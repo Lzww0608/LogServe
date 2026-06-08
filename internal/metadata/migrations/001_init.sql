@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS workflow_instances (
   output_json JSONB,
   output_ref TEXT,
   error TEXT,
+  idempotency_key TEXT UNIQUE,
+  idempotency_fingerprint TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ
@@ -27,6 +29,7 @@ CREATE TABLE IF NOT EXISTS task_instances (
   llm_model_name TEXT,
   llm_model_version TEXT,
   idempotency_key TEXT UNIQUE,
+  idempotency_fingerprint TEXT,
   result_json JSONB,
   error TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -76,6 +79,8 @@ CREATE TABLE IF NOT EXISTS actor_instances (
   state_json JSONB,
   init_args_json JSONB,
   snapshot_every INTEGER NOT NULL DEFAULT 25,
+  idempotency_key TEXT UNIQUE,
+  idempotency_fingerprint TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -135,6 +140,8 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model_name, mo
 
 ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS workflow_name TEXT;
 ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS idempotency_key TEXT UNIQUE;
+ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS idempotency_fingerprint TEXT;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS workflow_id TEXT;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS step_id TEXT;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS target_worker_id TEXT;
@@ -144,6 +151,9 @@ ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS actor_epoch BIGINT NOT NULL 
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS task_lease_epoch BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS llm_model_name TEXT;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS llm_model_version TEXT;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS idempotency_fingerprint TEXT;
 ALTER TABLE workers ADD COLUMN IF NOT EXISTS capacity INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE workers ADD COLUMN IF NOT EXISTS running_tasks INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE actor_instances ADD COLUMN IF NOT EXISTS class_source TEXT;
+ALTER TABLE actor_instances ADD COLUMN IF NOT EXISTS idempotency_key TEXT UNIQUE;
+ALTER TABLE actor_instances ADD COLUMN IF NOT EXISTS idempotency_fingerprint TEXT;

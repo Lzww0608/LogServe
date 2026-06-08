@@ -11,24 +11,25 @@ import (
 )
 
 type Task struct {
-	TaskID          string
-	TaskName        string
-	Status          logservepb.TaskStatus
-	ResultJSON      []byte
-	Error           string
-	WorkerID        string
-	WorkflowID      string
-	StepID          string
-	TargetWorkerID  string
-	ActorID         string
-	ActorCallID     string
-	ActorEpoch      uint64
-	TaskLeaseEpoch  uint64
-	LLMModelName    string
-	LLMModelVersion string
-	IdempotencyKey  string
-	CreatedAtMs     int64
-	UpdatedAtMs     int64
+	TaskID                 string
+	TaskName               string
+	Status                 logservepb.TaskStatus
+	ResultJSON             []byte
+	Error                  string
+	WorkerID               string
+	WorkflowID             string
+	StepID                 string
+	TargetWorkerID         string
+	ActorID                string
+	ActorCallID            string
+	ActorEpoch             uint64
+	TaskLeaseEpoch         uint64
+	LLMModelName           string
+	LLMModelVersion        string
+	IdempotencyKey         string
+	IdempotencyFingerprint string
+	CreatedAtMs            int64
+	UpdatedAtMs            int64
 }
 
 type Worker struct {
@@ -249,6 +250,7 @@ func (s *MemoryStore) CreateWorkflow(state workflow.State, idempotencyKey string
 			return cloneWorkflow(s.workflows[workflowID]), true
 		}
 	}
+	state.IdempotencyKey = idempotencyKey
 	s.workflows[state.WorkflowID] = cloneWorkflow(state)
 	if idempotencyKey != "" {
 		s.workflowByIdemKey[idempotencyKey] = state.WorkflowID
@@ -308,6 +310,9 @@ func (s *MemoryStore) UpsertWorkflow(state workflow.State) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.workflows[state.WorkflowID] = cloneWorkflow(state)
+	if state.IdempotencyKey != "" {
+		s.workflowByIdemKey[state.IdempotencyKey] = state.WorkflowID
+	}
 }
 
 func (s *MemoryStore) UpsertWorker(worker Worker) {
@@ -419,6 +424,7 @@ func (s *MemoryStore) CreateActor(state actor.State, idempotencyKey string) (act
 			return cloneActor(s.actors[actorID]), true
 		}
 	}
+	state.IdempotencyKey = idempotencyKey
 	s.actors[state.ActorID] = cloneActor(state)
 	if idempotencyKey != "" {
 		s.actorByIdemKey[idempotencyKey] = state.ActorID
@@ -478,6 +484,9 @@ func (s *MemoryStore) UpsertActor(state actor.State) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.actors[state.ActorID] = cloneActor(state)
+	if state.IdempotencyKey != "" {
+		s.actorByIdemKey[state.IdempotencyKey] = state.ActorID
+	}
 }
 
 func cloneTask(task Task) Task {

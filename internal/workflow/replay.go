@@ -10,18 +10,20 @@ import (
 )
 
 type EventPayload struct {
-	WorkflowID     string          `json:"workflow_id,omitempty"`
-	WorkflowName   string          `json:"workflow_name,omitempty"`
-	DefinitionJSON json.RawMessage `json:"definition_json,omitempty"`
-	StepID         string          `json:"step_id,omitempty"`
-	TaskID         string          `json:"task_id,omitempty"`
-	Attempt        uint32          `json:"attempt,omitempty"`
-	InputHash      string          `json:"input_hash,omitempty"`
-	ResultJSON     json.RawMessage `json:"result_json,omitempty"`
-	ResultRef      string          `json:"result_ref,omitempty"`
-	Error          string          `json:"error,omitempty"`
-	TimestampMs    int64           `json:"timestamp_ms,omitempty"`
-	LatencyMs      int64           `json:"latency_ms,omitempty"`
+	WorkflowID             string          `json:"workflow_id,omitempty"`
+	WorkflowName           string          `json:"workflow_name,omitempty"`
+	DefinitionJSON         json.RawMessage `json:"definition_json,omitempty"`
+	StepID                 string          `json:"step_id,omitempty"`
+	TaskID                 string          `json:"task_id,omitempty"`
+	Attempt                uint32          `json:"attempt,omitempty"`
+	InputHash              string          `json:"input_hash,omitempty"`
+	ResultJSON             json.RawMessage `json:"result_json,omitempty"`
+	ResultRef              string          `json:"result_ref,omitempty"`
+	Error                  string          `json:"error,omitempty"`
+	IdempotencyKey         string          `json:"idempotency_key,omitempty"`
+	IdempotencyFingerprint string          `json:"idempotency_fingerprint,omitempty"`
+	TimestampMs            int64           `json:"timestamp_ms,omitempty"`
+	LatencyMs              int64           `json:"latency_ms,omitempty"`
 }
 
 func Replay(workflowID string, records []*logservepb.LogRecord) (State, error) {
@@ -44,6 +46,8 @@ func Replay(workflowID string, records []*logservepb.LogRecord) (State, error) {
 				return State{}, err
 			}
 			state = NewState(workflowID, def, payload.TimestampMs)
+			state.IdempotencyKey = payload.IdempotencyKey
+			state.IdempotencyFingerprint = payload.IdempotencyFingerprint
 		case "StepScheduled":
 			step := state.Steps[payload.StepID]
 			step.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED

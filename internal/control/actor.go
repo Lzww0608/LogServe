@@ -24,20 +24,35 @@ func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRe
 		return nil, errors.New("class_source is required")
 	}
 	initArgs := defaultJSON(req.GetInitArgsJson(), []byte(`{"args":[],"kwargs":{}}`))
+	snapshotEvery := req.GetSnapshotEvery()
+	if snapshotEvery == 0 {
+		snapshotEvery = 25
+	}
+	fingerprint, err := actorCreateFingerprint(req, initArgs, snapshotEvery)
+	if err != nil {
+		return nil, err
+	}
 	if existing, ok := s.meta.GetActorByIdempotencyKey(req.GetIdempotencyKey()); ok {
+		if err := ensureIdempotencyFingerprint("actor", req.GetIdempotencyKey(), existing.IdempotencyFingerprint, fingerprint); err != nil {
+			return nil, err
+		}
 		return actorCreateResponse(existing), nil
 	}
 	actorID := newActorID()
 	now := actor.NowMs()
-	state := actor.NewState(actorID, req.GetClassName(), req.GetClassSource(), initArgs, req.GetSnapshotEvery(), now)
+	state := actor.NewState(actorID, req.GetClassName(), req.GetClassSource(), initArgs, snapshotEvery, now)
+	state.IdempotencyKey = req.GetIdempotencyKey()
+	state.IdempotencyFingerprint = fingerprint
 
 	payload, _ := json.Marshal(actor.EventPayload{
-		ActorID:       actorID,
-		ClassName:     req.GetClassName(),
-		ClassSource:   req.GetClassSource(),
-		InitArgsJSON:  initArgs,
-		SnapshotEvery: state.SnapshotEvery,
-		TimestampMs:   now,
+		ActorID:                actorID,
+		ClassName:              req.GetClassName(),
+		ClassSource:            req.GetClassSource(),
+		InitArgsJSON:           initArgs,
+		SnapshotEvery:          state.SnapshotEvery,
+		IdempotencyKey:         req.GetIdempotencyKey(),
+		IdempotencyFingerprint: fingerprint,
+		TimestampMs:            now,
 	})
 	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       actorStream(actorID),
@@ -49,6 +64,9 @@ func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRe
 	}
 	created, duplicate := s.meta.CreateActor(state, req.GetIdempotencyKey())
 	if duplicate {
+		if err := ensureIdempotencyFingerprint("actor", req.GetIdempotencyKey(), created.IdempotencyFingerprint, fingerprint); err != nil {
+			return nil, err
+		}
 		return actorCreateResponse(created), nil
 	}
 

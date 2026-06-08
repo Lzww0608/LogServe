@@ -10,40 +10,44 @@ import (
 )
 
 type State struct {
-	ActorID              string
-	ClassName            string
-	ClassSource          string
-	InitArgsJSON         []byte
-	Status               logservepb.ActorStatus
-	OwnerWorkerID        string
-	Epoch                uint64
-	CommandCount         uint64
-	SnapshotEvery        uint32
-	SnapshotRef          string
-	SnapshotCommandCount uint64
-	StateJSON            []byte
-	CreatedAtMs          int64
-	UpdatedAtMs          int64
+	ActorID                string
+	ClassName              string
+	ClassSource            string
+	InitArgsJSON           []byte
+	Status                 logservepb.ActorStatus
+	OwnerWorkerID          string
+	Epoch                  uint64
+	CommandCount           uint64
+	SnapshotEvery          uint32
+	SnapshotRef            string
+	SnapshotCommandCount   uint64
+	StateJSON              []byte
+	IdempotencyKey         string
+	IdempotencyFingerprint string
+	CreatedAtMs            int64
+	UpdatedAtMs            int64
 }
 
 type EventPayload struct {
-	ActorID              string          `json:"actor_id,omitempty"`
-	ClassName            string          `json:"class_name,omitempty"`
-	ClassSource          string          `json:"class_source,omitempty"`
-	InitArgsJSON         json.RawMessage `json:"init_args_json,omitempty"`
-	WorkerID             string          `json:"worker_id,omitempty"`
-	Epoch                uint64          `json:"epoch,omitempty"`
-	CallID               string          `json:"call_id,omitempty"`
-	MethodName           string          `json:"method_name,omitempty"`
-	ArgsJSON             json.RawMessage `json:"args_json,omitempty"`
-	ResultJSON           json.RawMessage `json:"result_json,omitempty"`
-	StateJSON            json.RawMessage `json:"state_json,omitempty"`
-	SnapshotRef          string          `json:"snapshot_ref,omitempty"`
-	SnapshotEvery        uint32          `json:"snapshot_every,omitempty"`
-	CommandCount         uint64          `json:"command_count,omitempty"`
-	SnapshotCommandCount uint64          `json:"snapshot_command_count,omitempty"`
-	Error                string          `json:"error,omitempty"`
-	TimestampMs          int64           `json:"timestamp_ms,omitempty"`
+	ActorID                string          `json:"actor_id,omitempty"`
+	ClassName              string          `json:"class_name,omitempty"`
+	ClassSource            string          `json:"class_source,omitempty"`
+	InitArgsJSON           json.RawMessage `json:"init_args_json,omitempty"`
+	WorkerID               string          `json:"worker_id,omitempty"`
+	Epoch                  uint64          `json:"epoch,omitempty"`
+	CallID                 string          `json:"call_id,omitempty"`
+	MethodName             string          `json:"method_name,omitempty"`
+	ArgsJSON               json.RawMessage `json:"args_json,omitempty"`
+	ResultJSON             json.RawMessage `json:"result_json,omitempty"`
+	StateJSON              json.RawMessage `json:"state_json,omitempty"`
+	SnapshotRef            string          `json:"snapshot_ref,omitempty"`
+	SnapshotEvery          uint32          `json:"snapshot_every,omitempty"`
+	CommandCount           uint64          `json:"command_count,omitempty"`
+	SnapshotCommandCount   uint64          `json:"snapshot_command_count,omitempty"`
+	Error                  string          `json:"error,omitempty"`
+	IdempotencyKey         string          `json:"idempotency_key,omitempty"`
+	IdempotencyFingerprint string          `json:"idempotency_fingerprint,omitempty"`
+	TimestampMs            int64           `json:"timestamp_ms,omitempty"`
 }
 
 type ResultLoader interface {
@@ -148,6 +152,8 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 					state.CreatedAtMs = payload.TimestampMs
 				}
 			}
+			state.IdempotencyKey = payload.IdempotencyKey
+			state.IdempotencyFingerprint = payload.IdempotencyFingerprint
 		case "ActorOwnershipGranted":
 			state.OwnerWorkerID = payload.WorkerID
 			state.Epoch = payload.Epoch

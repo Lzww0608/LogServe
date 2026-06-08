@@ -1,5 +1,6 @@
 from .client import (
     ActorHandle,
+    LogServeClient,
     call_actor,
     create_actor,
     get_actor_status,
@@ -19,6 +20,7 @@ from .decorators import actor, task, workflow
 
 __all__ = [
     "ActorHandle",
+    "LogServeClient",
     "actor",
     "create_actor",
     "call_actor",

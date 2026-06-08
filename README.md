@@ -22,7 +22,7 @@ cmd/
   logserve-control   Control plane and in-memory queue
   logserve-worker    Worker agent and Python executor bridge
   logserve-dev       Single-process local dev runner
-  logservectl        CLI used by the Python SDK
+  logservectl        CLI fallback for the Python SDK
 proto/               gRPC contracts
 internal/logstore    Segmented append-only log v1
 internal/control     Task API and status materialization
@@ -100,6 +100,29 @@ go run ./cmd/logserve-worker --worker-id worker-1 --control-addr 127.0.0.1:50052
 ```
 
 Then run the same Python demo.
+
+## Python SDK Transport And Idempotency
+
+The Python SDK defaults to `LOGSERVE_SDK_TRANSPORT=auto`: it uses the native
+gRPC transport when `grpcio` and `protobuf` are installed, and falls back to
+`logservectl` when those packages are unavailable. Force one mode with:
+
+```powershell
+$env:LOGSERVE_SDK_TRANSPORT = "grpc" # require native gRPC
+$env:LOGSERVE_SDK_TRANSPORT = "cli"  # force CLI fallback
+```
+
+Install the SDK gRPC dependencies on the experiment machine with:
+
+```powershell
+python -m pip install -r .\sdk\python\requirements.txt
+```
+
+SDK calls are non-idempotent by default. Repeating the same function and
+arguments creates a new submission unless the caller explicitly passes
+`idempotency_key`. If a key is reused with a different request payload, the
+control plane rejects it as an idempotency conflict instead of silently
+returning the first result.
 
 ## Shared Log v1 Benchmark
 

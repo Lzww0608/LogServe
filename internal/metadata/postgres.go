@@ -273,11 +273,11 @@ func (s *PostgresStore) persistTask(ctx context.Context, task Task) error {
 INSERT INTO task_instances (
   task_id, task_name, status, worker_id, workflow_id, step_id, target_worker_id,
   actor_id, actor_call_id, actor_epoch, task_lease_epoch, llm_model_name,
-  llm_model_version, idempotency_key, result_json, error, created_at, updated_at
+  llm_model_version, idempotency_key, idempotency_fingerprint, result_json, error, created_at, updated_at
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7,
   $8, $9, $10, $11, $12,
-  $13, $14, $15::jsonb, $16, $17, $18
+  $13, $14, $15, $16::jsonb, $17, $18, $19
 ) ON CONFLICT (task_id) DO UPDATE SET
   task_name = EXCLUDED.task_name,
   status = EXCLUDED.status,
@@ -292,6 +292,7 @@ INSERT INTO task_instances (
   llm_model_name = EXCLUDED.llm_model_name,
   llm_model_version = EXCLUDED.llm_model_version,
   idempotency_key = EXCLUDED.idempotency_key,
+  idempotency_fingerprint = EXCLUDED.idempotency_fingerprint,
   result_json = EXCLUDED.result_json,
   error = EXCLUDED.error,
   updated_at = EXCLUDED.updated_at`,
@@ -309,6 +310,7 @@ INSERT INTO task_instances (
 		nullString(task.LLMModelName),
 		nullString(task.LLMModelVersion),
 		nullString(task.IdempotencyKey),
+		nullString(task.IdempotencyFingerprint),
 		jsonValue(task.ResultJSON),
 		nullString(task.Error),
 		msTime(task.CreatedAtMs),
@@ -368,8 +370,8 @@ func (s *PostgresStore) persistWorkflow(ctx context.Context, state workflow.Stat
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO workflow_instances (
   workflow_id, workflow_name, status, input_json, definition_json, output_json,
-  output_ref, error, created_at, updated_at, completed_at
-) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11)
+  output_ref, error, idempotency_key, idempotency_fingerprint, created_at, updated_at, completed_at
+) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
 ON CONFLICT (workflow_id) DO UPDATE SET
   workflow_name = EXCLUDED.workflow_name,
   status = EXCLUDED.status,
@@ -378,6 +380,8 @@ ON CONFLICT (workflow_id) DO UPDATE SET
   output_json = EXCLUDED.output_json,
   output_ref = EXCLUDED.output_ref,
   error = EXCLUDED.error,
+  idempotency_key = EXCLUDED.idempotency_key,
+  idempotency_fingerprint = EXCLUDED.idempotency_fingerprint,
   updated_at = EXCLUDED.updated_at,
   completed_at = EXCLUDED.completed_at`,
 		state.WorkflowID,
@@ -388,6 +392,8 @@ ON CONFLICT (workflow_id) DO UPDATE SET
 		jsonValue(state.ResultJSON),
 		nullString(state.ResultRef),
 		nullString(state.Error),
+		nullString(state.IdempotencyKey),
+		nullString(state.IdempotencyFingerprint),
 		msTime(state.CreatedAtMs),
 		msTime(state.UpdatedAtMs),
 		nullTime(state.CompletedAtMs),
@@ -498,8 +504,8 @@ func (s *PostgresStore) persistActor(ctx context.Context, state actor.State) err
 INSERT INTO actor_instances (
   actor_id, class_name, class_source, status, owner_worker_id, epoch,
   command_count, snapshot_ref, snapshot_command_count, state_json,
-  init_args_json, snapshot_every, created_at, updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14)
+  init_args_json, snapshot_every, idempotency_key, idempotency_fingerprint, created_at, updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14, $15, $16)
 ON CONFLICT (actor_id) DO UPDATE SET
   class_name = EXCLUDED.class_name,
   class_source = EXCLUDED.class_source,
@@ -512,6 +518,8 @@ ON CONFLICT (actor_id) DO UPDATE SET
   state_json = EXCLUDED.state_json,
   init_args_json = EXCLUDED.init_args_json,
   snapshot_every = EXCLUDED.snapshot_every,
+  idempotency_key = EXCLUDED.idempotency_key,
+  idempotency_fingerprint = EXCLUDED.idempotency_fingerprint,
   updated_at = EXCLUDED.updated_at`,
 		state.ActorID,
 		state.ClassName,
@@ -525,6 +533,8 @@ ON CONFLICT (actor_id) DO UPDATE SET
 		jsonValue(state.StateJSON),
 		jsonValue(state.InitArgsJSON),
 		state.SnapshotEvery,
+		nullString(state.IdempotencyKey),
+		nullString(state.IdempotencyFingerprint),
 		msTime(state.CreatedAtMs),
 		msTime(state.UpdatedAtMs),
 	)

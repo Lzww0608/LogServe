@@ -68,6 +68,11 @@ func (s *Service) bootstrapTasks(ctx context.Context) error {
 			LLMModelName:    spec.GetLlmModelName(),
 			LLMModelVersion: spec.GetLlmModelVersion(),
 		}
+		if fingerprint, err := taskSpecFingerprint(spec); err == nil {
+			task.IdempotencyFingerprint = fingerprint
+		} else {
+			return err
+		}
 		s.meta.CreateTask(task, spec.GetIdempotencyKey())
 		s.specMu.Lock()
 		s.specs[spec.GetTaskId()] = cloneSpec(spec)
@@ -334,14 +339,19 @@ func (s *Service) restoreWorkflowTasks(state workflow.State) error {
 			LlmMaxTokens:    stepDef.LLMMaxTokens,
 			TimeoutMs:       stepDef.TimeoutMs,
 		}
+		fingerprint, err := taskSpecFingerprint(spec)
+		if err != nil {
+			return err
+		}
 		s.meta.CreateTask(metadata.Task{
-			TaskID:          spec.GetTaskId(),
-			TaskName:        spec.GetTaskName(),
-			Status:          logservepb.TaskStatus_TASK_STATUS_QUEUED,
-			WorkflowID:      spec.GetWorkflowId(),
-			StepID:          spec.GetStepId(),
-			LLMModelName:    spec.GetLlmModelName(),
-			LLMModelVersion: spec.GetLlmModelVersion(),
+			TaskID:                 spec.GetTaskId(),
+			TaskName:               spec.GetTaskName(),
+			Status:                 logservepb.TaskStatus_TASK_STATUS_QUEUED,
+			WorkflowID:             spec.GetWorkflowId(),
+			StepID:                 spec.GetStepId(),
+			LLMModelName:           spec.GetLlmModelName(),
+			LLMModelVersion:        spec.GetLlmModelVersion(),
+			IdempotencyFingerprint: fingerprint,
 		}, spec.GetIdempotencyKey())
 		s.specMu.Lock()
 		s.specs[step.TaskID] = cloneSpec(spec)

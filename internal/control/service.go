@@ -156,23 +156,34 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 	if def.ResultStepID == "" {
 		def.ResultStepID = def.Steps[len(def.Steps)-1].StepID
 	}
+	fingerprint, err := workflowFingerprint(req.GetWorkflowName(), def)
+	if err != nil {
+		return nil, err
+	}
 
 	if existing, ok := s.meta.GetWorkflowByIdempotencyKey(req.GetIdempotencyKey()); ok {
+		if err := ensureIdempotencyFingerprint("workflow", req.GetIdempotencyKey(), existing.IdempotencyFingerprint, fingerprint); err != nil {
+			return nil, err
+		}
 		return &logservepb.SubmitWorkflowResponse{WorkflowId: existing.WorkflowID, Status: existing.Status}, nil
 	}
 
 	workflowID := newWorkflowID()
 	now := workflow.NowMs()
 	state := workflow.NewState(workflowID, def, now)
+	state.IdempotencyKey = req.GetIdempotencyKey()
+	state.IdempotencyFingerprint = fingerprint
 	definitionJSON, err := json.Marshal(def)
 	if err != nil {
 		return nil, err
 	}
 	payload, _ := json.Marshal(workflow.EventPayload{
-		WorkflowID:     workflowID,
-		WorkflowName:   def.WorkflowName,
-		DefinitionJSON: definitionJSON,
-		TimestampMs:    now,
+		WorkflowID:             workflowID,
+		WorkflowName:           def.WorkflowName,
+		DefinitionJSON:         definitionJSON,
+		IdempotencyKey:         req.GetIdempotencyKey(),
+		IdempotencyFingerprint: fingerprint,
+		TimestampMs:            now,
 	})
 	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       workflowStream(workflowID),
@@ -184,6 +195,9 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 	}
 	created, duplicate := s.meta.CreateWorkflow(state, req.GetIdempotencyKey())
 	if duplicate {
+		if err := ensureIdempotencyFingerprint("workflow", req.GetIdempotencyKey(), created.IdempotencyFingerprint, fingerprint); err != nil {
+			return nil, err
+		}
 		return &logservepb.SubmitWorkflowResponse{WorkflowId: created.WorkflowID, Status: created.Status}, nil
 	}
 	if err := s.scheduleReadySteps(ctx, workflowID); err != nil {
@@ -355,7 +369,14 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 	if spec.GetTaskId() == "" {
 		spec.TaskId = newTaskID()
 	}
+	fingerprint, err := taskSpecFingerprint(spec)
+	if err != nil {
+		return metadata.Task{}, false, err
+	}
 	if task, ok := s.meta.GetTaskByIdempotencyKey(spec.GetIdempotencyKey()); ok {
+		if err := ensureIdempotencyFingerprint("task", spec.GetIdempotencyKey(), task.IdempotencyFingerprint, fingerprint); err != nil {
+			return metadata.Task{}, false, err
+		}
 		return task, true, nil
 	}
 
@@ -388,20 +409,24 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 	}
 
 	task, duplicate := s.meta.CreateTask(metadata.Task{
-		TaskID:          spec.GetTaskId(),
-		TaskName:        spec.GetTaskName(),
-		Status:          logservepb.TaskStatus_TASK_STATUS_QUEUED,
-		WorkflowID:      spec.GetWorkflowId(),
-		StepID:          spec.GetStepId(),
-		TargetWorkerID:  spec.GetTargetWorkerId(),
-		ActorID:         spec.GetActorId(),
-		ActorCallID:     spec.GetActorCallId(),
-		ActorEpoch:      spec.GetActorEpoch(),
-		TaskLeaseEpoch:  spec.GetTaskLeaseEpoch(),
-		LLMModelName:    spec.GetLlmModelName(),
-		LLMModelVersion: spec.GetLlmModelVersion(),
+		TaskID:                 spec.GetTaskId(),
+		TaskName:               spec.GetTaskName(),
+		Status:                 logservepb.TaskStatus_TASK_STATUS_QUEUED,
+		WorkflowID:             spec.GetWorkflowId(),
+		StepID:                 spec.GetStepId(),
+		TargetWorkerID:         spec.GetTargetWorkerId(),
+		ActorID:                spec.GetActorId(),
+		ActorCallID:            spec.GetActorCallId(),
+		ActorEpoch:             spec.GetActorEpoch(),
+		TaskLeaseEpoch:         spec.GetTaskLeaseEpoch(),
+		LLMModelName:           spec.GetLlmModelName(),
+		LLMModelVersion:        spec.GetLlmModelVersion(),
+		IdempotencyFingerprint: fingerprint,
 	}, spec.GetIdempotencyKey())
 	if duplicate {
+		if err := ensureIdempotencyFingerprint("task", spec.GetIdempotencyKey(), task.IdempotencyFingerprint, fingerprint); err != nil {
+			return metadata.Task{}, false, err
+		}
 		return task, true, nil
 	}
 

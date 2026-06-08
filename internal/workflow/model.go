@@ -32,18 +32,20 @@ type StepDefinition struct {
 }
 
 type State struct {
-	WorkflowID    string
-	WorkflowName  string
-	Status        logservepb.WorkflowStatus
-	Definition    Definition
-	StepOrder     []string
-	Steps         map[string]StepState
-	ResultJSON    []byte
-	ResultRef     string
-	Error         string
-	CreatedAtMs   int64
-	UpdatedAtMs   int64
-	CompletedAtMs int64
+	WorkflowID             string
+	WorkflowName           string
+	Status                 logservepb.WorkflowStatus
+	Definition             Definition
+	StepOrder              []string
+	Steps                  map[string]StepState
+	ResultJSON             []byte
+	ResultRef              string
+	Error                  string
+	IdempotencyKey         string
+	IdempotencyFingerprint string
+	CreatedAtMs            int64
+	UpdatedAtMs            int64
+	CompletedAtMs          int64
 }
 
 type StepState struct {
