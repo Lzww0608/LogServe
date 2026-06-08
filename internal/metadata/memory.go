@@ -263,6 +263,20 @@ func (s *MemoryStore) GetWorkflow(workflowID string) (workflow.State, bool) {
 	return cloneWorkflow(state), ok
 }
 
+func (s *MemoryStore) GetWorkflowByIdempotencyKey(idempotencyKey string) (workflow.State, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if idempotencyKey == "" {
+		return workflow.State{}, false
+	}
+	workflowID, ok := s.workflowByIdemKey[idempotencyKey]
+	if !ok {
+		return workflow.State{}, false
+	}
+	state, ok := s.workflows[workflowID]
+	return cloneWorkflow(state), ok
+}
+
 func (s *MemoryStore) ListWorkflows() []workflow.State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -415,6 +429,20 @@ func (s *MemoryStore) CreateActor(state actor.State, idempotencyKey string) (act
 func (s *MemoryStore) GetActor(actorID string) (actor.State, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	state, ok := s.actors[actorID]
+	return cloneActor(state), ok
+}
+
+func (s *MemoryStore) GetActorByIdempotencyKey(idempotencyKey string) (actor.State, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if idempotencyKey == "" {
+		return actor.State{}, false
+	}
+	actorID, ok := s.actorByIdemKey[idempotencyKey]
+	if !ok {
+		return actor.State{}, false
+	}
 	state, ok := s.actors[actorID]
 	return cloneActor(state), ok
 }

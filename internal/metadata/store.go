@@ -24,6 +24,7 @@ type Store interface {
 
 	CreateWorkflow(state workflow.State, idempotencyKey string) (workflow.State, bool)
 	GetWorkflow(workflowID string) (workflow.State, bool)
+	GetWorkflowByIdempotencyKey(idempotencyKey string) (workflow.State, bool)
 	ListWorkflows() []workflow.State
 	UpdateWorkflow(workflowID string, fn func(*workflow.State) error) (workflow.State, error)
 	UpsertWorkflow(state workflow.State)
@@ -38,6 +39,7 @@ type Store interface {
 
 	CreateActor(state actor.State, idempotencyKey string) (actor.State, bool)
 	GetActor(actorID string) (actor.State, bool)
+	GetActorByIdempotencyKey(idempotencyKey string) (actor.State, bool)
 	ListActors() []actor.State
 	UpdateActor(actorID string, fn func(*actor.State) error) (actor.State, error)
 	UpsertActor(state actor.State)

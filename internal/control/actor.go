@@ -14,6 +14,8 @@ import (
 	"github.com/logserve/logserve/internal/observability"
 )
 
+var errNoActiveActorWorker = errors.New("no active worker available for actor")
+
 func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRequest) (*logservepb.CreateActorResponse, error) {
 	if req.GetClassName() == "" {
 		return nil, errors.New("class_name is required")
@@ -22,13 +24,12 @@ func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRe
 		return nil, errors.New("class_source is required")
 	}
 	initArgs := defaultJSON(req.GetInitArgsJson(), []byte(`{"args":[],"kwargs":{}}`))
+	if existing, ok := s.meta.GetActorByIdempotencyKey(req.GetIdempotencyKey()); ok {
+		return actorCreateResponse(existing), nil
+	}
 	actorID := newActorID()
 	now := actor.NowMs()
 	state := actor.NewState(actorID, req.GetClassName(), req.GetClassSource(), initArgs, req.GetSnapshotEvery(), now)
-	created, duplicate := s.meta.CreateActor(state, req.GetIdempotencyKey())
-	if duplicate {
-		return actorCreateResponse(created), nil
-	}
 
 	payload, _ := json.Marshal(actor.EventPayload{
 		ActorID:       actorID,
@@ -45,6 +46,10 @@ func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRe
 		Payload:        payload,
 	}); err != nil {
 		return nil, err
+	}
+	created, duplicate := s.meta.CreateActor(state, req.GetIdempotencyKey())
+	if duplicate {
+		return actorCreateResponse(created), nil
 	}
 
 	owned, err := s.ensureActorOwner(ctx, actorID)
@@ -66,7 +71,12 @@ func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorReques
 	lock.Lock()
 	defer lock.Unlock()
 
-	state, err := s.ensureActorOwner(ctx, req.GetActorId())
+	timeout := time.Duration(req.GetTimeoutMs()) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadlineAt := time.Now().Add(timeout)
+	state, err := s.waitActorOwner(ctx, req.GetActorId(), deadlineAt)
 	if err != nil {
 		return nil, err
 	}
@@ -105,11 +115,11 @@ func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorReques
 		return nil, err
 	}
 
-	timeout := time.Duration(req.GetTimeoutMs()) * time.Millisecond
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+	remaining := time.Until(deadlineAt)
+	if remaining <= 0 {
+		return nil, errors.New("actor call timed out")
 	}
-	deadline := time.NewTimer(timeout)
+	deadline := time.NewTimer(remaining)
 	defer deadline.Stop()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
@@ -172,6 +182,28 @@ func (s *Service) ReplayActor(ctx context.Context, req *logservepb.ReplayActorRe
 	}, nil
 }
 
+func (s *Service) waitActorOwner(ctx context.Context, actorID string, deadlineAt time.Time) (actor.State, error) {
+	for {
+		state, err := s.ensureActorOwner(ctx, actorID)
+		if err == nil {
+			return state, nil
+		}
+		if !errors.Is(err, errNoActiveActorWorker) {
+			return actor.State{}, err
+		}
+		if time.Now().After(deadlineAt) {
+			return actor.State{}, err
+		}
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return actor.State{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func (s *Service) ensureActorOwner(ctx context.Context, actorID string) (actor.State, error) {
 	state, ok := s.meta.GetActor(actorID)
 	if !ok {
@@ -185,7 +217,7 @@ func (s *Service) ensureActorOwner(ctx context.Context, actorID string) (actor.S
 	}
 	workers := sortedWorkers(s.meta.ActiveWorkers(actorOwnerLease))
 	if len(workers) == 0 {
-		return state, errors.New("no active worker available for actor")
+		return state, errNoActiveActorWorker
 	}
 	owner := workers[0].WorkerID
 	epoch := state.Epoch + 1

@@ -28,15 +28,17 @@ func (s *Service) RegisterModel(ctx context.Context, req *logservepb.RegisterMod
 	if model.GetName() == "" {
 		return nil, errors.New("model.name is required")
 	}
-	registered := s.meta.RegisterModel(model)
+	registered := normalizeModelInfo(model)
 	payload, _ := json.Marshal(registered)
-	_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       "system:models",
 		EventType:      "ModelRegistered",
-		IdempotencyKey: metadata.ModelKey(registered.GetName(), registered.GetVersion()) + ":registered",
+		IdempotencyKey: fmt.Sprintf("%s:registered:%d", metadata.ModelKey(registered.GetName(), registered.GetVersion()), time.Now().UnixNano()),
 		Payload:        payload,
-	})
-	return &logservepb.RegisterModelResponse{Model: registered}, nil
+	}); err != nil {
+		return nil, err
+	}
+	return &logservepb.RegisterModelResponse{Model: s.meta.RegisterModel(registered)}, nil
 }
 
 func (s *Service) SetSchedulingPolicy(ctx context.Context, req *logservepb.SetSchedulingPolicyRequest) (*logservepb.SetSchedulingPolicyResponse, error) {
@@ -44,19 +46,21 @@ func (s *Service) SetSchedulingPolicy(ctx context.Context, req *logservepb.SetSc
 	if policy == logservepb.SchedulingPolicy_SCHEDULING_POLICY_UNSPECIFIED {
 		policy = logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE
 	}
-	s.configMu.Lock()
-	s.schedulingPolicy = policy
-	s.configMu.Unlock()
 	payload, _ := json.Marshal(map[string]any{
 		"policy":       policy.String(),
 		"timestamp_ms": time.Now().UnixMilli(),
 	})
-	_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       "system:scheduler",
 		EventType:      "SchedulingPolicyChanged",
 		IdempotencyKey: fmt.Sprintf("policy:%d:%d", policy, time.Now().UnixNano()),
 		Payload:        payload,
-	})
+	}); err != nil {
+		return nil, err
+	}
+	s.configMu.Lock()
+	s.schedulingPolicy = policy
+	s.configMu.Unlock()
 	return &logservepb.SetSchedulingPolicyResponse{Policy: policy}, nil
 }
 
@@ -338,6 +342,23 @@ func modelCacheFromProto(entries []*logservepb.ModelCacheEntry) map[string]bool 
 
 func llmStream(taskID string) string {
 	return "llm:" + taskID
+}
+
+func normalizeModelInfo(model *logservepb.ModelInfo) *logservepb.ModelInfo {
+	clone := &logservepb.ModelInfo{
+		Name:      model.GetName(),
+		Version:   model.GetVersion(),
+		SizeBytes: model.GetSizeBytes(),
+		Path:      model.GetPath(),
+		Adapter:   model.GetAdapter(),
+	}
+	if clone.Version == "" {
+		clone.Version = "v1"
+	}
+	if clone.Adapter == "" {
+		clone.Adapter = "mock"
+	}
+	return clone
 }
 
 func firstNonEmpty(values ...string) string {

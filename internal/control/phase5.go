@@ -11,20 +11,21 @@ import (
 )
 
 func (s *Service) SetBackpressure(ctx context.Context, req *logservepb.SetBackpressureRequest) (*logservepb.SetBackpressureResponse, error) {
-	s.configMu.Lock()
-	if req.GetQueueHighWatermark() > 0 {
-		s.queueHighWatermark = req.GetQueueHighWatermark()
-	}
-	if req.GetRedeliveryTimeoutMs() > 0 {
-		s.redeliveryTimeout = time.Duration(req.GetRedeliveryTimeoutMs()) * time.Millisecond
-	}
-	if req.GetLogAppendSlowMs() > 0 {
-		s.logAppendSlowLimit = time.Duration(req.GetLogAppendSlowMs()) * time.Millisecond
-	}
+	s.configMu.RLock()
 	queueHighWatermark := s.queueHighWatermark
 	redeliveryTimeout := s.redeliveryTimeout
 	logAppendSlowLimit := s.logAppendSlowLimit
-	s.configMu.Unlock()
+	s.configMu.RUnlock()
+
+	if req.GetQueueHighWatermark() > 0 {
+		queueHighWatermark = req.GetQueueHighWatermark()
+	}
+	if req.GetRedeliveryTimeoutMs() > 0 {
+		redeliveryTimeout = time.Duration(req.GetRedeliveryTimeoutMs()) * time.Millisecond
+	}
+	if req.GetLogAppendSlowMs() > 0 {
+		logAppendSlowLimit = time.Duration(req.GetLogAppendSlowMs()) * time.Millisecond
+	}
 
 	payload, _ := json.Marshal(map[string]any{
 		"queue_high_watermark":  queueHighWatermark,
@@ -32,12 +33,19 @@ func (s *Service) SetBackpressure(ctx context.Context, req *logservepb.SetBackpr
 		"log_append_slow_ms":    logAppendSlowLimit.Milliseconds(),
 		"timestamp_ms":          time.Now().UnixMilli(),
 	})
-	_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       "system:backpressure",
 		EventType:      "BackpressureConfigured",
 		IdempotencyKey: "backpressure:" + time.Now().Format("150405.000000000"),
 		Payload:        payload,
-	})
+	}); err != nil {
+		return nil, err
+	}
+	s.configMu.Lock()
+	s.queueHighWatermark = queueHighWatermark
+	s.redeliveryTimeout = redeliveryTimeout
+	s.logAppendSlowLimit = logAppendSlowLimit
+	s.configMu.Unlock()
 	return &logservepb.SetBackpressureResponse{
 		QueueHighWatermark:  queueHighWatermark,
 		RedeliveryTimeoutMs: redeliveryTimeout.Milliseconds(),
@@ -127,31 +135,48 @@ func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetD
 
 func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
 	_, redeliveryTimeout, _ := s.getBackpressureConfig()
-	requeued := s.meta.RequeueExpiredRunningTasks(redeliveryTimeout)
-	if len(requeued) == 0 {
+	if redeliveryTimeout <= 0 {
 		return nil
 	}
-	s.queueMu.Lock()
-	for _, task := range requeued {
-		s.queue = append(s.queue, task.TaskID)
+
+	now := time.Now()
+	expired := make([]metadata.Task, 0)
+	for _, task := range s.meta.ListTasks() {
+		if task.Status != logservepb.TaskStatus_TASK_STATUS_RUNNING {
+			continue
+		}
+		if task.UpdatedAtMs == 0 || now.Sub(time.UnixMilli(task.UpdatedAtMs)) < redeliveryTimeout {
+			continue
+		}
+		expired = append(expired, task)
 	}
-	s.queueMu.Unlock()
-	for _, task := range requeued {
+	if len(expired) == 0 {
+		return nil
+	}
+	for _, task := range expired {
 		payload, _ := json.Marshal(map[string]any{
 			"task_id":      task.TaskID,
 			"task_name":    task.TaskName,
 			"timestamp_ms": time.Now().UnixMilli(),
 		})
-		_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
+		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 			StreamId:       taskStream(task.TaskID),
 			EventType:      "TaskRedelivered",
 			IdempotencyKey: task.TaskID + ":redelivered:" + time.Now().Format("150405.000000000"),
 			Payload:        payload,
-		})
+		}); err != nil {
+			return err
+		}
+	}
+	requeued := s.meta.RequeueExpiredRunningTasks(redeliveryTimeout)
+	s.queueMu.Lock()
+	for _, task := range requeued {
+		s.queue = append(s.queue, task.TaskID)
 		if task.WorkerID != "" {
 			s.meta.DecrementWorkerLoad(task.WorkerID)
 		}
 	}
+	s.queueMu.Unlock()
 	return nil
 }
 

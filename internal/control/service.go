@@ -157,14 +157,13 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 		def.ResultStepID = def.Steps[len(def.Steps)-1].StepID
 	}
 
+	if existing, ok := s.meta.GetWorkflowByIdempotencyKey(req.GetIdempotencyKey()); ok {
+		return &logservepb.SubmitWorkflowResponse{WorkflowId: existing.WorkflowID, Status: existing.Status}, nil
+	}
+
 	workflowID := newWorkflowID()
 	now := workflow.NowMs()
 	state := workflow.NewState(workflowID, def, now)
-	created, duplicate := s.meta.CreateWorkflow(state, req.GetIdempotencyKey())
-	if duplicate {
-		return &logservepb.SubmitWorkflowResponse{WorkflowId: created.WorkflowID, Status: created.Status}, nil
-	}
-
 	definitionJSON, err := json.Marshal(def)
 	if err != nil {
 		return nil, err
@@ -182,6 +181,10 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 		Payload:        payload,
 	}); err != nil {
 		return nil, err
+	}
+	created, duplicate := s.meta.CreateWorkflow(state, req.GetIdempotencyKey())
+	if duplicate {
+		return &logservepb.SubmitWorkflowResponse{WorkflowId: created.WorkflowID, Status: created.Status}, nil
 	}
 	if err := s.scheduleReadySteps(ctx, workflowID); err != nil {
 		return nil, err
@@ -222,13 +225,6 @@ func (s *Service) RegisterWorker(ctx context.Context, req *logservepb.RegisterWo
 	if req.GetWorkerId() == "" {
 		return nil, errors.New("worker_id is required")
 	}
-	s.meta.UpsertWorker(metadata.Worker{
-		WorkerID:     req.GetWorkerId(),
-		Address:      req.GetAddress(),
-		Labels:       req.GetLabels(),
-		CachedModels: modelCacheFromProto(req.GetCachedModels()),
-		Capacity:     req.GetCapacity(),
-	})
 	payload, _ := json.Marshal(map[string]any{
 		"worker_id":     req.GetWorkerId(),
 		"address":       req.GetAddress(),
@@ -236,11 +232,20 @@ func (s *Service) RegisterWorker(ctx context.Context, req *logservepb.RegisterWo
 		"cached_models": req.GetCachedModels(),
 		"capacity":      req.GetCapacity(),
 	})
-	_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       "system:workers",
 		EventType:      "WorkerRegistered",
-		IdempotencyKey: req.GetWorkerId() + ":registered",
+		IdempotencyKey: fmt.Sprintf("%s:registered:%d", req.GetWorkerId(), time.Now().UnixNano()),
 		Payload:        payload,
+	}); err != nil {
+		return nil, err
+	}
+	s.meta.UpsertWorker(metadata.Worker{
+		WorkerID:     req.GetWorkerId(),
+		Address:      req.GetAddress(),
+		Labels:       req.GetLabels(),
+		CachedModels: modelCacheFromProto(req.GetCachedModels()),
+		Capacity:     req.GetCapacity(),
 	})
 	return &logservepb.RegisterWorkerResponse{Accepted: true}, nil
 }

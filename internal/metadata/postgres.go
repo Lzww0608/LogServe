@@ -176,6 +176,10 @@ func (s *PostgresStore) GetWorkflow(workflowID string) (workflow.State, bool) {
 	return s.memory.GetWorkflow(workflowID)
 }
 
+func (s *PostgresStore) GetWorkflowByIdempotencyKey(idempotencyKey string) (workflow.State, bool) {
+	return s.memory.GetWorkflowByIdempotencyKey(idempotencyKey)
+}
+
 func (s *PostgresStore) ListWorkflows() []workflow.State {
 	return s.memory.ListWorkflows()
 }
@@ -241,6 +245,10 @@ func (s *PostgresStore) CreateActor(state actor.State, idempotencyKey string) (a
 
 func (s *PostgresStore) GetActor(actorID string) (actor.State, bool) {
 	return s.memory.GetActor(actorID)
+}
+
+func (s *PostgresStore) GetActorByIdempotencyKey(idempotencyKey string) (actor.State, bool) {
+	return s.memory.GetActorByIdempotencyKey(idempotencyKey)
 }
 
 func (s *PostgresStore) ListActors() []actor.State {
