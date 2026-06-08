@@ -1,0 +1,11 @@
+{
+  "queueDepth": 0,
+  "queueHighWatermark": 1024,
+  "redeliveryTimeoutMs": 30000,
+  "schedulingPolicy": "SCHEDULING_POLICY_LOCALITY_AWARE",
+  "tasks": [],
+  "workflows": [],
+  "actors": [],
+  "workers": [],
+  "models": []
+}

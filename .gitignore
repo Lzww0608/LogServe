@@ -1,0 +1,10 @@
+.gocache/
+bin/
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+dashboard/snapshot.json
+benchmarks/phase5_latest.json
+reports/*.json

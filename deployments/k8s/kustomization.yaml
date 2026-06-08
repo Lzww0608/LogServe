@@ -1,0 +1,5 @@
+resources:
+  - namespace.yaml
+  - logd.yaml
+  - control.yaml
+  - worker.yaml

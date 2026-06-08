@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LogServe Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --ink: #1d2633;
+      --muted: #697586;
+      --line: #d8dee8;
+      --accent: #0f766e;
+      --warn: #b45309;
+      --bad: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      padding: 18px 24px;
+      background: #111827;
+      color: white;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+    }
+    h1, h2 { margin: 0; letter-spacing: 0; }
+    h1 { font-size: 20px; }
+    h2 { font-size: 16px; margin-bottom: 10px; }
+    main {
+      padding: 20px 24px 32px;
+      display: grid;
+      gap: 18px;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      overflow: auto;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      background: #eef6f5;
+      border-left: 4px solid var(--accent);
+      padding: 12px;
+      border-radius: 6px;
+    }
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .metric strong { font-size: 20px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 720px;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    th { color: var(--muted); font-weight: 600; background: #f8fafc; }
+    .status {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      background: #e5e7eb;
+    }
+    .ok { background: #dcfce7; color: #166534; }
+    .warn { background: #fef3c7; color: var(--warn); }
+    .bad { background: #fee2e2; color: var(--bad); }
+    .dag {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      min-height: 44px;
+    }
+    .node {
+      border: 1px solid var(--line);
+      background: #f8fafc;
+      border-radius: 6px;
+      padding: 7px 10px;
+    }
+    .arrow { color: var(--muted); }
+    code { color: #374151; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>LogServe Dashboard</h1>
+    <div id="updated">snapshot.json</div>
+  </header>
+  <main>
+    <section class="metrics" id="metrics"></section>
+    <section>
+      <h2>Workflow DAG</h2>
+      <div id="workflows"></div>
+    </section>
+    <section>
+      <h2>Tasks</h2>
+      <div id="tasks"></div>
+    </section>
+    <section>
+      <h2>Actors</h2>
+      <div id="actors"></div>
+    </section>
+    <section>
+      <h2>Workers And Model Cache</h2>
+      <div id="workers"></div>
+    </section>
+  </main>
+  <script>
+    const statusClass = (value) => {
+      if (String(value).includes("SUCCEEDED") || String(value).includes("COMPLETED") || String(value).includes("ACTIVE")) return "ok";
+      if (String(value).includes("FAILED")) return "bad";
+      return "warn";
+    };
+
+    const pick = (obj, camel, snake) => obj?.[camel] ?? obj?.[snake];
+    const cell = (value) => value === undefined || value === null || value === "" ? "-" : value;
+
+    const table = (columns, rows) => {
+      const head = `<tr>${columns.map((c) => `<th>${c.label}</th>`).join("")}</tr>`;
+      const body = rows.map((row) => `<tr>${columns.map((c) => `<td>${c.render ? c.render(row) : cell(row[c.key])}</td>`).join("")}</tr>`).join("");
+      return `<table>${head}${body}</table>`;
+    };
+
+    const status = (value) => `<span class="status ${statusClass(value)}">${cell(value)}</span>`;
+
+    const render = (data) => {
+      document.getElementById("metrics").innerHTML = [
+        ["Queue Depth", pick(data, "queueDepth", "queue_depth") || 0],
+        ["High Watermark", pick(data, "queueHighWatermark", "queue_high_watermark") || 0],
+        ["Redelivery Timeout", `${pick(data, "redeliveryTimeoutMs", "redelivery_timeout_ms") || 0} ms`],
+        ["Scheduling Policy", pick(data, "schedulingPolicy", "scheduling_policy") || "-"],
+      ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
+
+      document.getElementById("workflows").innerHTML = (data.workflows || []).map((wf) => {
+        const nodes = (wf.steps || []).map((step, i) => `${i ? '<span class="arrow">-></span>' : ''}<span class="node">${pick(step, "stepId", "step_id")}<br>${status(step.status)}</span>`).join("");
+        return `<p><code>${pick(wf, "workflowId", "workflow_id")}</code> ${status(wf.status)}</p><div class="dag">${nodes}</div>`;
+      }).join("") || "No workflows";
+
+      document.getElementById("tasks").innerHTML = table([
+        { label: "Task", render: (r) => pick(r, "taskId", "task_id") },
+        { label: "Name", render: (r) => pick(r, "taskName", "task_name") },
+        { label: "Status", render: (r) => status(r.status) },
+        { label: "Worker", render: (r) => pick(r, "workerId", "worker_id") },
+        { label: "Workflow", render: (r) => pick(r, "workflowId", "workflow_id") },
+        { label: "Actor", render: (r) => pick(r, "actorId", "actor_id") },
+        { label: "Model", render: (r) => [pick(r, "llmModelName", "llm_model_name"), pick(r, "llmModelVersion", "llm_model_version")].filter(Boolean).join(":") || "-" },
+      ], data.tasks || []);
+
+      document.getElementById("actors").innerHTML = table([
+        { label: "Actor", render: (r) => pick(r, "actorId", "actor_id") },
+        { label: "Class", render: (r) => pick(r, "className", "class_name") },
+        { label: "Status", render: (r) => status(r.status) },
+        { label: "Owner", render: (r) => pick(r, "ownerWorkerId", "owner_worker_id") },
+        { label: "Epoch", key: "epoch" },
+        { label: "Commands", render: (r) => pick(r, "commandCount", "command_count") },
+        { label: "Snapshot", render: (r) => pick(r, "snapshotCommandCount", "snapshot_command_count") },
+      ], data.actors || []);
+
+      document.getElementById("workers").innerHTML = table([
+        { label: "Worker", render: (r) => pick(r, "workerId", "worker_id") },
+        { label: "Capacity", key: "capacity" },
+        { label: "Running", render: (r) => pick(r, "runningTasks", "running_tasks") },
+        { label: "Cached Models", render: (r) => (pick(r, "cachedModels", "cached_models") || []).map((m) => `${m.name}:${m.version || "v1"}`).join(", ") || "-" },
+        { label: "Heartbeat", render: (r) => pick(r, "lastHeartbeatMs", "last_heartbeat_ms") },
+      ], data.workers || []);
+    };
+
+    fetch("snapshot.json", { cache: "no-store" })
+      .then((response) => response.json())
+      .then(render)
+      .catch((error) => {
+        document.querySelector("main").innerHTML = `<section>Unable to load snapshot.json: ${error.message}</section>`;
+      });
+  </script>
+</body>
+</html>

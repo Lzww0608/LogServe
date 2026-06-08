@@ -1,0 +1,332 @@
+# LogServe
+
+LogServe is a lightweight shared-log-based runtime for AI workflow infrastructure.
+Phase 1 focuses on the smallest distributed task execution path:
+
+1. Python SDK submits a `@task`.
+2. Control plane appends `TaskSubmitted` and queues the task.
+3. Worker heartbeats, polls, appends `TaskStarted`, executes Python, and appends `TaskCompleted`.
+4. Task status can be queried from the control plane.
+5. Shared log can be read by stream for replay/debugging.
+
+Phase 2 adds a multi-step workflow runtime with replay and retry. Phase 3 adds
+stateful Python actors with mailbox serialization, log replay, snapshots, and
+epoch fencing. Phase 4 adds LLM serving with model registry, worker model-cache
+reporting, and locality-aware scheduling.
+
+## Repository Layout
+
+```text
+cmd/
+  logserve-logd      Shared log service
+  logserve-control   Control plane and in-memory queue
+  logserve-worker    Worker agent and Python executor bridge
+  logserve-dev       Single-process local dev runner
+  logservectl        CLI used by the Python SDK
+proto/               gRPC contracts
+internal/logstore    Segmented append-only log v0
+internal/control     Task API and status materialization
+internal/workflow    Workflow DAG model, argument resolution, replay
+internal/actor       Actor state model and replay reducer
+internal/worker      Worker polling and task execution
+internal/objectstore Local result store v0 for large workflow results
+sdk/python/logserve  Python SDK
+executor/python      Python function executor
+deployments/         Docker Compose skeleton for Phase 1 infra
+```
+
+## Local Demo Without Docker
+
+Docker is optional for the Phase 1 local loop. From the repository root:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase1_smoke.ps1
+```
+
+Or run the services manually:
+
+```powershell
+go run ./cmd/logserve-dev
+```
+
+In another PowerShell:
+
+```powershell
+$env:PYTHONPATH = "$PWD\sdk\python"
+python .\examples\hello_task\add.py
+```
+
+Expected output:
+
+```text
+3
+```
+
+## Phase 2 Workflow Demo
+
+Run the Python `@workflow` DSL example:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase2_smoke.ps1
+```
+
+Expected output:
+
+```text
+answer:hello:doc:vec:hello
+```
+
+The example shape is:
+
+```python
+@workflow
+def simple_rag(query: str):
+    vec = embed(query)
+    docs = search(vec)
+    ans = generate_mock(query, docs)
+    return ans
+```
+
+During submission the Python SDK traces `@task` calls into a DAG. The Go control
+plane schedules only ready steps, substitutes completed step outputs into
+dependent step inputs, and writes workflow events to `wf:<workflow_id>`.
+
+## Separate Process Mode
+
+```powershell
+go run ./cmd/logserve-logd --addr 127.0.0.1:50051 --data-dir data/logstore
+go run ./cmd/logserve-control --addr 127.0.0.1:50052 --log-addr 127.0.0.1:50051
+go run ./cmd/logserve-worker --worker-id worker-1 --control-addr 127.0.0.1:50052 --log-addr 127.0.0.1:50051
+```
+
+Then run the same Python demo.
+
+## Docker Compose
+
+The Compose file starts PostgreSQL, NATS JetStream, MinIO, logd, control, and a worker:
+
+```powershell
+docker compose -f deployments/docker-compose.yml up --build
+```
+
+The current Phase 1 runtime uses the in-memory queue path and in-memory metadata
+materialization so it can run without external services. PostgreSQL migrations are
+included under `internal/metadata/migrations` as the Phase 1 database contract.
+
+## Tests
+
+```powershell
+go test ./...
+```
+
+Covered Phase 1 checks:
+
+- append/read and idempotent append in shared log
+- recovery truncation for partial log tail
+- worker heartbeat, task execution, status query, and task event log chain
+
+Covered Phase 2 checks:
+
+- `simple_rag` workflow completion
+- worker stops after `embed`; a restarted worker continues from `search` without re-running `embed`
+- replayed workflow state from shared log matches metadata state
+- duplicate step completion does not write a second workflow final result
+- failed steps retry according to `max_attempts`
+
+## Phase 2 Semantics
+
+Workflow source of truth is the shared log. Metadata is a materialized current
+view and can be checked against replay through `ReplayWorkflow`.
+
+LogServe Phase 2 provides exactly-once-ish workflow step results, not strict
+distributed exactly-once execution. The worker may execute a task at least once.
+The workflow engine deduplicates final step results using:
+
+```text
+workflow_id + step_id + input_hash
+```
+
+Retry attempts add an attempt number to the task dispatch key so a failed
+attempt can run again, while duplicate successful completions for the same
+step/input do not create another workflow final result.
+
+Large workflow step results are written through the result-store interface and
+workflow log events keep only `result_ref`. The local development adapter stores
+objects under a filesystem-backed `local://` namespace; the Compose environment
+still includes MinIO for the later S3-compatible adapter.
+
+## Phase 3 Actor Demo
+
+Run the Python `@actor` counter example:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase3_smoke.ps1
+```
+
+Expected output:
+
+```text
+100
+```
+
+The example shape is:
+
+```python
+@actor
+class Counter:
+    def __init__(self):
+        self.value = 0
+
+    def inc(self):
+        self.value += 1
+        return self.value
+
+    def get(self):
+        return self.value
+```
+
+The SDK creates an actor instance with `create_actor(Counter)`. Calls such as
+`counter.inc()` are submitted to the control plane as actor tasks targeted at
+the current owner worker.
+
+Covered Phase 3 checks:
+
+- `Counter` actor recovery after the first worker exits at 100 `inc()` calls
+- a second worker takes ownership and `get()` returns `100`
+- replayed actor state from `actor:<actor_id>` matches metadata state
+- snapshots reduce replay work compared with full command replay
+- 1000 concurrent `inc()` submissions serialize through the actor mailbox and
+  final `get()` returns `1000`
+- stale actor completions are rejected by worker id plus epoch fencing
+
+## Phase 3 Semantics
+
+Actor source of truth is the shared log stream `actor:<actor_id>`. Metadata is a
+materialized current view. Replay applies:
+
+```text
+ActorCreated -> ActorOwnershipGranted -> ActorCommandApplied -> ActorSnapshotCreated
+```
+
+LogServe Phase 3 provides exactly-once-ish actor command application, not strict
+distributed exactly-once execution. A worker may execute a method more than once
+after failure or redelivery, but the control plane applies a command to actor
+state through an idempotent log key:
+
+```text
+actor_id + actor_call_id + applied
+```
+
+The mailbox is enforced in the control plane with one lock per actor. While this
+single control-plane implementation is running, only one call for a given actor
+can be scheduled and committed at a time, so in-memory actor state is not written
+concurrently.
+
+Actor ownership is represented by `owner_worker_id` and a monotonically
+increasing `epoch`. Actor tasks are routed only to the owner. If the owner stops
+heartbeating past the lease window, the control plane grants a higher epoch to
+another active worker. Completion from an old owner or old epoch is rejected
+before writing `ActorCommandApplied`.
+
+Snapshots are written through the result-store interface and the actor log keeps
+only `snapshot_ref`. The local development adapter stores snapshot objects under
+`local://actors/<actor_id>/snapshots/...`; the Compose stack includes MinIO, and
+the same result-store boundary is where an S3-compatible MinIO adapter should be
+plugged in for production-style deployments.
+
+Observability is emitted as structured logs. Workflow runs include end-to-end
+latency and step latency; actor commands include actor id, call id, epoch, and
+command count, with replay exposing full versus snapshot command counts.
+
+## Phase 4 LLM Demo
+
+Run the RAG workflow with a mock LLM and three workers:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase4_smoke.ps1
+```
+
+The script starts:
+
+```text
+worker-1: cached model-A:v1
+worker-2: cached model-B:v1
+worker-3: empty cache
+```
+
+Then it registers `model-A`, enables `LOCALITY_AWARE`, and runs:
+
+```python
+@workflow
+def rag_with_llm(query: str):
+    vec = embed(query)
+    docs = search(vec)
+    prompt = build_prompt(query, docs)
+    return llm_generate("model-A", prompt, version="v1", adapter="mock")
+```
+
+Expected output contains:
+
+```text
+mock:model-A:v1
+```
+
+## Phase 4 Semantics
+
+The model registry records model name, version, size, path, and adapter. Workers
+report local model cache entries during registration and heartbeat. A mock LLM
+adapter simulates cold model load and first-token latency on machines without a
+GPU. The `vllm` adapter calls a vLLM OpenAI-compatible
+`/v1/chat/completions` endpoint using `LOGSERVE_VLLM_BASE_URL` or
+`--vllm-base-url`.
+
+Two scheduler policies are implemented:
+
+- `RESOURCE_ONLY`: assign queued LLM work to an idle polling worker without
+  considering model cache.
+- `LOCALITY_AWARE`: score active workers by cache hit, available capacity, and
+  queue wait. Cached workers are preferred while they have capacity; cold workers
+  can run work when cached capacity is unavailable.
+
+LLM requests are task instances with extra model metadata. The worker writes the
+LLM event stream `llm:<task_id>`:
+
+```text
+ModelLoadStarted -> ModelLoaded -> LLMCompleted
+```
+
+`ReplayLLM` reconstructs model name/version, worker id, cache hit, model load
+time, first-token latency, total latency, and the raw event sequence from that
+stream.
+
+Covered Phase 4 checks:
+
+- resource-only assigns a model-A request to the first idle worker
+- locality-aware waits for the worker that already caches model-A
+- locality-aware experiment has higher cache hit rate and lower cold-start,
+  p95, and p99 latency than resource-only
+- mock LLM event replay includes model load and completion metrics
+- a RAG workflow can use `llm_generate()` as a real workflow step
+
+## Phase 5 Analysis And Hardening
+
+Phase 5 adds operational analysis assets and runtime hardening:
+
+- running task redelivery after worker loss
+- queue high-watermark backpressure
+- dashboard snapshot API and static dashboard
+- benchmark harness for workflow latency, task throughput, actor replay, and
+  LLM cold start
+- ablation report for locality, snapshots, and replay semantics
+- fault-injection script for worker/control/logd probes
+- optional Kubernetes manifests for kind or minikube
+
+Useful commands:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_benchmark.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_fault_injection.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_dashboard.ps1
+```
+
+The detailed analysis is in `docs/phase5_analysis.md`.

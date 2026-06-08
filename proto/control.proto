@@ -1,0 +1,405 @@
+syntax = "proto3";
+
+package logserve.v1;
+
+option go_package = "github.com/logserve/logserve/gen/logservepb;logservepb";
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_QUEUED = 1;
+  TASK_STATUS_RUNNING = 2;
+  TASK_STATUS_SUCCEEDED = 3;
+  TASK_STATUS_FAILED = 4;
+}
+
+enum WorkflowStatus {
+  WORKFLOW_STATUS_UNSPECIFIED = 0;
+  WORKFLOW_STATUS_RUNNING = 1;
+  WORKFLOW_STATUS_COMPLETED = 2;
+  WORKFLOW_STATUS_FAILED = 3;
+}
+
+enum WorkflowStepStatus {
+  WORKFLOW_STEP_STATUS_UNSPECIFIED = 0;
+  WORKFLOW_STEP_STATUS_SCHEDULED = 1;
+  WORKFLOW_STEP_STATUS_STARTED = 2;
+  WORKFLOW_STEP_STATUS_SUCCEEDED = 3;
+  WORKFLOW_STEP_STATUS_FAILED = 4;
+}
+
+enum ActorStatus {
+  ACTOR_STATUS_UNSPECIFIED = 0;
+  ACTOR_STATUS_ACTIVE = 1;
+  ACTOR_STATUS_UNAVAILABLE = 2;
+}
+
+enum SchedulingPolicy {
+  SCHEDULING_POLICY_UNSPECIFIED = 0;
+  SCHEDULING_POLICY_RESOURCE_ONLY = 1;
+  SCHEDULING_POLICY_LOCALITY_AWARE = 2;
+}
+
+message ModelInfo {
+  string name = 1;
+  string version = 2;
+  uint64 size_bytes = 3;
+  string path = 4;
+  string adapter = 5;
+}
+
+message ModelCacheEntry {
+  string name = 1;
+  string version = 2;
+}
+
+message TaskSpec {
+  string task_id = 1;
+  string task_name = 2;
+  string function_name = 3;
+  string function_source = 4;
+  bytes args_json = 5;
+  string idempotency_key = 6;
+  string workflow_id = 7;
+  string step_id = 8;
+  string target_worker_id = 9;
+  string actor_id = 10;
+  string actor_call_id = 11;
+  string actor_class_name = 12;
+  string actor_class_source = 13;
+  string actor_method = 14;
+  bytes actor_state_json = 15;
+  bytes actor_init_args_json = 16;
+  uint64 actor_epoch = 17;
+  string llm_model_name = 18;
+  string llm_model_version = 19;
+  string llm_adapter = 20;
+  uint32 llm_max_tokens = 21;
+}
+
+message SubmitTaskRequest {
+  string task_name = 1;
+  string function_name = 2;
+  string function_source = 3;
+  bytes args_json = 4;
+  string idempotency_key = 5;
+}
+
+message SubmitTaskResponse {
+  string task_id = 1;
+  TaskStatus status = 2;
+}
+
+message GetTaskStatusRequest {
+  string task_id = 1;
+}
+
+message GetTaskStatusResponse {
+  string task_id = 1;
+  TaskStatus status = 2;
+  bytes result_json = 3;
+  string error = 4;
+  string worker_id = 5;
+  int64 created_at_ms = 6;
+  int64 updated_at_ms = 7;
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string address = 2;
+  map<string, string> labels = 3;
+  repeated ModelCacheEntry cached_models = 4;
+  uint32 capacity = 5;
+}
+
+message RegisterWorkerResponse {
+  bool accepted = 1;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  repeated ModelCacheEntry cached_models = 2;
+}
+
+message HeartbeatResponse {
+  int64 server_time_ms = 1;
+}
+
+message PollTaskRequest {
+  string worker_id = 1;
+}
+
+message PollTaskResponse {
+  bool has_task = 1;
+  TaskSpec task = 2;
+}
+
+message StartTaskRequest {
+  string task_id = 1;
+  string worker_id = 2;
+}
+
+message StartTaskResponse {
+  bool accepted = 1;
+}
+
+message CompleteTaskRequest {
+  string task_id = 1;
+  string worker_id = 2;
+  TaskStatus status = 3;
+  bytes result_json = 4;
+  string error = 5;
+  bytes actor_state_json = 6;
+  uint64 actor_epoch = 7;
+}
+
+message CompleteTaskResponse {
+  bool accepted = 1;
+}
+
+message WorkflowStepState {
+  string step_id = 1;
+  string task_name = 2;
+  WorkflowStepStatus status = 3;
+  uint32 attempts = 4;
+  string task_id = 5;
+  bytes result_json = 6;
+  string result_ref = 7;
+  string error = 8;
+  int64 started_at_ms = 9;
+  int64 completed_at_ms = 10;
+  int64 latency_ms = 11;
+}
+
+message SubmitWorkflowRequest {
+  string workflow_name = 1;
+  bytes definition_json = 2;
+  string idempotency_key = 3;
+}
+
+message SubmitWorkflowResponse {
+  string workflow_id = 1;
+  WorkflowStatus status = 2;
+}
+
+message GetWorkflowStatusRequest {
+  string workflow_id = 1;
+}
+
+message GetWorkflowStatusResponse {
+  string workflow_id = 1;
+  string workflow_name = 2;
+  WorkflowStatus status = 3;
+  repeated WorkflowStepState steps = 4;
+  bytes result_json = 5;
+  string result_ref = 6;
+  string error = 7;
+  int64 created_at_ms = 8;
+  int64 updated_at_ms = 9;
+  int64 completed_at_ms = 10;
+  int64 latency_ms = 11;
+}
+
+message ReplayWorkflowRequest {
+  string workflow_id = 1;
+}
+
+message ReplayWorkflowResponse {
+  GetWorkflowStatusResponse replayed = 1;
+  bool consistent_with_metadata = 2;
+}
+
+message CreateActorRequest {
+  string class_name = 1;
+  string class_source = 2;
+  bytes init_args_json = 3;
+  string idempotency_key = 4;
+  uint32 snapshot_every = 5;
+}
+
+message CreateActorResponse {
+  string actor_id = 1;
+  ActorStatus status = 2;
+  string owner_worker_id = 3;
+  uint64 epoch = 4;
+}
+
+message CallActorRequest {
+  string actor_id = 1;
+  string method_name = 2;
+  bytes args_json = 3;
+  string idempotency_key = 4;
+  int64 timeout_ms = 5;
+}
+
+message CallActorResponse {
+  string actor_id = 1;
+  string call_id = 2;
+  TaskStatus status = 3;
+  bytes result_json = 4;
+  string error = 5;
+  uint64 epoch = 6;
+}
+
+message GetActorStatusRequest {
+  string actor_id = 1;
+}
+
+message GetActorStatusResponse {
+  string actor_id = 1;
+  string class_name = 2;
+  ActorStatus status = 3;
+  string owner_worker_id = 4;
+  uint64 epoch = 5;
+  uint64 command_count = 6;
+  string snapshot_ref = 7;
+  uint64 snapshot_command_count = 8;
+  bytes state_json = 9;
+  int64 created_at_ms = 10;
+  int64 updated_at_ms = 11;
+}
+
+message ReplayActorRequest {
+  string actor_id = 1;
+}
+
+message ReplayActorResponse {
+  GetActorStatusResponse replayed = 1;
+  bool consistent_with_metadata = 2;
+  uint64 full_replay_commands = 3;
+  uint64 snapshot_replay_commands = 4;
+}
+
+message RegisterModelRequest {
+  ModelInfo model = 1;
+}
+
+message RegisterModelResponse {
+  ModelInfo model = 1;
+}
+
+message SetSchedulingPolicyRequest {
+  SchedulingPolicy policy = 1;
+}
+
+message SetSchedulingPolicyResponse {
+  SchedulingPolicy policy = 1;
+}
+
+message SubmitLLMRequest {
+  string model_name = 1;
+  string model_version = 2;
+  string prompt = 3;
+  uint32 max_tokens = 4;
+  string adapter = 5;
+  string idempotency_key = 6;
+}
+
+message SubmitLLMResponse {
+  string task_id = 1;
+  TaskStatus status = 2;
+}
+
+message LLMEvent {
+  string event_type = 1;
+  int64 timestamp_ms = 2;
+  string task_id = 3;
+  string model_name = 4;
+  string model_version = 5;
+  string worker_id = 6;
+  bool cache_hit = 7;
+  int64 model_load_ms = 8;
+  int64 first_token_ms = 9;
+  int64 total_latency_ms = 10;
+}
+
+message ReplayLLMRequest {
+  string task_id = 1;
+}
+
+message ReplayLLMResponse {
+  string task_id = 1;
+  string model_name = 2;
+  string model_version = 3;
+  string worker_id = 4;
+  bool cache_hit = 5;
+  int64 model_load_ms = 6;
+  int64 first_token_ms = 7;
+  int64 total_latency_ms = 8;
+  repeated LLMEvent events = 9;
+}
+
+message SetBackpressureRequest {
+  uint32 queue_high_watermark = 1;
+  int64 redelivery_timeout_ms = 2;
+}
+
+message SetBackpressureResponse {
+  uint32 queue_high_watermark = 1;
+  int64 redelivery_timeout_ms = 2;
+}
+
+message DashboardTask {
+  string task_id = 1;
+  string task_name = 2;
+  TaskStatus status = 3;
+  string worker_id = 4;
+  string workflow_id = 5;
+  string step_id = 6;
+  string actor_id = 7;
+  string llm_model_name = 8;
+  string llm_model_version = 9;
+  int64 created_at_ms = 10;
+  int64 updated_at_ms = 11;
+}
+
+message DashboardWorkflow {
+  string workflow_id = 1;
+  string workflow_name = 2;
+  WorkflowStatus status = 3;
+  repeated WorkflowStepState steps = 4;
+}
+
+message DashboardWorker {
+  string worker_id = 1;
+  uint32 capacity = 2;
+  uint32 running_tasks = 3;
+  repeated ModelCacheEntry cached_models = 4;
+  int64 last_heartbeat_ms = 5;
+}
+
+message DashboardSnapshot {
+  uint32 queue_depth = 1;
+  uint32 queue_high_watermark = 2;
+  int64 redelivery_timeout_ms = 3;
+  SchedulingPolicy scheduling_policy = 4;
+  repeated DashboardTask tasks = 5;
+  repeated DashboardWorkflow workflows = 6;
+  repeated GetActorStatusResponse actors = 7;
+  repeated DashboardWorker workers = 8;
+  repeated ModelInfo models = 9;
+}
+
+message GetDashboardSnapshotRequest {}
+
+service ControlService {
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+  rpc SubmitWorkflow(SubmitWorkflowRequest) returns (SubmitWorkflowResponse);
+  rpc GetWorkflowStatus(GetWorkflowStatusRequest) returns (GetWorkflowStatusResponse);
+  rpc ReplayWorkflow(ReplayWorkflowRequest) returns (ReplayWorkflowResponse);
+  rpc RegisterModel(RegisterModelRequest) returns (RegisterModelResponse);
+  rpc SetSchedulingPolicy(SetSchedulingPolicyRequest) returns (SetSchedulingPolicyResponse);
+  rpc SubmitLLM(SubmitLLMRequest) returns (SubmitLLMResponse);
+  rpc ReplayLLM(ReplayLLMRequest) returns (ReplayLLMResponse);
+  rpc SetBackpressure(SetBackpressureRequest) returns (SetBackpressureResponse);
+  rpc GetDashboardSnapshot(GetDashboardSnapshotRequest) returns (DashboardSnapshot);
+  rpc CreateActor(CreateActorRequest) returns (CreateActorResponse);
+  rpc CallActor(CallActorRequest) returns (CallActorResponse);
+  rpc GetActorStatus(GetActorStatusRequest) returns (GetActorStatusResponse);
+  rpc ReplayActor(ReplayActorRequest) returns (ReplayActorResponse);
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
+  rpc StartTask(StartTaskRequest) returns (StartTaskResponse);
+  rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
+}

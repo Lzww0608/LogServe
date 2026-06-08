@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logserve-worker-a
+  namespace: logserve
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logserve-worker-a
+  template:
+    metadata:
+      labels:
+        app: logserve-worker-a
+    spec:
+      containers:
+        - name: worker
+          image: logserve:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - logserve-worker
+            - --worker-id
+            - worker-a
+            - --control-addr
+            - logserve-control:50052
+            - --log-addr
+            - logserve-logd:50051
+            - --executor
+            - /app/executor/python/server.py
+            - --models
+            - model-A:v1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logserve-worker-b
+  namespace: logserve
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logserve-worker-b
+  template:
+    metadata:
+      labels:
+        app: logserve-worker-b
+    spec:
+      containers:
+        - name: worker
+          image: logserve:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - logserve-worker
+            - --worker-id
+            - worker-b
+            - --control-addr
+            - logserve-control:50052
+            - --log-addr
+            - logserve-logd:50051
+            - --executor
+            - /app/executor/python/server.py
+            - --models
+            - model-B:v1

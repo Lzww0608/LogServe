@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: logserve
+      POSTGRES_PASSWORD: logserve
+      POSTGRES_DB: logserve
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  nats:
+    image: nats:2.10
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: logserve
+      MINIO_ROOT_PASSWORD: logserve123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  logd:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command: ["logserve-logd", "--addr", "0.0.0.0:50051", "--data-dir", "/var/lib/logserve/logstore"]
+    ports:
+      - "50051:50051"
+    volumes:
+      - logstore-data:/var/lib/logserve/logstore
+
+  control:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command: ["logserve-control", "--addr", "0.0.0.0:50052", "--log-addr", "logd:50051"]
+    ports:
+      - "50052:50052"
+    depends_on:
+      - logd
+      - postgres
+      - nats
+      - minio
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command: ["logserve-worker", "--worker-id", "worker-1", "--control-addr", "control:50052", "--log-addr", "logd:50051", "--executor", "/app/executor/python/server.py"]
+    depends_on:
+      - control
+
+volumes:
+  postgres-data:
+  minio-data:
+  logstore-data:

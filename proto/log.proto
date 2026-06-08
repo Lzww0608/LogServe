@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package logserve.v1;
+
+option go_package = "github.com/logserve/logserve/gen/logservepb;logservepb";
+
+message LogRecord {
+  string stream_id = 1;
+  uint64 seq = 2;
+  string event_type = 3;
+  string idempotency_key = 4;
+  bytes payload = 5;
+  int64 timestamp_ms = 6;
+  uint32 crc32 = 7;
+}
+
+message AppendLogRequest {
+  string stream_id = 1;
+  string event_type = 2;
+  string idempotency_key = 3;
+  bytes payload = 4;
+}
+
+message AppendLogResponse {
+  uint64 seq = 1;
+  int64 timestamp_ms = 2;
+  uint32 crc32 = 3;
+  bool duplicate = 4;
+}
+
+message ReadLogRequest {
+  string stream_id = 1;
+  uint64 from_seq = 2;
+  uint32 limit = 3;
+}
+
+message ReadLogResponse {
+  repeated LogRecord records = 1;
+}
+
+service LogService {
+  rpc AppendLog(AppendLogRequest) returns (AppendLogResponse);
+  rpc ReadLog(ReadLogRequest) returns (ReadLogResponse);
+}
