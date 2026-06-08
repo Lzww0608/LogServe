@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS workflow_instances (
   workflow_id TEXT PRIMARY KEY,
+  workflow_name TEXT,
   status TEXT NOT NULL,
   input_json JSONB,
   definition_json JSONB,
@@ -7,7 +8,8 @@ CREATE TABLE IF NOT EXISTS workflow_instances (
   output_ref TEXT,
   error TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS task_instances (
@@ -15,6 +17,15 @@ CREATE TABLE IF NOT EXISTS task_instances (
   task_name TEXT NOT NULL,
   status TEXT NOT NULL,
   worker_id TEXT,
+  workflow_id TEXT,
+  step_id TEXT,
+  target_worker_id TEXT,
+  actor_id TEXT,
+  actor_call_id TEXT,
+  actor_epoch BIGINT NOT NULL DEFAULT 0,
+  task_lease_epoch BIGINT NOT NULL DEFAULT 0,
+  llm_model_name TEXT,
+  llm_model_version TEXT,
   idempotency_key TEXT UNIQUE,
   result_json JSONB,
   error TEXT,
@@ -26,6 +37,8 @@ CREATE TABLE IF NOT EXISTS workers (
   worker_id TEXT PRIMARY KEY,
   address TEXT,
   labels JSONB NOT NULL DEFAULT '{}',
+  capacity INTEGER NOT NULL DEFAULT 1,
+  running_tasks INTEGER NOT NULL DEFAULT 0,
   last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -53,6 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_workflow_steps_status ON workflow_steps(status);
 CREATE TABLE IF NOT EXISTS actor_instances (
   actor_id TEXT PRIMARY KEY,
   class_name TEXT NOT NULL,
+  class_source TEXT,
   status TEXT NOT NULL,
   owner_worker_id TEXT,
   epoch BIGINT NOT NULL DEFAULT 0,
@@ -118,3 +132,18 @@ CREATE TABLE IF NOT EXISTS llm_requests (
 
 CREATE INDEX IF NOT EXISTS idx_worker_model_cache_model ON worker_model_cache(model_name, model_version);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model_name, model_version);
+
+ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS workflow_name TEXT;
+ALTER TABLE workflow_instances ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS workflow_id TEXT;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS step_id TEXT;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS target_worker_id TEXT;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS actor_id TEXT;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS actor_call_id TEXT;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS actor_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS task_lease_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS llm_model_name TEXT;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS llm_model_version TEXT;
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS capacity INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS running_tasks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE actor_instances ADD COLUMN IF NOT EXISTS class_source TEXT;

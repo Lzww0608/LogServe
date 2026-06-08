@@ -12,6 +12,7 @@ import (
 	"github.com/logserve/logserve/internal/metadata"
 	"github.com/logserve/logserve/internal/observability"
 	"github.com/logserve/logserve/internal/workflow"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const bootstrapReadLimit = 1000
@@ -20,10 +21,16 @@ func (s *Service) BootstrapFromLog(ctx context.Context) error {
 	if err := s.bootstrapModels(ctx); err != nil {
 		return err
 	}
+	if err := s.bootstrapWorkers(ctx); err != nil {
+		return err
+	}
 	if err := s.bootstrapScheduler(ctx); err != nil {
 		return err
 	}
 	if err := s.bootstrapBackpressure(ctx); err != nil {
+		return err
+	}
+	if err := s.bootstrapTasks(ctx); err != nil {
 		return err
 	}
 	if err := s.bootstrapWorkflows(ctx); err != nil {
@@ -33,6 +40,94 @@ func (s *Service) BootstrapFromLog(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Service) bootstrapTasks(ctx context.Context) error {
+	streams, err := s.listStreams(ctx, "task:")
+	if err != nil {
+		return err
+	}
+	for _, streamID := range streams {
+		records, err := s.readAllLog(ctx, streamID)
+		if err != nil {
+			return err
+		}
+		spec, status, leaseEpoch, ok, err := replayTaskSpec(records)
+		if err != nil {
+			return err
+		}
+		if !ok || spec.GetWorkflowId() != "" || spec.GetActorId() != "" {
+			continue
+		}
+		task := metadata.Task{
+			TaskID:          spec.GetTaskId(),
+			TaskName:        spec.GetTaskName(),
+			Status:          status,
+			TaskLeaseEpoch:  leaseEpoch,
+			TargetWorkerID:  spec.GetTargetWorkerId(),
+			LLMModelName:    spec.GetLlmModelName(),
+			LLMModelVersion: spec.GetLlmModelVersion(),
+		}
+		s.meta.CreateTask(task, spec.GetIdempotencyKey())
+		s.specMu.Lock()
+		s.specs[spec.GetTaskId()] = cloneSpec(spec)
+		s.specMu.Unlock()
+		if status == logservepb.TaskStatus_TASK_STATUS_QUEUED || status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
+			s.queueMu.Lock()
+			if !containsTaskID(s.queue, spec.GetTaskId()) {
+				s.queue = append(s.queue, spec.GetTaskId())
+			}
+			s.queueMu.Unlock()
+		}
+	}
+	return nil
+}
+
+func replayTaskSpec(records []*logservepb.LogRecord) (*logservepb.TaskSpec, logservepb.TaskStatus, uint64, bool, error) {
+	var spec *logservepb.TaskSpec
+	status := logservepb.TaskStatus_TASK_STATUS_QUEUED
+	var leaseEpoch uint64
+	for _, rec := range records {
+		switch rec.GetEventType() {
+		case "TaskSubmitted":
+			var payload taskSubmittedPayload
+			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+				return nil, 0, 0, false, err
+			}
+			if len(payload.TaskSpec) == 0 {
+				continue
+			}
+			decoded := &logservepb.TaskSpec{}
+			if err := protojson.Unmarshal(payload.TaskSpec, decoded); err != nil {
+				return nil, 0, 0, false, err
+			}
+			spec = decoded
+			status = logservepb.TaskStatus_TASK_STATUS_QUEUED
+		case "TaskStarted":
+			var payload struct {
+				TaskLeaseEpoch uint64 `json:"task_lease_epoch"`
+			}
+			_ = json.Unmarshal(rec.GetPayload(), &payload)
+			if payload.TaskLeaseEpoch > leaseEpoch {
+				leaseEpoch = payload.TaskLeaseEpoch
+			}
+			status = logservepb.TaskStatus_TASK_STATUS_RUNNING
+		case "TaskRedelivered":
+			status = logservepb.TaskStatus_TASK_STATUS_QUEUED
+		case "TaskCompleted":
+			status = logservepb.TaskStatus_TASK_STATUS_SUCCEEDED
+		case "TaskFailed":
+			status = logservepb.TaskStatus_TASK_STATUS_FAILED
+		}
+	}
+	if spec == nil {
+		return nil, status, leaseEpoch, false, nil
+	}
+	spec.TaskLeaseEpoch = leaseEpoch
+	if status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
+		status = logservepb.TaskStatus_TASK_STATUS_QUEUED
+	}
+	return spec, status, leaseEpoch, true, nil
 }
 
 func (s *Service) bootstrapModels(ctx context.Context) error {
@@ -49,6 +144,50 @@ func (s *Service) bootstrapModels(ctx context.Context) error {
 			return err
 		}
 		s.meta.RegisterModel(&model)
+	}
+	return nil
+}
+
+func (s *Service) bootstrapWorkers(ctx context.Context) error {
+	records, err := s.readAllLog(ctx, "system:workers")
+	if err != nil {
+		return err
+	}
+	for _, rec := range records {
+		if rec.GetEventType() != "WorkerRegistered" {
+			continue
+		}
+		var payload struct {
+			WorkerID     string `json:"worker_id"`
+			Address      string `json:"address"`
+			Labels       map[string]string
+			CachedModels []struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"cached_models"`
+			Capacity uint32 `json:"capacity"`
+		}
+		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+			return err
+		}
+		if payload.WorkerID == "" {
+			continue
+		}
+		cachedModels := make(map[string]bool, len(payload.CachedModels))
+		for _, model := range payload.CachedModels {
+			if model.Name == "" {
+				continue
+			}
+			cachedModels[metadata.ModelKey(model.Name, model.Version)] = true
+		}
+		s.meta.UpsertWorker(metadata.Worker{
+			WorkerID:      payload.WorkerID,
+			Address:       payload.Address,
+			Labels:        payload.Labels,
+			CachedModels:  cachedModels,
+			Capacity:      payload.Capacity,
+			LastHeartbeat: rec.GetTimestampMs(),
+		})
 	}
 	return nil
 }

@@ -210,20 +210,22 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 	}
 
 	startPayload, _ := json.Marshal(map[string]any{
-		"task_id":   task.GetTaskId(),
-		"worker_id": cfg.WorkerID,
+		"task_id":          task.GetTaskId(),
+		"worker_id":        cfg.WorkerID,
+		"task_lease_epoch": task.GetTaskLeaseEpoch(),
 	})
 	if _, err := logClient.AppendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       taskStream(task.GetTaskId()),
 		EventType:      "TaskStarted",
-		IdempotencyKey: task.GetTaskId() + ":started:" + cfg.WorkerID,
+		IdempotencyKey: fmt.Sprintf("%s:started:%s:%d", task.GetTaskId(), cfg.WorkerID, task.GetTaskLeaseEpoch()),
 		Payload:        startPayload,
 	}); err != nil {
 		return err
 	}
 	if _, err := controlClient.StartTask(ctx, &logservepb.StartTaskRequest{
-		TaskId:   task.GetTaskId(),
-		WorkerId: cfg.WorkerID,
+		TaskId:         task.GetTaskId(),
+		WorkerId:       cfg.WorkerID,
+		TaskLeaseEpoch: task.GetTaskLeaseEpoch(),
 	}); err != nil {
 		return err
 	}
@@ -271,6 +273,7 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 		Error:          errText,
 		ActorStateJson: actorState,
 		ActorEpoch:     task.GetActorEpoch(),
+		TaskLeaseEpoch: task.GetTaskLeaseEpoch(),
 	}); err != nil {
 		return err
 	}

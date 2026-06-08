@@ -179,11 +179,16 @@ func (s *Service) canAssignTaskToWorker(taskID string, spec *logservepb.TaskSpec
 	if !ok || !workerHasCapacity(worker) {
 		return false
 	}
-	if s.getSchedulingPolicy() == logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY {
+	switch s.getSchedulingPolicy() {
+	case logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY:
 		return true
+	case logservepb.SchedulingPolicy_SCHEDULING_POLICY_PREDICTED_LATENCY:
+		preferred := s.predictedLLMWorker(taskID, spec)
+		return preferred == "" || preferred == workerID
+	default:
+		preferred := s.preferredLLMWorker(taskID, spec)
+		return preferred == "" || preferred == workerID
 	}
-	preferred := s.preferredLLMWorker(taskID, spec)
-	return preferred == "" || preferred == workerID
 }
 
 func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) string {
@@ -228,6 +233,90 @@ func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) s
 	return bestWorker
 }
 
+type llmWorkerStats struct {
+	count          int
+	totalLatencyMs int64
+}
+
+func (s *Service) predictedLLMWorker(taskID string, spec *logservepb.TaskSpec) string {
+	workers := s.meta.ActiveWorkers(schedulerWorkerLease)
+	if len(workers) == 0 {
+		return ""
+	}
+	modelKey := metadata.ModelKey(spec.GetLlmModelName(), spec.GetLlmModelVersion())
+	stats := s.observedLLMStats(spec.GetLlmModelName(), spec.GetLlmModelVersion())
+	task, _ := s.meta.GetTask(taskID)
+	queueDelayMs := int64(0)
+	if task.CreatedAtMs > 0 {
+		queueDelayMs = time.Since(time.UnixMilli(task.CreatedAtMs)).Milliseconds()
+	}
+
+	bestWorker := ""
+	bestPrediction := int64(1<<62 - 1)
+	for _, worker := range workers {
+		if !workerHasCapacity(worker) {
+			continue
+		}
+		predicted := predictedLatencyMs(worker, modelKey, stats[worker.WorkerID])
+		predicted += int64(worker.RunningTasks) * 50
+		if queueDelayMs > localityQueueWait.Milliseconds() && !worker.CachedModels[modelKey] {
+			predicted -= 25
+		}
+		if bestWorker == "" || predicted < bestPrediction || (predicted == bestPrediction && worker.WorkerID < bestWorker) {
+			bestWorker = worker.WorkerID
+			bestPrediction = predicted
+		}
+	}
+	return bestWorker
+}
+
+func predictedLatencyMs(worker metadata.Worker, modelKey string, stats llmWorkerStats) int64 {
+	if stats.count > 0 {
+		return stats.totalLatencyMs / int64(stats.count)
+	}
+	if worker.CachedModels[modelKey] {
+		return 25
+	}
+	return 125
+}
+
+func (s *Service) observedLLMStats(modelName, modelVersion string) map[string]llmWorkerStats {
+	streams, err := s.listStreams(context.Background(), "llm:")
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]llmWorkerStats)
+	if modelVersion == "" {
+		modelVersion = "v1"
+	}
+	for _, streamID := range streams {
+		records, err := s.readAllLog(context.Background(), streamID)
+		if err != nil {
+			continue
+		}
+		for _, rec := range records {
+			if rec.GetEventType() != "LLMCompleted" {
+				continue
+			}
+			var payload llmEventPayload
+			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+				continue
+			}
+			if payload.ModelName != modelName || firstNonEmpty(payload.ModelVersion, "v1") != modelVersion {
+				continue
+			}
+			if payload.WorkerID == "" || payload.TotalLatencyMs <= 0 {
+				continue
+			}
+			stats := out[payload.WorkerID]
+			stats.count++
+			stats.totalLatencyMs += payload.TotalLatencyMs
+			out[payload.WorkerID] = stats
+		}
+	}
+	return out
+}
+
 func workerHasCapacity(worker metadata.Worker) bool {
 	capacity := worker.Capacity
 	if capacity == 0 {
@@ -249,4 +338,13 @@ func modelCacheFromProto(entries []*logservepb.ModelCacheEntry) map[string]bool 
 
 func llmStream(taskID string) string {
 	return "llm:" + taskID
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

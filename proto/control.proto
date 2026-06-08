@@ -37,6 +37,7 @@ enum SchedulingPolicy {
   SCHEDULING_POLICY_UNSPECIFIED = 0;
   SCHEDULING_POLICY_RESOURCE_ONLY = 1;
   SCHEDULING_POLICY_LOCALITY_AWARE = 2;
+  SCHEDULING_POLICY_PREDICTED_LATENCY = 3;
 }
 
 message ModelInfo {
@@ -75,6 +76,7 @@ message TaskSpec {
   string llm_adapter = 20;
   uint32 llm_max_tokens = 21;
   int64 timeout_ms = 22;
+  uint64 task_lease_epoch = 23;
 }
 
 message SubmitTaskRequest {
@@ -137,6 +139,7 @@ message PollTaskResponse {
 message StartTaskRequest {
   string task_id = 1;
   string worker_id = 2;
+  uint64 task_lease_epoch = 3;
 }
 
 message StartTaskResponse {
@@ -151,6 +154,7 @@ message CompleteTaskRequest {
   string error = 5;
   bytes actor_state_json = 6;
   uint64 actor_epoch = 7;
+  uint64 task_lease_epoch = 8;
 }
 
 message CompleteTaskResponse {

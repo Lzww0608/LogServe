@@ -24,7 +24,7 @@ cmd/
   logserve-dev       Single-process local dev runner
   logservectl        CLI used by the Python SDK
 proto/               gRPC contracts
-internal/logstore    Segmented append-only log v0
+internal/logstore    Segmented append-only log v1
 internal/control     Task API and status materialization
 internal/workflow    Workflow DAG model, argument resolution, replay
 internal/actor       Actor state model and replay reducer
@@ -94,12 +94,37 @@ dependent step inputs, and writes workflow events to `wf:<workflow_id>`.
 ## Separate Process Mode
 
 ```powershell
-go run ./cmd/logserve-logd --addr 127.0.0.1:50051 --data-dir data/logstore
+go run ./cmd/logserve-logd --addr 127.0.0.1:50051 --data-dir data/logstore --segment-size-bytes 67108864 --fsync-policy always
 go run ./cmd/logserve-control --addr 127.0.0.1:50052 --log-addr 127.0.0.1:50051
 go run ./cmd/logserve-worker --worker-id worker-1 --control-addr 127.0.0.1:50052 --log-addr 127.0.0.1:50051
 ```
 
 Then run the same Python demo.
+
+## Shared Log v1 Benchmark
+
+The shared log uses rolling segment files, a rebuilt-on-start index, and an
+index-backed `ReadLog` path that reads payloads from segment files instead of
+keeping every record body in memory. `logd` exposes:
+
+```text
+--segment-size-bytes
+--fsync-policy always|batch|interval
+--fsync-interval-ms
+```
+
+On the Ubuntu single-node experiment machine, run:
+
+```bash
+bash scripts/logstore_v1_benchmark.sh
+```
+
+The script writes a generated JSON report to
+`benchmarks/logstore_v1_latest.json` and compares append, read, recovery time,
+and segment count across `always`, `batch`, and `interval` fsync policies. You
+can tune the workload through environment variables such as
+`LOGSERVE_LOGBENCH_RECORDS`, `LOGSERVE_LOGBENCH_PAYLOAD_BYTES`, and
+`LOGSERVE_LOGBENCH_SEGMENT_SIZE_BYTES`.
 
 ## Docker Compose
 
@@ -111,10 +136,12 @@ docker compose -f deployments/docker-compose.yml up --build
 
 The default single-process development path uses the in-memory queue and a
 materialized metadata view. Control startup bootstraps workflow, actor, model,
-and backpressure state from the shared log; plain ad-hoc task function specs are
-still held in memory and are not resumed after a control restart. PostgreSQL
-migrations are included under `internal/metadata/migrations` as the Phase 1
-database contract.
+plain ad-hoc task specs, and backpressure state from the shared log. PostgreSQL
+migrations are included under `internal/metadata/migrations`; Compose mode runs
+the control plane with `LOGSERVE_METADATA_STORE=postgres` and writes the
+materialized dashboard/task/workflow/actor/model view to PostgreSQL. If the
+PostgreSQL tables are dropped, restart control after logd and `BootstrapFromLog`
+will recreate the tables and rebuild the view from shared log streams.
 
 ## Tests
 
@@ -137,6 +164,8 @@ Covered Phase 2 checks:
 - failed steps retry according to `max_attempts`
 - timed-out steps fail and retry according to `max_attempts`
 - poll-before-start worker loss redelivers the leased task
+- ordinary ad-hoc task specs are restored from `TaskSubmitted` after control restart
+- stale task completions are rejected by task lease epoch
 
 ## Phase 2 Semantics
 
@@ -288,13 +317,16 @@ GPU. The `vllm` adapter calls a vLLM OpenAI-compatible
 `/v1/chat/completions` endpoint using `LOGSERVE_VLLM_BASE_URL` or
 `--vllm-base-url`.
 
-Two scheduler policies are implemented:
+Three scheduler policies are implemented:
 
 - `RESOURCE_ONLY`: assign queued LLM work to an idle polling worker without
   considering model cache.
 - `LOCALITY_AWARE`: score active workers by cache hit, available capacity, and
   queue wait. Cached workers are preferred while they have capacity; cold workers
   can run work when cached capacity is unavailable.
+- `PREDICTED_LATENCY`: replay recent `llm:*` completion events and prefer the
+  worker with the lowest observed latency for the requested model/version,
+  adjusted by current worker load.
 
 LLM requests are task instances with extra model metadata. The worker writes the
 LLM event stream `llm:<task_id>`:
@@ -311,6 +343,8 @@ Covered Phase 4 checks:
 
 - resource-only assigns a model-A request to the first idle worker
 - locality-aware waits for the worker that already caches model-A
+- predicted-latency can choose a historically faster worker even when another
+  worker has the cache
 - locality-aware experiment has higher cache hit rate and lower cold-start,
   p95, and p99 latency than resource-only
 - mock LLM event replay includes model load and completion metrics
@@ -337,5 +371,3 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_benchmark.ps1
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_fault_injection.ps1
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_dashboard.ps1
 ```
-
-The detailed analysis is in `docs/phase5_analysis.md`.

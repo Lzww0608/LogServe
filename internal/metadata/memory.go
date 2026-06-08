@@ -23,6 +23,7 @@ type Task struct {
 	ActorID         string
 	ActorCallID     string
 	ActorEpoch      uint64
+	TaskLeaseEpoch  uint64
 	LLMModelName    string
 	LLMModelVersion string
 	IdempotencyKey  string
@@ -118,7 +119,7 @@ func (s *MemoryStore) ListTasks() []Task {
 	return out
 }
 
-func (s *MemoryStore) SetTaskRunning(taskID, workerID string) (Task, error) {
+func (s *MemoryStore) LeaseTask(taskID, workerID string) (Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -129,10 +130,31 @@ func (s *MemoryStore) SetTaskRunning(taskID, workerID string) (Task, error) {
 	if task.Status == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED || task.Status == logservepb.TaskStatus_TASK_STATUS_FAILED {
 		return cloneTask(task), nil
 	}
+	task.TaskLeaseEpoch++
 	task.Status = logservepb.TaskStatus_TASK_STATUS_RUNNING
 	task.WorkerID = workerID
 	task.UpdatedAtMs = time.Now().UnixMilli()
 	s.tasks[taskID] = task
+	return cloneTask(task), nil
+}
+
+func (s *MemoryStore) ValidateTaskLease(taskID, workerID string, leaseEpoch uint64) (Task, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return Task{}, errors.New("task not found")
+	}
+	if task.Status == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED || task.Status == logservepb.TaskStatus_TASK_STATUS_FAILED {
+		return cloneTask(task), nil
+	}
+	if task.WorkerID != "" && workerID != "" && task.WorkerID != workerID {
+		return Task{}, errors.New("stale task lease rejected")
+	}
+	if leaseEpoch > 0 && task.TaskLeaseEpoch != leaseEpoch {
+		return Task{}, errors.New("stale task lease rejected")
+	}
 	return cloneTask(task), nil
 }
 
@@ -165,7 +187,7 @@ func (s *MemoryStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task {
 	return requeued
 }
 
-func (s *MemoryStore) CompleteTask(taskID, workerID string, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (Task, error) {
+func (s *MemoryStore) CompleteTask(taskID, workerID string, leaseEpoch uint64, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -176,8 +198,13 @@ func (s *MemoryStore) CompleteTask(taskID, workerID string, status logservepb.Ta
 	if task.Status == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED || task.Status == logservepb.TaskStatus_TASK_STATUS_FAILED {
 		return cloneTask(task), nil
 	}
-	if task.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING && task.WorkerID != "" && workerID != "" && task.WorkerID != workerID {
-		return Task{}, errors.New("stale task completion rejected")
+	if task.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
+		if task.WorkerID != "" && workerID != "" && task.WorkerID != workerID {
+			return Task{}, errors.New("stale task lease rejected")
+		}
+		if leaseEpoch > 0 && task.TaskLeaseEpoch != leaseEpoch {
+			return Task{}, errors.New("stale task lease rejected")
+		}
 	}
 	task.Status = status
 	task.WorkerID = workerID

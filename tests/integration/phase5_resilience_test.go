@@ -86,9 +86,14 @@ func TestStaleTaskCompletionRejectedAfterRedelivery(t *testing.T) {
 	if !firstPoll.GetHasTask() {
 		t.Fatal("first worker did not receive task")
 	}
+	firstEpoch := firstPoll.GetTask().GetTaskLeaseEpoch()
+	if firstEpoch == 0 {
+		t.Fatal("first poll did not assign a task lease epoch")
+	}
 	if _, err := env.controlClient.StartTask(context.Background(), &logservepb.StartTaskRequest{
-		TaskId:   submitted.GetTaskId(),
-		WorkerId: "stale-worker-1",
+		TaskId:         submitted.GetTaskId(),
+		WorkerId:       "stale-worker-1",
+		TaskLeaseEpoch: firstEpoch,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -101,21 +106,43 @@ func TestStaleTaskCompletionRejectedAfterRedelivery(t *testing.T) {
 	if !secondPoll.GetHasTask() {
 		t.Fatal("second worker did not receive redelivered task")
 	}
+	if secondPoll.GetTask().GetTaskLeaseEpoch() <= firstEpoch {
+		t.Fatalf("redelivered lease epoch = %d, want > %d", secondPoll.GetTask().GetTaskLeaseEpoch(), firstEpoch)
+	}
 	if _, err := env.controlClient.StartTask(context.Background(), &logservepb.StartTaskRequest{
-		TaskId:   submitted.GetTaskId(),
-		WorkerId: "stale-worker-2",
+		TaskId:         submitted.GetTaskId(),
+		WorkerId:       "stale-worker-2",
+		TaskLeaseEpoch: secondPoll.GetTask().GetTaskLeaseEpoch(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	_, err = env.controlClient.CompleteTask(context.Background(), &logservepb.CompleteTaskRequest{
-		TaskId:     submitted.GetTaskId(),
-		WorkerId:   "stale-worker-1",
-		Status:     logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
-		ResultJson: []byte(`"stale"`),
+		TaskId:         submitted.GetTaskId(),
+		WorkerId:       "stale-worker-2",
+		TaskLeaseEpoch: firstEpoch,
+		Status:         logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
+		ResultJson:     []byte(`"stale"`),
 	})
-	if err == nil || !strings.Contains(err.Error(), "stale task completion") {
-		t.Fatalf("stale completion error = %v, want stale task completion rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "stale task lease") {
+		t.Fatalf("stale completion error = %v, want stale task lease rejection", err)
+	}
+}
+
+func TestOrdinaryTaskSurvivesControlRestartFromTaskSpecLog(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	submitted := submitPlainTask(t, env.controlClient, "ordinary_restart")
+	env.restartControl(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runWorkerForTest(ctx, t, env, "ordinary-restart-worker", 0)
+
+	status := waitTask(t, env.controlClient, submitted.GetTaskId(), logservepb.TaskStatus_TASK_STATUS_SUCCEEDED)
+	if string(status.GetResultJson()) != `"ordinary_restart-ok"` {
+		t.Fatalf("ordinary task result after control restart = %s", status.GetResultJson())
 	}
 }
 
@@ -250,6 +277,26 @@ func TestControlRestartBootstrapsWorkflowAndModelStateFromLog(t *testing.T) {
 	status := waitWorkflow(t, env.controlClient, submitted.GetWorkflowId(), logservepb.WorkflowStatus_WORKFLOW_STATUS_COMPLETED)
 	if string(status.GetResultJson()) != `"answer:hello:doc:vec:hello"` {
 		t.Fatalf("result after control restart = %s", status.GetResultJson())
+	}
+}
+
+func TestControlRestartBootstrapsWorkerCacheFromLog(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	registerLLMWorkers(t, env.controlClient)
+	env.restartControl(t)
+
+	snapshot, err := env.controlClient.GetDashboardSnapshot(context.Background(), &logservepb.GetDashboardSnapshotRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := dashboardWorker(snapshot, "worker-1")
+	if worker == nil {
+		t.Fatal("worker-1 missing after control restart")
+	}
+	if len(worker.GetCachedModels()) == 0 || worker.GetCachedModels()[0].GetName() != "model-A" {
+		t.Fatalf("worker-1 cached models after restart = %v, want model-A", worker.GetCachedModels())
 	}
 }
 

@@ -1,9 +1,12 @@
 package logstore
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestAppendReadAndIdempotency(t *testing.T) {
@@ -96,4 +99,162 @@ func TestRecoveryTruncatesPartialTail(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("records = %d, want 1", len(records))
 	}
+}
+
+func TestSegmentRollingRecoverAndReadAcrossSegments(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SegmentSizeBytes = 220
+	opts.FsyncPolicy = FsyncAlways
+
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("x"), 128)
+	for i := 0; i < 12; i++ {
+		if _, _, err := store.Append(AppendRequest{
+			StreamID:       "wf:rolling",
+			EventType:      "StepCompleted",
+			IdempotencyKey: fmt.Sprintf("step-%02d", i),
+			Payload:        payload,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logSegments := globSegments(t, dir, ".log")
+	if len(logSegments) < 2 {
+		t.Fatalf("log segments = %d, want at least 2", len(logSegments))
+	}
+
+	recovered, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+
+	records, err := recovered.Read("wf:rolling", 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 12 {
+		t.Fatalf("records = %d, want 12", len(records))
+	}
+	for i, rec := range records {
+		if rec.Seq != uint64(i+1) {
+			t.Fatalf("record[%d].Seq = %d, want %d", i, rec.Seq, i+1)
+		}
+		if !bytes.Equal(rec.Payload, payload) {
+			t.Fatalf("record[%d] payload changed", i)
+		}
+	}
+}
+
+func TestIndexRebuiltFromSegments(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SegmentSizeBytes = 220
+	opts.FsyncPolicy = FsyncAlways
+
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		if _, _, err := store.Append(AppendRequest{
+			StreamID:  "task:index-rebuild",
+			EventType: "TaskSubmitted",
+			Payload:   bytes.Repeat([]byte{byte('a' + i)}, 128),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logSegments := globSegments(t, dir, ".log")
+	for _, path := range globSegments(t, dir, ".index") {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recovered, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+
+	records, err := recovered.Read("task:index-rebuild", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 6 {
+		t.Fatalf("records = %d, want 6", len(records))
+	}
+	indexSegments := globSegments(t, dir, ".index")
+	if len(indexSegments) != len(logSegments) {
+		t.Fatalf("index segments = %d, want %d", len(indexSegments), len(logSegments))
+	}
+}
+
+func TestFsyncPoliciesAppendAndRecover(t *testing.T) {
+	for _, policy := range []FsyncPolicy{FsyncBatch, FsyncInterval} {
+		t.Run(string(policy), func(t *testing.T) {
+			dir := t.TempDir()
+			opts := DefaultOptions()
+			opts.FsyncPolicy = policy
+			opts.FsyncInterval = time.Millisecond
+
+			store, err := OpenWithOptions(dir, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := store.Append(AppendRequest{
+				StreamID:  "task:fsync",
+				EventType: "TaskSubmitted",
+				Payload:   []byte(`{"ok":true}`),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			recovered, err := OpenWithOptions(dir, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recovered.Close()
+			records, err := recovered.Read("task:fsync", 1, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 1 {
+				t.Fatalf("records = %d, want 1", len(records))
+			}
+		})
+	}
+}
+
+func TestOpenRejectsInvalidFsyncPolicy(t *testing.T) {
+	opts := DefaultOptions()
+	opts.FsyncPolicy = "sometimes"
+	if _, err := OpenWithOptions(t.TempDir(), opts); err == nil {
+		t.Fatal("OpenWithOptions accepted invalid fsync policy")
+	}
+}
+
+func globSegments(t *testing.T, dir, ext string) []string {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, "segment-*"+ext))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return paths
 }

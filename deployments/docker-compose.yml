@@ -44,6 +44,8 @@ services:
       dockerfile: deployments/Dockerfile
     command: ["logserve-control", "--addr", "0.0.0.0:50052", "--log-addr", "logd:50051"]
     environment:
+      LOGSERVE_METADATA_STORE: postgres
+      LOGSERVE_POSTGRES_DSN: postgres://logserve:logserve@postgres:5432/logserve?sslmode=disable
       LOGSERVE_RESULT_STORE: minio
       LOGSERVE_S3_ENDPOINT: http://minio:9000
       LOGSERVE_S3_BUCKET: logserve-results

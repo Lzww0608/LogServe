@@ -21,7 +21,7 @@ $results = [ordered]@{
 }
 
 try {
-  go test ./tests/integration -run "Test(WorkflowWorkerRecoveryContinuesAfterCompletedStep|ActorCounterRecoverySnapshotAndReplay|RunningTaskIsRedeliveredAfterWorkerLeaseExpires|PolledTaskIsRedeliveredWhenWorkerDiesBeforeStart|ControlRestartBootstrapsWorkflowAndModelStateFromLog)" -count=1 | Out-Host
+  go test ./tests/integration -run "Test(WorkflowWorkerRecoveryContinuesAfterCompletedStep|ActorCounterRecoverySnapshotAndReplay|RunningTaskIsRedeliveredAfterWorkerLeaseExpires|PolledTaskIsRedeliveredWhenWorkerDiesBeforeStart|StaleTaskCompletionRejectedAfterRedelivery|OrdinaryTaskSurvivesControlRestartFromTaskSpecLog|ControlRestartBootstrapsWorkflowAndModelStateFromLog)" -count=1 | Out-Host
   $results.worker_kill_recovery = "passed"
   $results.queue_redelivery = "passed"
 }
@@ -59,7 +59,7 @@ try {
     -PassThru
   Start-Sleep -Seconds 2
   $results.control_restart_probe = "process_restarted"
-  $results.notes += "Control bootstraps workflow, actor, model, and backpressure materialized state from shared log streams. Plain ad-hoc task execution still depends on in-memory function specs."
+  $results.notes += "Control bootstraps workflow, actor, model, ordinary task, and backpressure materialized state from shared log streams."
 
   Stop-Process -Id $logd.Id -Force
   Start-Sleep -Seconds 1

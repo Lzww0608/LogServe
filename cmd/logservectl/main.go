@@ -862,6 +862,8 @@ func parseSchedulingPolicy(value string) (logservepb.SchedulingPolicy, error) {
 		return logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE, nil
 	case "RESOURCE_ONLY", "resource-only", "resource_only":
 		return logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY, nil
+	case "PREDICTED_LATENCY", "predicted-latency", "predicted_latency":
+		return logservepb.SchedulingPolicy_SCHEDULING_POLICY_PREDICTED_LATENCY, nil
 	default:
 		return logservepb.SchedulingPolicy_SCHEDULING_POLICY_UNSPECIFIED, fmt.Errorf("unknown scheduling policy %q", value)
 	}
@@ -873,6 +875,8 @@ func schedulingPolicyString(policy logservepb.SchedulingPolicy) string {
 		return "RESOURCE_ONLY"
 	case logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE:
 		return "LOCALITY_AWARE"
+	case logservepb.SchedulingPolicy_SCHEDULING_POLICY_PREDICTED_LATENCY:
+		return "PREDICTED_LATENCY"
 	default:
 		return "UNSPECIFIED"
 	}

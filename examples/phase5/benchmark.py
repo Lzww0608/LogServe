@@ -174,20 +174,36 @@ def llm_cold_start():
 
 def locality_ablation(requests):
     out = {}
-    for policy in ("RESOURCE_ONLY", "LOCALITY_AWARE"):
+    slo_ms = 250
+    for policy in ("RESOURCE_ONLY", "LOCALITY_AWARE", "PREDICTED_LATENCY"):
         set_scheduling_policy(policy)
         hits = 0
+        cold_starts = 0
         latencies = []
+        queue_waits = []
+        slo_violations = 0
         for i in range(requests):
             submitted, elapsed = ms(lambda i=i: submit_llm("model-A", f"locality-{policy}-{i}", version="v1", adapter="mock"))
             replay = replay_llm(submitted["task_id"])
             hits += 1 if pick_bool(replay, "cache_hit", "cacheHit") else 0
+            cold_starts += 0 if pick_bool(replay, "cache_hit", "cacheHit") else 1
+            total_latency = pick_int(replay, "total_latency_ms", "totalLatencyMs")
+            queue_waits.append(max(0, elapsed - total_latency))
             latencies.append(elapsed)
+            if elapsed > slo_ms:
+                slo_violations += 1
         out[policy.lower()] = {
             "requests": requests,
             "cache_hit_rate": round(hits / requests, 3),
+            "cold_starts": cold_starts,
+            "cold_start_rate": round(cold_starts / requests, 3),
+            "p50_latency_ms": percentile(latencies, 50),
             "p95_latency_ms": percentile(latencies, 95),
             "p99_latency_ms": percentile(latencies, 99),
+            "p95_queue_wait_ms": percentile(queue_waits, 95),
+            "p99_queue_wait_ms": percentile(queue_waits, 99),
+            "slo_ms": slo_ms,
+            "slo_violation_rate": round(slo_violations / requests, 3),
         }
     return out
 

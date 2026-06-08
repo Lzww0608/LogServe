@@ -16,7 +16,11 @@ type Server struct {
 }
 
 func Start(addr, dataDir string) (*Server, error) {
-	store, err := logstore.Open(dataDir)
+	return StartWithOptions(addr, dataDir, logstore.DefaultOptions())
+}
+
+func StartWithOptions(addr, dataDir string, opts logstore.Options) (*Server, error) {
+	store, err := logstore.OpenWithOptions(dataDir, opts)
 	if err != nil {
 		return nil, err
 	}

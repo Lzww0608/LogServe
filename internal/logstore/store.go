@@ -10,60 +10,111 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	magic      uint32 = 0x4c535647
-	version    uint16 = 1
-	headerSize        = 36
+	magic                   uint32 = 0x4c535647
+	version                 uint16 = 1
+	headerSize                     = 36
+	defaultSegmentSizeBytes int64  = 64 << 20
+	defaultFsyncInterval           = 100 * time.Millisecond
 )
 
 var errCorruptRecord = errors.New("corrupt log record")
 
+type FsyncPolicy string
+
+const (
+	FsyncAlways   FsyncPolicy = "always"
+	FsyncBatch    FsyncPolicy = "batch"
+	FsyncInterval FsyncPolicy = "interval"
+)
+
+type Options struct {
+	SegmentSizeBytes int64
+	FsyncPolicy      FsyncPolicy
+	FsyncInterval    time.Duration
+}
+
+func DefaultOptions() Options {
+	return Options{
+		SegmentSizeBytes: defaultSegmentSizeBytes,
+		FsyncPolicy:      FsyncAlways,
+		FsyncInterval:    defaultFsyncInterval,
+	}
+}
+
+func (opts Options) normalize() (Options, error) {
+	if opts.SegmentSizeBytes <= 0 {
+		opts.SegmentSizeBytes = defaultSegmentSizeBytes
+	}
+	if opts.FsyncPolicy == "" {
+		opts.FsyncPolicy = FsyncAlways
+	}
+	if opts.FsyncInterval <= 0 {
+		opts.FsyncInterval = defaultFsyncInterval
+	}
+	switch opts.FsyncPolicy {
+	case FsyncAlways, FsyncBatch, FsyncInterval:
+		return opts, nil
+	default:
+		return Options{}, fmt.Errorf("unsupported fsync policy %q", opts.FsyncPolicy)
+	}
+}
+
 type Store struct {
-	mu          sync.Mutex
-	dir         string
-	logPath     string
-	indexPath   string
-	logFile     *os.File
-	indexFile   *os.File
-	nextSeq     map[string]uint64
-	records     map[string][]Record
-	idempotency map[string]Record
+	mu                 sync.Mutex
+	dir                string
+	options            Options
+	logFile            *os.File
+	indexFile          *os.File
+	activeSegmentID    uint64
+	activeSegmentBytes int64
+	nextSeq            map[string]uint64
+	index              map[string][]indexEntry
+	idempotency        map[string]Record
+	lastSync           time.Time
+}
+
+type indexEntry struct {
+	StreamID  string
+	Seq       uint64
+	SegmentID uint64
+	Offset    int64
+	Length    int64
 }
 
 func Open(dir string) (*Store, error) {
+	return OpenWithOptions(dir, DefaultOptions())
+}
+
+func OpenWithOptions(dir string, opts Options) (*Store, error) {
+	normalized, err := opts.normalize()
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
 	s := &Store{
 		dir:         dir,
-		logPath:     filepath.Join(dir, "segment-00000001.log"),
-		indexPath:   filepath.Join(dir, "segment-00000001.index"),
+		options:     normalized,
 		nextSeq:     make(map[string]uint64),
-		records:     make(map[string][]Record),
+		index:       make(map[string][]indexEntry),
 		idempotency: make(map[string]Record),
 	}
 
 	if err := s.recover(); err != nil {
 		return nil, err
 	}
-
-	logFile, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
-	if err != nil {
+	if err := s.openActiveFilesLocked(); err != nil {
 		return nil, err
 	}
-	indexFile, err := os.OpenFile(s.indexPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
-	if err != nil {
-		_ = logFile.Close()
-		return nil, err
-	}
-	s.logFile = logFile
-	s.indexFile = indexFile
 	return s, nil
 }
 
@@ -71,16 +122,7 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var err error
-	if s.logFile != nil {
-		err = errors.Join(err, s.logFile.Sync(), s.logFile.Close())
-		s.logFile = nil
-	}
-	if s.indexFile != nil {
-		err = errors.Join(err, s.indexFile.Sync(), s.indexFile.Close())
-		s.indexFile = nil
-	}
-	return err
+	return s.closeActiveFilesLocked(true)
 }
 
 func (s *Store) Append(req AppendRequest) (Record, bool, error) {
@@ -118,25 +160,33 @@ func (s *Store) Append(req AppendRequest) (Record, bool, error) {
 		return Record{}, false, err
 	}
 	rec.CRC32 = crc
-
-	offset, err := s.logFile.Seek(0, io.SeekEnd)
-	if err != nil {
+	if err := s.ensureWritableSegmentLocked(int64(len(encoded))); err != nil {
 		return Record{}, false, err
 	}
+
+	offset := s.activeSegmentBytes
 	if _, err := s.logFile.Write(encoded); err != nil {
 		return Record{}, false, err
 	}
-	if err := s.logFile.Sync(); err != nil {
+	entry := indexEntry{
+		StreamID:  rec.StreamID,
+		Seq:       rec.Seq,
+		SegmentID: s.activeSegmentID,
+		Offset:    offset,
+		Length:    int64(len(encoded)),
+	}
+	if err := s.appendIndex(entry); err != nil {
 		return Record{}, false, err
 	}
-	if err := s.appendIndex(rec, offset); err != nil {
+	if err := s.syncForPolicyLocked(); err != nil {
 		return Record{}, false, err
 	}
 
-	s.records[rec.StreamID] = append(s.records[rec.StreamID], cloneRecord(rec))
+	s.activeSegmentBytes += int64(len(encoded))
+	s.index[rec.StreamID] = append(s.index[rec.StreamID], entry)
 	s.nextSeq[rec.StreamID] = seq + 1
 	if rec.IdempotencyKey != "" {
-		s.idempotency[idempotencyKey(rec.StreamID, rec.IdempotencyKey)] = cloneRecord(rec)
+		s.idempotency[idempotencyKey(rec.StreamID, rec.IdempotencyKey)] = idempotencyRecord(rec)
 	}
 	return rec, false, nil
 }
@@ -153,18 +203,46 @@ func (s *Store) Read(streamID string, fromSeq uint64, limit int) ([]Record, erro
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	source := s.records[streamID]
-	out := make([]Record, 0, min(limit, len(source)))
-	for _, rec := range source {
-		if rec.Seq < fromSeq {
+	entries := s.index[streamID]
+	selected := make([]indexEntry, 0, min(limit, len(entries)))
+	for _, entry := range entries {
+		if entry.Seq < fromSeq {
 			continue
 		}
-		out = append(out, cloneRecord(rec))
-		if len(out) == limit {
+		selected = append(selected, entry)
+		if len(selected) == limit {
 			break
 		}
+	}
+	s.mu.Unlock()
+
+	out := make([]Record, 0, len(selected))
+	var (
+		currentSegmentID uint64
+		currentFile      *os.File
+	)
+	defer func() {
+		if currentFile != nil {
+			_ = currentFile.Close()
+		}
+	}()
+	for _, entry := range selected {
+		if currentFile == nil || currentSegmentID != entry.SegmentID {
+			if currentFile != nil {
+				_ = currentFile.Close()
+			}
+			file, err := os.Open(segmentPath(s.dir, entry.SegmentID, ".log"))
+			if err != nil {
+				return nil, err
+			}
+			currentFile = file
+			currentSegmentID = entry.SegmentID
+		}
+		rec, err := readIndexedRecordFromFile(currentFile, entry)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
 	}
 	return out, nil
 }
@@ -173,8 +251,8 @@ func (s *Store) ListStreams(prefix string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	out := make([]string, 0, len(s.records))
-	for streamID := range s.records {
+	out := make([]string, 0, len(s.index))
+	for streamID := range s.index {
 		if prefix == "" || strings.HasPrefix(streamID, prefix) {
 			out = append(out, streamID)
 		}
@@ -184,9 +262,32 @@ func (s *Store) ListStreams(prefix string) []string {
 }
 
 func (s *Store) recover() error {
-	file, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_RDWR, 0o644)
+	segmentIDs, err := discoverSegmentIDs(s.dir, ".log")
 	if err != nil {
 		return err
+	}
+	if len(segmentIDs) == 0 {
+		s.activeSegmentID = 1
+		s.activeSegmentBytes = 0
+		return s.rewriteIndex()
+	}
+
+	for _, segmentID := range segmentIDs {
+		size, err := s.recoverSegment(segmentID)
+		if err != nil {
+			return err
+		}
+		s.activeSegmentID = segmentID
+		s.activeSegmentBytes = size
+	}
+	return s.rewriteIndex()
+}
+
+func (s *Store) recoverSegment(segmentID uint64) (int64, error) {
+	path := segmentPath(s.dir, segmentID, ".log")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return 0, err
 	}
 	defer file.Close()
 
@@ -198,57 +299,185 @@ func (s *Store) recover() error {
 		}
 		if err != nil {
 			if truncateErr := file.Truncate(offset); truncateErr != nil {
-				return truncateErr
+				return 0, truncateErr
 			}
 			break
 		}
-		s.records[rec.StreamID] = append(s.records[rec.StreamID], cloneRecord(rec))
+		entry := indexEntry{
+			StreamID:  rec.StreamID,
+			Seq:       rec.Seq,
+			SegmentID: segmentID,
+			Offset:    offset,
+			Length:    nextOffset - offset,
+		}
+		s.index[rec.StreamID] = append(s.index[rec.StreamID], entry)
 		if s.nextSeq[rec.StreamID] <= rec.Seq {
 			s.nextSeq[rec.StreamID] = rec.Seq + 1
 		}
 		if rec.IdempotencyKey != "" {
-			s.idempotency[idempotencyKey(rec.StreamID, rec.IdempotencyKey)] = cloneRecord(rec)
+			s.idempotency[idempotencyKey(rec.StreamID, rec.IdempotencyKey)] = idempotencyRecord(rec)
 		}
 		offset = nextOffset
 	}
-	return s.rewriteIndex()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }
 
 func (s *Store) rewriteIndex() error {
-	file, err := os.OpenFile(s.indexPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	indexIDs, err := discoverSegmentIDs(s.dir, ".index")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
-	logFile, err := os.Open(s.logPath)
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-
-	var offset int64
-	for {
-		rec, nextOffset, err := readRecordAt(logFile, offset)
-		if errors.Is(err, io.EOF) {
-			break
+	for _, segmentID := range indexIDs {
+		if err := os.Remove(segmentPath(s.dir, segmentID, ".index")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
+	}
+
+	segmentIDs, err := discoverSegmentIDs(s.dir, ".log")
+	if err != nil {
+		return err
+	}
+	if len(segmentIDs) == 0 && s.activeSegmentID != 0 {
+		segmentIDs = []uint64{s.activeSegmentID}
+	}
+
+	bySegment := make(map[uint64][]indexEntry)
+	for _, entries := range s.index {
+		for _, entry := range entries {
+			bySegment[entry.SegmentID] = append(bySegment[entry.SegmentID], entry)
+		}
+	}
+
+	for _, segmentID := range segmentIDs {
+		entries := bySegment[segmentID]
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Offset < entries[j].Offset
+		})
+		file, err := os.OpenFile(segmentPath(s.dir, segmentID, ".index"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
 		}
-		if err := writeIndexEntry(file, rec, offset); err != nil {
+		for _, entry := range entries {
+			if err := writeIndexEntry(file, entry); err != nil {
+				_ = file.Close()
+				return err
+			}
+		}
+		if err := errors.Join(file.Sync(), file.Close()); err != nil {
 			return err
 		}
-		offset = nextOffset
 	}
-	return file.Sync()
+	return nil
 }
 
-func (s *Store) appendIndex(rec Record, offset int64) error {
-	if err := writeIndexEntry(s.indexFile, rec, offset); err != nil {
+func (s *Store) appendIndex(entry indexEntry) error {
+	return writeIndexEntry(s.indexFile, entry)
+}
+
+func readIndexedRecordFromFile(file *os.File, entry indexEntry) (Record, error) {
+	rec, nextOffset, err := readRecordAt(file, entry.Offset)
+	if err != nil {
+		return Record{}, err
+	}
+	if rec.StreamID != entry.StreamID || rec.Seq != entry.Seq || nextOffset-entry.Offset != entry.Length {
+		return Record{}, errCorruptRecord
+	}
+	return cloneRecord(rec), nil
+}
+
+func (s *Store) ensureWritableSegmentLocked(recordLen int64) error {
+	if s.logFile == nil || s.indexFile == nil {
+		return errors.New("logstore is closed")
+	}
+	if s.activeSegmentBytes > 0 && s.activeSegmentBytes+recordLen > s.options.SegmentSizeBytes {
+		return s.rollSegmentLocked()
+	}
+	return nil
+}
+
+func (s *Store) rollSegmentLocked() error {
+	if err := s.closeActiveFilesLocked(true); err != nil {
 		return err
 	}
-	return s.indexFile.Sync()
+	s.activeSegmentID++
+	s.activeSegmentBytes = 0
+	return s.openActiveFilesLocked()
+}
+
+func (s *Store) openActiveFilesLocked() error {
+	if s.activeSegmentID == 0 {
+		s.activeSegmentID = 1
+	}
+	logFile, err := os.OpenFile(segmentPath(s.dir, s.activeSegmentID, ".log"), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	indexFile, err := os.OpenFile(segmentPath(s.dir, s.activeSegmentID, ".index"), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	if err != nil {
+		_ = logFile.Close()
+		return err
+	}
+	info, err := logFile.Stat()
+	if err != nil {
+		_ = logFile.Close()
+		_ = indexFile.Close()
+		return err
+	}
+	s.logFile = logFile
+	s.indexFile = indexFile
+	s.activeSegmentBytes = info.Size()
+	s.lastSync = time.Now()
+	return nil
+}
+
+func (s *Store) closeActiveFilesLocked(sync bool) error {
+	var err error
+	if sync {
+		err = errors.Join(err, s.syncFilesLocked())
+	}
+	if s.logFile != nil {
+		err = errors.Join(err, s.logFile.Close())
+		s.logFile = nil
+	}
+	if s.indexFile != nil {
+		err = errors.Join(err, s.indexFile.Close())
+		s.indexFile = nil
+	}
+	return err
+}
+
+func (s *Store) syncForPolicyLocked() error {
+	switch s.options.FsyncPolicy {
+	case FsyncAlways:
+		return s.syncFilesLocked()
+	case FsyncBatch:
+		return nil
+	case FsyncInterval:
+		if time.Since(s.lastSync) >= s.options.FsyncInterval {
+			return s.syncFilesLocked()
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported fsync policy %q", s.options.FsyncPolicy)
+	}
+}
+
+func (s *Store) syncFilesLocked() error {
+	var err error
+	if s.logFile != nil {
+		err = errors.Join(err, s.logFile.Sync())
+	}
+	if s.indexFile != nil {
+		err = errors.Join(err, s.indexFile.Sync())
+	}
+	if err == nil {
+		s.lastSync = time.Now()
+	}
+	return err
 }
 
 func encodeRecord(rec Record) ([]byte, uint32, error) {
@@ -349,17 +578,20 @@ func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
 	}, offset + int64(headerSize+bodyLen), nil
 }
 
-func writeIndexEntry(w io.Writer, rec Record, offset int64) error {
-	entry := struct {
-		StreamID string `json:"stream_id"`
-		Seq      uint64 `json:"seq"`
-		Offset   int64  `json:"offset"`
+func writeIndexEntry(w io.Writer, entry indexEntry) error {
+	data, err := json.Marshal(struct {
+		StreamID  string `json:"stream_id"`
+		Seq       uint64 `json:"seq"`
+		SegmentID uint64 `json:"segment_id"`
+		Offset    int64  `json:"offset"`
+		Length    int64  `json:"length"`
 	}{
-		StreamID: rec.StreamID,
-		Seq:      rec.Seq,
-		Offset:   offset,
-	}
-	data, err := json.Marshal(entry)
+		StreamID:  entry.StreamID,
+		Seq:       entry.Seq,
+		SegmentID: entry.SegmentID,
+		Offset:    entry.Offset,
+		Length:    entry.Length,
+	})
 	if err != nil {
 		return err
 	}
@@ -369,8 +601,44 @@ func writeIndexEntry(w io.Writer, rec Record, offset int64) error {
 	return nil
 }
 
+func segmentPath(dir string, segmentID uint64, ext string) string {
+	return filepath.Join(dir, fmt.Sprintf("segment-%08d%s", segmentID, ext))
+}
+
+func discoverSegmentIDs(dir, ext string) ([]uint64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uint64, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "segment-") || !strings.HasSuffix(name, ext) {
+			continue
+		}
+		rawID := strings.TrimSuffix(strings.TrimPrefix(name, "segment-"), ext)
+		id, err := strconv.ParseUint(rawID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse segment id from %q: %w", name, err)
+		}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i] < out[j]
+	})
+	return out, nil
+}
+
 func cloneRecord(rec Record) Record {
 	rec.Payload = append([]byte(nil), rec.Payload...)
+	return rec
+}
+
+func idempotencyRecord(rec Record) Record {
+	rec.Payload = nil
 	return rec
 }
 

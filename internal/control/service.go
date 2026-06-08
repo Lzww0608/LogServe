@@ -19,6 +19,7 @@ import (
 	"github.com/logserve/logserve/internal/objectstore"
 	"github.com/logserve/logserve/internal/observability"
 	"github.com/logserve/logserve/internal/workflow"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const defaultResultInlineThreshold = 4096
@@ -28,9 +29,13 @@ const localityQueueWait = 250 * time.Millisecond
 const defaultQueueHighWatermark = 1024
 const defaultRedeliveryTimeout = 30 * time.Second
 
+type taskSubmittedPayload struct {
+	TaskSpec json.RawMessage `json:"task_spec,omitempty"`
+}
+
 type Service struct {
 	logservepb.UnimplementedControlServiceServer
-	meta                  *metadata.MemoryStore
+	meta                  metadata.Store
 	log                   logservepb.LogServiceClient
 	queueMu               sync.Mutex
 	queue                 []string
@@ -49,12 +54,12 @@ type Service struct {
 	lastLogAppendMs       atomic.Int64
 }
 
-func NewService(meta *metadata.MemoryStore, logClient logservepb.LogServiceClient) *Service {
+func NewService(meta metadata.Store, logClient logservepb.LogServiceClient) *Service {
 	store, _ := objectstore.OpenLocal(filepath.Join(os.TempDir(), "logserve-objectstore"))
 	return NewServiceWithResultStore(meta, logClient, store, defaultResultInlineThreshold)
 }
 
-func NewServiceWithResultStore(meta *metadata.MemoryStore, logClient logservepb.LogServiceClient, store objectstore.Store, threshold int) *Service {
+func NewServiceWithResultStore(meta metadata.Store, logClient logservepb.LogServiceClient, store objectstore.Store, threshold int) *Service {
 	if threshold <= 0 {
 		threshold = defaultResultInlineThreshold
 	}
@@ -269,26 +274,25 @@ func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest)
 			continue
 		}
 		before, _ := s.meta.GetTask(taskID)
-		if _, err := s.meta.SetTaskRunning(taskID, req.GetWorkerId()); err != nil {
+		leased, err := s.meta.LeaseTask(taskID, req.GetWorkerId())
+		if err != nil {
 			return nil, err
 		}
 		if before.Status == logservepb.TaskStatus_TASK_STATUS_QUEUED {
 			s.meta.IncrementWorkerLoad(req.GetWorkerId())
 		}
 		s.queue = append(s.queue[:i], s.queue[i+1:]...)
-		return &logservepb.PollTaskResponse{HasTask: true, Task: cloneSpec(spec)}, nil
+		leasedSpec := cloneSpec(spec)
+		leasedSpec.TaskLeaseEpoch = leased.TaskLeaseEpoch
+		return &logservepb.PollTaskResponse{HasTask: true, Task: leasedSpec}, nil
 	}
 	return &logservepb.PollTaskResponse{HasTask: false}, nil
 }
 
 func (s *Service) StartTask(ctx context.Context, req *logservepb.StartTaskRequest) (*logservepb.StartTaskResponse, error) {
-	before, _ := s.meta.GetTask(req.GetTaskId())
-	task, err := s.meta.SetTaskRunning(req.GetTaskId(), req.GetWorkerId())
+	task, err := s.meta.ValidateTaskLease(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch())
 	if err != nil {
 		return nil, err
-	}
-	if before.Status == logservepb.TaskStatus_TASK_STATUS_QUEUED {
-		s.meta.IncrementWorkerLoad(req.GetWorkerId())
 	}
 	if task.ActorID != "" {
 		return &logservepb.StartTaskResponse{Accepted: true}, nil
@@ -313,7 +317,7 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 		if err := s.completeActorCall(ctx, existing, req); err != nil {
 			return nil, err
 		}
-		if _, err := s.meta.CompleteTask(req.GetTaskId(), req.GetWorkerId(), req.GetStatus(), req.GetResultJson(), req.GetError()); err != nil {
+		if _, err := s.meta.CompleteTask(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch(), req.GetStatus(), req.GetResultJson(), req.GetError()); err != nil {
 			return nil, err
 		}
 		if existing.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
@@ -321,7 +325,7 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 		}
 		return &logservepb.CompleteTaskResponse{Accepted: true}, nil
 	}
-	task, err := s.meta.CompleteTask(req.GetTaskId(), req.GetWorkerId(), req.GetStatus(), req.GetResultJson(), req.GetError())
+	task, err := s.meta.CompleteTask(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch(), req.GetStatus(), req.GetResultJson(), req.GetError())
 	if err != nil {
 		return nil, err
 	}
@@ -365,6 +369,19 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 	}
 	s.queueMu.Unlock()
 
+	payload, err := marshalTaskSubmittedPayload(spec)
+	if err != nil {
+		return metadata.Task{}, false, err
+	}
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+		StreamId:       taskStream(spec.GetTaskId()),
+		EventType:      "TaskSubmitted",
+		IdempotencyKey: spec.GetTaskId() + ":submitted",
+		Payload:        payload,
+	}); err != nil {
+		return metadata.Task{}, false, err
+	}
+
 	task, duplicate := s.meta.CreateTask(metadata.Task{
 		TaskID:          spec.GetTaskId(),
 		TaskName:        spec.GetTaskName(),
@@ -375,6 +392,7 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 		ActorID:         spec.GetActorId(),
 		ActorCallID:     spec.GetActorCallId(),
 		ActorEpoch:      spec.GetActorEpoch(),
+		TaskLeaseEpoch:  spec.GetTaskLeaseEpoch(),
 		LLMModelName:    spec.GetLlmModelName(),
 		LLMModelVersion: spec.GetLlmModelVersion(),
 	}, spec.GetIdempotencyKey())
@@ -386,27 +404,18 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 	s.specs[task.TaskID] = cloneSpec(spec)
 	s.specMu.Unlock()
 
-	payload, _ := json.Marshal(map[string]any{
-		"task_id":           task.TaskID,
-		"task_name":         spec.GetTaskName(),
-		"workflow_id":       spec.GetWorkflowId(),
-		"step_id":           spec.GetStepId(),
-		"llm_model_name":    spec.GetLlmModelName(),
-		"llm_model_version": spec.GetLlmModelVersion(),
-	})
-	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
-		StreamId:       taskStream(task.TaskID),
-		EventType:      "TaskSubmitted",
-		IdempotencyKey: task.TaskID + ":submitted",
-		Payload:        payload,
-	}); err != nil {
-		return metadata.Task{}, false, err
-	}
-
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	s.queue = append(s.queue, task.TaskID)
 	return task, false, nil
+}
+
+func marshalTaskSubmittedPayload(spec *logservepb.TaskSpec) ([]byte, error) {
+	specJSON, err := protojson.Marshal(cloneSpec(spec))
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(taskSubmittedPayload{TaskSpec: specJSON})
 }
 
 func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) error {
@@ -832,6 +841,7 @@ func cloneSpec(spec *logservepb.TaskSpec) *logservepb.TaskSpec {
 		LlmAdapter:        spec.GetLlmAdapter(),
 		LlmMaxTokens:      spec.GetLlmMaxTokens(),
 		TimeoutMs:         spec.GetTimeoutMs(),
+		TaskLeaseEpoch:    spec.GetTaskLeaseEpoch(),
 	}
 }
 
