@@ -43,6 +43,82 @@ func TestRunningTaskIsRedeliveredAfterWorkerLeaseExpires(t *testing.T) {
 	}
 }
 
+func TestPolledTaskIsRedeliveredWhenWorkerDiesBeforeStart(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	configureBackpressure(t, env.controlClient, 10, 100)
+	registerBasicWorker(t, env.controlClient, "poll-worker-1")
+	registerBasicWorker(t, env.controlClient, "poll-worker-2")
+
+	submitted := submitPlainTask(t, env.controlClient, "redeliver_before_start")
+	firstPoll, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: "poll-worker-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !firstPoll.GetHasTask() || firstPoll.GetTask().GetTaskId() != submitted.GetTaskId() {
+		t.Fatalf("first poll = %v, want task %s", firstPoll, submitted.GetTaskId())
+	}
+
+	time.Sleep(180 * time.Millisecond)
+	secondPoll, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: "poll-worker-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !secondPoll.GetHasTask() || secondPoll.GetTask().GetTaskId() != submitted.GetTaskId() {
+		t.Fatalf("redelivery poll = %v, want task %s", secondPoll, submitted.GetTaskId())
+	}
+}
+
+func TestStaleTaskCompletionRejectedAfterRedelivery(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	configureBackpressure(t, env.controlClient, 10, 100)
+	registerBasicWorker(t, env.controlClient, "stale-worker-1")
+	registerBasicWorker(t, env.controlClient, "stale-worker-2")
+
+	submitted := submitPlainTask(t, env.controlClient, "reject_stale_completion")
+	firstPoll, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: "stale-worker-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !firstPoll.GetHasTask() {
+		t.Fatal("first worker did not receive task")
+	}
+	if _, err := env.controlClient.StartTask(context.Background(), &logservepb.StartTaskRequest{
+		TaskId:   submitted.GetTaskId(),
+		WorkerId: "stale-worker-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(180 * time.Millisecond)
+	secondPoll, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: "stale-worker-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !secondPoll.GetHasTask() {
+		t.Fatal("second worker did not receive redelivered task")
+	}
+	if _, err := env.controlClient.StartTask(context.Background(), &logservepb.StartTaskRequest{
+		TaskId:   submitted.GetTaskId(),
+		WorkerId: "stale-worker-2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = env.controlClient.CompleteTask(context.Background(), &logservepb.CompleteTaskRequest{
+		TaskId:     submitted.GetTaskId(),
+		WorkerId:   "stale-worker-1",
+		Status:     logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
+		ResultJson: []byte(`"stale"`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "stale task completion") {
+		t.Fatalf("stale completion error = %v, want stale task completion rejection", err)
+	}
+}
+
 func TestBackpressureRejectsNewTaskWhenQueueBacklogExceedsWatermark(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -60,6 +136,54 @@ func TestBackpressureRejectsNewTaskWhenQueueBacklogExceedsWatermark(t *testing.T
 	}
 	if !strings.Contains(err.Error(), "backpressure") {
 		t.Fatalf("error = %v, want backpressure", err)
+	}
+}
+
+func TestBackpressureAllowsIdempotentDuplicateWhenQueueIsFull(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	configureBackpressure(t, env.controlClient, 1, 1000)
+	req := &logservepb.SubmitTaskRequest{
+		TaskName:       "idempotent_queued",
+		FunctionName:   "idempotent_queued",
+		FunctionSource: plainTaskSource("idempotent_queued"),
+		ArgsJson:       []byte(`{"args":[],"kwargs":{}}`),
+		IdempotencyKey: "same-task-key",
+	}
+	first, err := env.controlClient.SubmitTask(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := env.controlClient.SubmitTask(context.Background(), req)
+	if err != nil {
+		t.Fatalf("idempotent duplicate should bypass backpressure: %v", err)
+	}
+	if second.GetTaskId() != first.GetTaskId() {
+		t.Fatalf("duplicate task id = %s, want %s", second.GetTaskId(), first.GetTaskId())
+	}
+}
+
+func TestLogAppendSlowBackpressureRejectsNewTask(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	_, err := env.controlClient.SetBackpressure(context.Background(), &logservepb.SetBackpressureRequest{
+		QueueHighWatermark:  10,
+		RedeliveryTimeoutMs: 1000,
+		LogAppendSlowMs:     1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = env.controlClient.SubmitTask(context.Background(), &logservepb.SubmitTaskRequest{
+		TaskName:       "log_slow_rejected",
+		FunctionName:   "log_slow_rejected",
+		FunctionSource: plainTaskSource("log_slow_rejected"),
+		ArgsJson:       []byte(`{"args":[],"kwargs":{}}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "last log append latency") {
+		t.Fatalf("submit error = %v, want log append backpressure", err)
 	}
 }
 
@@ -98,6 +222,34 @@ func TestDashboardSnapshotShowsWorkflowTaskActorAndModelCache(t *testing.T) {
 	}
 	if len(snapshot.GetModels()) < 2 {
 		t.Fatalf("models = %v, want registered models", snapshot.GetModels())
+	}
+}
+
+func TestControlRestartBootstrapsWorkflowAndModelStateFromLog(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	registerTestModels(t, env.controlClient)
+	setPolicy(t, env.controlClient, logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY)
+	submitted := submitWorkflowForTest(t, env.controlClient, simpleRAGDefinition(t))
+
+	env.restartControl(t)
+
+	if _, err := env.controlClient.SubmitLLM(context.Background(), &logservepb.SubmitLLMRequest{
+		ModelName:    "model-A",
+		ModelVersion: "v1",
+		Prompt:       "registry survived restart",
+		Adapter:      "mock",
+	}); err != nil {
+		t.Fatalf("model registry did not bootstrap after control restart: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runWorkerForTest(ctx, t, env, "bootstrap-worker", 0)
+	status := waitWorkflow(t, env.controlClient, submitted.GetWorkflowId(), logservepb.WorkflowStatus_WORKFLOW_STATUS_COMPLETED)
+	if string(status.GetResultJson()) != `"answer:hello:doc:vec:hello"` {
+		t.Fatalf("result after control restart = %s", status.GetResultJson())
 	}
 }
 

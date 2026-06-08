@@ -54,7 +54,7 @@ func (s *LocalStore) Get(ctx context.Context, ref string) ([]byte, error) {
 	path := filepath.Join(s.dir, rel)
 	cleanDir := filepath.Clean(s.dir)
 	cleanPath := filepath.Clean(path)
-	if !strings.HasPrefix(cleanPath, cleanDir) {
+	if cleanPath != cleanDir && !strings.HasPrefix(cleanPath, cleanDir+string(os.PathSeparator)) {
 		return nil, errors.New("object ref escapes store")
 	}
 	return os.ReadFile(cleanPath)

@@ -38,7 +38,16 @@ message ReadLogResponse {
   repeated LogRecord records = 1;
 }
 
+message ListStreamsRequest {
+  string prefix = 1;
+}
+
+message ListStreamsResponse {
+  repeated string stream_ids = 1;
+}
+
 service LogService {
   rpc AppendLog(AppendLogRequest) returns (AppendLogResponse);
   rpc ReadLog(ReadLogRequest) returns (ReadLogResponse);
+  rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
 }

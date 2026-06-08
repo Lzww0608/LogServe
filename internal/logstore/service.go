@@ -52,3 +52,7 @@ func (s *Service) ReadLog(ctx context.Context, req *logservepb.ReadLogRequest) (
 	}
 	return &logservepb.ReadLogResponse{Records: out}, nil
 }
+
+func (s *Service) ListStreams(ctx context.Context, req *logservepb.ListStreamsRequest) (*logservepb.ListStreamsResponse, error) {
+	return &logservepb.ListStreamsResponse{StreamIds: s.store.ListStreams(req.GetPrefix())}, nil
+}

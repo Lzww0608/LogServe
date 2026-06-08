@@ -4,6 +4,18 @@ Phase 5 turns LogServe from a feature-complete prototype into an analyzable
 system. The focus is not only "can it run", but whether failures, scheduling
 choices, replay, snapshots, and backpressure have observable consequences.
 
+## Experiment Environment
+
+The intended single-machine experiment environment is:
+
+```text
+Linux lab2439 6.8.0-111-generic #111~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Apr 14 17:13:45 UTC x86_64 GNU/Linux
+```
+
+This is a single-node Ubuntu 22.04-class Linux host. The default scripts run
+logd, control, and multiple workers as local processes. Docker Compose can be
+used on the same host to add MinIO for S3-compatible result storage.
+
 ## Fault Injection
 
 Run:
@@ -17,11 +29,15 @@ The script executes the automated recovery tests for:
 - worker loss during workflow execution
 - actor owner loss and recovery through replay/snapshot
 - running task redelivery after the lease expires
+- poll-before-start task redelivery after worker loss
+- control restart bootstrap for workflow, actor, model, and backpressure streams
 
-It also probes control and logd process restarts. Current limitation: control
-metadata is still in-memory, so a restarted control plane can replay named
-workflow, actor, and LLM streams on request, but it does not yet scan every log
-stream and automatically rebuild the full metadata index.
+It also probes control and logd process restarts. On control startup, LogServe
+scans shared-log streams and rebuilds materialized workflow, actor, model, and
+backpressure state. Running workflow steps are restored to the in-memory queue
+from their logged DAG definitions. Plain ad-hoc tasks do not yet have enough
+function-spec metadata in the shared log to be automatically resumed after a
+control restart, so they remain a prototype limitation.
 
 ## Benchmarks
 
@@ -72,17 +88,37 @@ This writes `dashboard/snapshot.json`. Open `dashboard/index.html` to inspect:
 
 ## Backpressure
 
-Backpressure currently rejects new task submissions when the in-memory queue
-length reaches the configured high watermark. Running tasks that exceed the
-redelivery timeout are moved back to queued state and can be polled by another
-worker.
+Backpressure rejects new non-duplicate task submissions when the in-memory queue
+length reaches the configured high watermark. It also rejects new submissions
+when the most recent control-plane log append latency is above the configured
+slow threshold. Idempotent duplicate submissions bypass backpressure and return
+the existing task id. Running tasks that exceed the redelivery timeout, including
+tasks leased by `PollTask` before `StartTask`, are moved back to queued state
+and can be polled by another worker.
 
 Configure through:
 
 ```powershell
-'{"queue_high_watermark":128,"redelivery_timeout_ms":30000}' |
+'{"queue_high_watermark":128,"redelivery_timeout_ms":30000,"log_append_slow_ms":250}' |
   go run ./cmd/logservectl backpressure-set
 ```
+
+## Result Store
+
+The default result store is filesystem-backed `local://` storage. For the
+single-machine Compose experiment, control is configured to use MinIO through
+the S3-compatible adapter:
+
+```text
+LOGSERVE_RESULT_STORE=minio
+LOGSERVE_S3_ENDPOINT=http://minio:9000
+LOGSERVE_S3_BUCKET=logserve-results
+LOGSERVE_S3_ACCESS_KEY=logserve
+LOGSERVE_S3_SECRET_KEY=logserve123
+```
+
+Large workflow results and actor snapshots are written to this store, while log
+events retain only `result_ref` or `snapshot_ref`.
 
 ## Kubernetes
 

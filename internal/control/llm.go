@@ -30,7 +30,7 @@ func (s *Service) RegisterModel(ctx context.Context, req *logservepb.RegisterMod
 	}
 	registered := s.meta.RegisterModel(model)
 	payload, _ := json.Marshal(registered)
-	_, _ = s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       "system:models",
 		EventType:      "ModelRegistered",
 		IdempotencyKey: metadata.ModelKey(registered.GetName(), registered.GetVersion()) + ":registered",
@@ -44,12 +44,14 @@ func (s *Service) SetSchedulingPolicy(ctx context.Context, req *logservepb.SetSc
 	if policy == logservepb.SchedulingPolicy_SCHEDULING_POLICY_UNSPECIFIED {
 		policy = logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE
 	}
+	s.configMu.Lock()
 	s.schedulingPolicy = policy
+	s.configMu.Unlock()
 	payload, _ := json.Marshal(map[string]any{
 		"policy":       policy.String(),
 		"timestamp_ms": time.Now().UnixMilli(),
 	})
-	_, _ = s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       "system:scheduler",
 		EventType:      "SchedulingPolicyChanged",
 		IdempotencyKey: fmt.Sprintf("policy:%d:%d", policy, time.Now().UnixNano()),
@@ -70,7 +72,11 @@ func (s *Service) SubmitLLM(ctx context.Context, req *logservepb.SubmitLLMReques
 		version = "v1"
 	}
 	adapter := req.GetAdapter()
-	if model, ok := s.meta.GetModel(req.GetModelName(), version); ok && adapter == "" {
+	model, ok := s.meta.GetModel(req.GetModelName(), version)
+	if !ok {
+		return nil, fmt.Errorf("model %s:%s is not registered", req.GetModelName(), version)
+	}
+	if adapter == "" {
 		adapter = model.GetAdapter()
 	}
 	if adapter == "" {
@@ -173,7 +179,7 @@ func (s *Service) canAssignTaskToWorker(taskID string, spec *logservepb.TaskSpec
 	if !ok || !workerHasCapacity(worker) {
 		return false
 	}
-	if s.schedulingPolicy == logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY {
+	if s.getSchedulingPolicy() == logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY {
 		return true
 	}
 	preferred := s.preferredLLMWorker(taskID, spec)

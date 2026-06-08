@@ -109,9 +109,12 @@ The Compose file starts PostgreSQL, NATS JetStream, MinIO, logd, control, and a 
 docker compose -f deployments/docker-compose.yml up --build
 ```
 
-The current Phase 1 runtime uses the in-memory queue path and in-memory metadata
-materialization so it can run without external services. PostgreSQL migrations are
-included under `internal/metadata/migrations` as the Phase 1 database contract.
+The default single-process development path uses the in-memory queue and a
+materialized metadata view. Control startup bootstraps workflow, actor, model,
+and backpressure state from the shared log; plain ad-hoc task function specs are
+still held in memory and are not resumed after a control restart. PostgreSQL
+migrations are included under `internal/metadata/migrations` as the Phase 1
+database contract.
 
 ## Tests
 
@@ -132,6 +135,8 @@ Covered Phase 2 checks:
 - replayed workflow state from shared log matches metadata state
 - duplicate step completion does not write a second workflow final result
 - failed steps retry according to `max_attempts`
+- timed-out steps fail and retry according to `max_attempts`
+- poll-before-start worker loss redelivers the leased task
 
 ## Phase 2 Semantics
 
@@ -151,9 +156,12 @@ attempt can run again, while duplicate successful completions for the same
 step/input do not create another workflow final result.
 
 Large workflow step results are written through the result-store interface and
-workflow log events keep only `result_ref`. The local development adapter stores
-objects under a filesystem-backed `local://` namespace; the Compose environment
-still includes MinIO for the later S3-compatible adapter.
+workflow log events keep only `result_ref`. The default local adapter stores
+objects under a filesystem-backed `local://` namespace. Set
+`LOGSERVE_RESULT_STORE=minio` or `LOGSERVE_RESULT_STORE=s3` with
+`LOGSERVE_S3_ENDPOINT`, `LOGSERVE_S3_BUCKET`, `LOGSERVE_S3_ACCESS_KEY`, and
+`LOGSERVE_S3_SECRET_KEY` to use the S3-compatible MinIO adapter. The Compose
+environment wires this to its MinIO service.
 
 ## Phase 3 Actor Demo
 
@@ -312,13 +320,14 @@ Covered Phase 4 checks:
 
 Phase 5 adds operational analysis assets and runtime hardening:
 
-- running task redelivery after worker loss
-- queue high-watermark backpressure
+- running and poll-before-start task redelivery after worker loss
+- queue high-watermark and log-append-latency backpressure
 - dashboard snapshot API and static dashboard
 - benchmark harness for workflow latency, task throughput, actor replay, and
   LLM cold start
 - ablation report for locality, snapshots, and replay semantics
-- fault-injection script for worker/control/logd probes
+- fault-injection script for worker/control/logd probes, including control
+  metadata bootstrap from the shared log
 - optional Kubernetes manifests for kind or minikube
 
 Useful commands:

@@ -89,6 +89,7 @@ type llmSubmitInput struct {
 type backpressureInput struct {
 	QueueHighWatermark  uint32 `json:"queue_high_watermark"`
 	RedeliveryTimeoutMs int64  `json:"redelivery_timeout_ms"`
+	LogAppendSlowMs     int64  `json:"log_append_slow_ms"`
 }
 
 type llmOutput struct {
@@ -617,6 +618,7 @@ func backpressureSet(args []string) error {
 	resp, err := client.SetBackpressure(ctx, &logservepb.SetBackpressureRequest{
 		QueueHighWatermark:  input.QueueHighWatermark,
 		RedeliveryTimeoutMs: input.RedeliveryTimeoutMs,
+		LogAppendSlowMs:     input.LogAppendSlowMs,
 	})
 	if err != nil {
 		return err

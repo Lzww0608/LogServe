@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -165,6 +167,20 @@ func (s *Store) Read(streamID string, fromSeq uint64, limit int) ([]Record, erro
 		}
 	}
 	return out, nil
+}
+
+func (s *Store) ListStreams(prefix string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]string, 0, len(s.records))
+	for streamID := range s.records {
+		if prefix == "" || strings.HasPrefix(streamID, prefix) {
+			out = append(out, streamID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (s *Store) recover() error {

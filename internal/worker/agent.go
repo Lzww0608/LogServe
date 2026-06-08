@@ -81,8 +81,31 @@ type pythonRunner struct {
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
 	scanner *bufio.Scanner
-	stderr  *bytes.Buffer
+	stderr  *lockedBuffer
 	mu      sync.Mutex
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 type modelCache struct {
@@ -205,14 +228,29 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 		return err
 	}
 
-	result, actorState, execErr := runExecutor(ctx, cfg, runner, cache, controlClient, logClient, task)
+	execCtx := ctx
+	cancelExec := func() {}
+	if task.GetTimeoutMs() > 0 {
+		execCtx, cancelExec = context.WithTimeout(ctx, time.Duration(task.GetTimeoutMs())*time.Millisecond)
+	}
+	result, actorState, execErr := runExecutor(execCtx, cfg, runner, cache, controlClient, logClient, task)
+	cancelExec()
+	if errors.Is(execErr, context.DeadlineExceeded) && task.GetLlmModelName() == "" {
+		if err := runner.Restart(ctx, cfg); err != nil {
+			observability.Error("python_executor_restart_failed", err, map[string]any{"worker_id": cfg.WorkerID})
+		}
+	}
 	status := logservepb.TaskStatus_TASK_STATUS_SUCCEEDED
 	errText := ""
 	payload := result
 	eventType := "TaskCompleted"
 	if execErr != nil {
 		status = logservepb.TaskStatus_TASK_STATUS_FAILED
-		errText = execErr.Error()
+		if errors.Is(execErr, context.DeadlineExceeded) && task.GetTimeoutMs() > 0 {
+			errText = fmt.Sprintf("task timed out after %dms", task.GetTimeoutMs())
+		} else {
+			errText = execErr.Error()
+		}
 		payload, _ = json.Marshal(map[string]string{"error": errText})
 		eventType = "TaskFailed"
 	}
@@ -388,7 +426,7 @@ func startPythonRunner(ctx context.Context, cfg Config) (*pythonRunner, error) {
 	if err != nil {
 		return nil, err
 	}
-	stderr := &bytes.Buffer{}
+	stderr := &lockedBuffer{}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -420,20 +458,71 @@ func (r *pythonRunner) Execute(ctx context.Context, req any) (executorResponse, 
 	if _, err := r.stdin.Write(append(data, '\n')); err != nil {
 		return executorResponse{}, err
 	}
-	if !r.scanner.Scan() {
-		if err := r.scanner.Err(); err != nil {
-			return executorResponse{}, err
-		}
-		if r.stderr.Len() > 0 {
-			return executorResponse{}, errors.New(r.stderr.String())
-		}
-		return executorResponse{}, errors.New("python executor stopped")
+
+	type scanResult struct {
+		resp executorResponse
+		err  error
 	}
-	var resp executorResponse
-	if err := json.Unmarshal(r.scanner.Bytes(), &resp); err != nil {
-		return executorResponse{}, err
+	scanner := r.scanner
+	stderr := r.stderr
+	cmd := r.cmd
+	done := make(chan scanResult, 1)
+	go func() {
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				done <- scanResult{err: err}
+				return
+			}
+			if stderr.Len() > 0 {
+				done <- scanResult{err: errors.New(stderr.String())}
+				return
+			}
+			done <- scanResult{err: errors.New("python executor stopped")}
+			return
+		}
+		var resp executorResponse
+		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			done <- scanResult{err: err}
+			return
+		}
+		done <- scanResult{resp: resp}
+	}()
+
+	select {
+	case result := <-done:
+		return result.resp, result.err
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+		return executorResponse{}, ctx.Err()
 	}
-	return resp, nil
+}
+
+func (r *pythonRunner) Restart(ctx context.Context, cfg Config) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.stdin != nil {
+		_ = r.stdin.Close()
+	}
+	if r.cmd != nil && r.cmd.Process != nil {
+		_ = r.cmd.Process.Kill()
+		_ = r.cmd.Wait()
+	}
+	next, err := startPythonRunner(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	r.cmd = next.cmd
+	r.stdin = next.stdin
+	r.scanner = next.scanner
+	r.stderr = next.stderr
+	return nil
 }
 
 func (r *pythonRunner) Close() error {

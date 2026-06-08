@@ -93,6 +93,20 @@ func (s *MemoryStore) GetTask(taskID string) (Task, bool) {
 	return cloneTask(task), ok
 }
 
+func (s *MemoryStore) GetTaskByIdempotencyKey(idempotencyKey string) (Task, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if idempotencyKey == "" {
+		return Task{}, false
+	}
+	taskID, ok := s.taskByIdemKey[idempotencyKey]
+	if !ok {
+		return Task{}, false
+	}
+	task, ok := s.tasks[taskID]
+	return cloneTask(task), ok
+}
+
 func (s *MemoryStore) ListTasks() []Task {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -158,6 +172,12 @@ func (s *MemoryStore) CompleteTask(taskID, workerID string, status logservepb.Ta
 	task, ok := s.tasks[taskID]
 	if !ok {
 		return Task{}, errors.New("task not found")
+	}
+	if task.Status == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED || task.Status == logservepb.TaskStatus_TASK_STATUS_FAILED {
+		return cloneTask(task), nil
+	}
+	if task.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING && task.WorkerID != "" && workerID != "" && task.WorkerID != workerID {
+		return Task{}, errors.New("stale task completion rejected")
 	}
 	task.Status = status
 	task.WorkerID = workerID
@@ -241,6 +261,12 @@ func (s *MemoryStore) UpdateWorkflow(workflowID string, fn func(*workflow.State)
 	state.UpdatedAtMs = time.Now().UnixMilli()
 	s.workflows[workflowID] = cloneWorkflow(state)
 	return cloneWorkflow(state), nil
+}
+
+func (s *MemoryStore) UpsertWorkflow(state workflow.State) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workflows[state.WorkflowID] = cloneWorkflow(state)
 }
 
 func (s *MemoryStore) UpsertWorker(worker Worker) {
@@ -391,6 +417,12 @@ func (s *MemoryStore) UpdateActor(actorID string, fn func(*actor.State) error) (
 	state.UpdatedAtMs = time.Now().UnixMilli()
 	s.actors[actorID] = cloneActor(state)
 	return cloneActor(state), nil
+}
+
+func (s *MemoryStore) UpsertActor(state actor.State) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.actors[state.ActorID] = cloneActor(state)
 }
 
 func cloneTask(task Task) Task {

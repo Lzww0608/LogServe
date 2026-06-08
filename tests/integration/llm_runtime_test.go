@@ -54,6 +54,21 @@ func TestLLMLocalityAwareSchedulerPrefersCachedWorker(t *testing.T) {
 	}
 }
 
+func TestLLMSubmitRequiresRegisteredModel(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	_, err := env.controlClient.SubmitLLM(context.Background(), &logservepb.SubmitLLMRequest{
+		ModelName:    "missing-model",
+		ModelVersion: "v1",
+		Prompt:       "hello",
+		Adapter:      "mock",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("SubmitLLM error = %v, want model registry rejection", err)
+	}
+}
+
 func TestLLMReplayRecordsModelLoadAndCompletion(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -156,6 +171,7 @@ func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPol
 	for i := 0; i < requests; i++ {
 		submitLLMForTest(t, env.controlClient, "model-A", "hello")
 		var worker string
+		var taskID string
 		for _, poller := range pollOrder {
 			resp, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: poller})
 			if err != nil {
@@ -163,11 +179,20 @@ func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPol
 			}
 			if resp.GetHasTask() {
 				worker = poller
+				taskID = resp.GetTask().GetTaskId()
 				break
 			}
 		}
 		if worker == "" {
 			t.Fatal("no worker selected")
+		}
+		if _, err := env.controlClient.CompleteTask(context.Background(), &logservepb.CompleteTaskRequest{
+			TaskId:     taskID,
+			WorkerId:   worker,
+			Status:     logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
+			ResultJson: []byte(`"ok"`),
+		}); err != nil {
+			t.Fatal(err)
 		}
 		assigned = append(assigned, worker)
 		cacheHit := worker == "worker-1"

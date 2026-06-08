@@ -152,6 +152,8 @@
         ["Queue Depth", pick(data, "queueDepth", "queue_depth") || 0],
         ["High Watermark", pick(data, "queueHighWatermark", "queue_high_watermark") || 0],
         ["Redelivery Timeout", `${pick(data, "redeliveryTimeoutMs", "redelivery_timeout_ms") || 0} ms`],
+        ["Last Log Append", `${pick(data, "lastLogAppendMs", "last_log_append_ms") || 0} ms`],
+        ["Log Slow Limit", `${pick(data, "logAppendSlowMs", "log_append_slow_ms") || 0} ms`],
         ["Scheduling Policy", pick(data, "schedulingPolicy", "scheduling_policy") || "-"],
       ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
 

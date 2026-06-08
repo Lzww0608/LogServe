@@ -134,6 +134,28 @@ func TestWorkflowRetriesFailedStep(t *testing.T) {
 	}
 }
 
+func TestWorkflowRetriesTimedOutStep(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runWorkerForTest(ctx, t, env, "timeout-worker", 0)
+
+	submitted := submitWorkflowForTest(t, env.controlClient, timeoutDefinition(t))
+	status := waitWorkflowTerminal(t, env.controlClient, submitted.GetWorkflowId())
+	if status.GetStatus() != logservepb.WorkflowStatus_WORKFLOW_STATUS_FAILED {
+		t.Fatalf("workflow status = %s, want FAILED", status.GetStatus())
+	}
+	step := stepByID(t, status, "slow")
+	if step.GetAttempts() != 2 {
+		t.Fatalf("timeout step attempts = %d, want 2", step.GetAttempts())
+	}
+	if step.GetStatus() != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_FAILED {
+		t.Fatalf("timeout step status = %s, want FAILED", step.GetStatus())
+	}
+}
+
 func startWorkflowEnv(t *testing.T) *workflowTestEnv {
 	t.Helper()
 	root := repoRoot(t)
@@ -170,6 +192,25 @@ func (e *workflowTestEnv) stop() {
 	_ = e.logConn.Close()
 	_ = e.controlServer.Stop()
 	_ = e.logServer.Stop()
+}
+
+func (e *workflowTestEnv) restartControl(t *testing.T) {
+	t.Helper()
+	_ = e.controlConn.Close()
+	_ = e.controlServer.Stop()
+
+	controlServer, err := controlplane.Start("127.0.0.1:0", e.logServer.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlConn, err := grpc.NewClient(controlServer.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		_ = controlServer.Stop()
+		t.Fatal(err)
+	}
+	e.controlServer = controlServer
+	e.controlConn = controlConn
+	e.controlClient = logservepb.NewControlServiceClient(controlConn)
 }
 
 func runWorkerForTest(ctx context.Context, t *testing.T, env *workflowTestEnv, workerID string, maxTasks int) {
@@ -224,6 +265,25 @@ func waitWorkflow(t *testing.T, client logservepb.ControlServiceClient, workflow
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("workflow status = %s, want %s; last=%v", last.GetStatus(), want, last)
+	return nil
+}
+
+func waitWorkflowTerminal(t *testing.T, client logservepb.ControlServiceClient, workflowID string) *logservepb.GetWorkflowStatusResponse {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	var last *logservepb.GetWorkflowStatusResponse
+	for time.Now().Before(deadline) {
+		resp, err := client.GetWorkflowStatus(context.Background(), &logservepb.GetWorkflowStatusRequest{WorkflowId: workflowID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = resp
+		if resp.GetStatus() == logservepb.WorkflowStatus_WORKFLOW_STATUS_COMPLETED || resp.GetStatus() == logservepb.WorkflowStatus_WORKFLOW_STATUS_FAILED {
+			return resp
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("workflow did not reach a terminal state; last=%v", last)
 	return nil
 }
 
@@ -361,6 +421,35 @@ def finish(value):
 				"depends_on":      []string{"flaky"},
 				"max_attempts":    2,
 				"timeout_ms":      30000,
+			},
+		},
+	}
+}
+
+func timeoutDefinition(t *testing.T) map[string]any {
+	t.Helper()
+	source := `
+def slow():
+    import time
+    time.sleep(0.25)
+    return "late"
+`
+	return map[string]any{
+		"workflow_name":   "timeout_workflow",
+		"function_source": source,
+		"max_attempts":    2,
+		"timeout_ms":      50,
+		"result_step_id":  "slow",
+		"steps": []map[string]any{
+			{
+				"step_id":         "slow",
+				"task_name":       "slow",
+				"function_name":   "slow",
+				"function_source": source,
+				"args_json":       map[string]any{"args": []any{}, "kwargs": map[string]any{}},
+				"depends_on":      []string{},
+				"max_attempts":    2,
+				"timeout_ms":      50,
 			},
 		},
 	}

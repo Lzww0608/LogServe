@@ -15,3 +15,5 @@ COPY --from=build /out/logserve-control /usr/local/bin/logserve-control
 COPY --from=build /out/logserve-worker /usr/local/bin/logserve-worker
 COPY --from=build /out/logservectl /usr/local/bin/logservectl
 COPY executor /app/executor
+COPY sdk /app/sdk
+ENV PYTHONPATH=/app/sdk/python

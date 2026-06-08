@@ -74,6 +74,7 @@ message TaskSpec {
   string llm_model_version = 19;
   string llm_adapter = 20;
   uint32 llm_max_tokens = 21;
+  int64 timeout_ms = 22;
 }
 
 message SubmitTaskRequest {
@@ -331,11 +332,13 @@ message ReplayLLMResponse {
 message SetBackpressureRequest {
   uint32 queue_high_watermark = 1;
   int64 redelivery_timeout_ms = 2;
+  int64 log_append_slow_ms = 3;
 }
 
 message SetBackpressureResponse {
   uint32 queue_high_watermark = 1;
   int64 redelivery_timeout_ms = 2;
+  int64 log_append_slow_ms = 3;
 }
 
 message DashboardTask {
@@ -377,6 +380,8 @@ message DashboardSnapshot {
   repeated GetActorStatusResponse actors = 7;
   repeated DashboardWorker workers = 8;
   repeated ModelInfo models = 9;
+  int64 last_log_append_ms = 10;
+  int64 log_append_slow_ms = 11;
 }
 
 message GetDashboardSnapshotRequest {}

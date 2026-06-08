@@ -20,6 +20,13 @@ spec:
           args: ["logserve-logd", "--addr", "0.0.0.0:50051", "--data-dir", "/var/lib/logserve/logstore"]
           ports:
             - containerPort: 50051
+          volumeMounts:
+            - name: logstore
+              mountPath: /var/lib/logserve/logstore
+      volumes:
+        - name: logstore
+          persistentVolumeClaim:
+            claimName: logserve-logstore
 ---
 apiVersion: v1
 kind: Service
@@ -32,3 +39,15 @@ spec:
   ports:
     - port: 50051
       targetPort: 50051
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: logserve-logstore
+  namespace: logserve
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

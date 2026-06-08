@@ -11,26 +11,37 @@ import (
 )
 
 func (s *Service) SetBackpressure(ctx context.Context, req *logservepb.SetBackpressureRequest) (*logservepb.SetBackpressureResponse, error) {
+	s.configMu.Lock()
 	if req.GetQueueHighWatermark() > 0 {
 		s.queueHighWatermark = req.GetQueueHighWatermark()
 	}
 	if req.GetRedeliveryTimeoutMs() > 0 {
 		s.redeliveryTimeout = time.Duration(req.GetRedeliveryTimeoutMs()) * time.Millisecond
 	}
+	if req.GetLogAppendSlowMs() > 0 {
+		s.logAppendSlowLimit = time.Duration(req.GetLogAppendSlowMs()) * time.Millisecond
+	}
+	queueHighWatermark := s.queueHighWatermark
+	redeliveryTimeout := s.redeliveryTimeout
+	logAppendSlowLimit := s.logAppendSlowLimit
+	s.configMu.Unlock()
+
 	payload, _ := json.Marshal(map[string]any{
-		"queue_high_watermark":  s.queueHighWatermark,
-		"redelivery_timeout_ms": s.redeliveryTimeout.Milliseconds(),
+		"queue_high_watermark":  queueHighWatermark,
+		"redelivery_timeout_ms": redeliveryTimeout.Milliseconds(),
+		"log_append_slow_ms":    logAppendSlowLimit.Milliseconds(),
 		"timestamp_ms":          time.Now().UnixMilli(),
 	})
-	_, _ = s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       "system:backpressure",
 		EventType:      "BackpressureConfigured",
 		IdempotencyKey: "backpressure:" + time.Now().Format("150405.000000000"),
 		Payload:        payload,
 	})
 	return &logservepb.SetBackpressureResponse{
-		QueueHighWatermark:  s.queueHighWatermark,
-		RedeliveryTimeoutMs: s.redeliveryTimeout.Milliseconds(),
+		QueueHighWatermark:  queueHighWatermark,
+		RedeliveryTimeoutMs: redeliveryTimeout.Milliseconds(),
+		LogAppendSlowMs:     logAppendSlowLimit.Milliseconds(),
 	}, nil
 }
 
@@ -98,21 +109,25 @@ func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetD
 		}
 		return models[i].GetName() < models[j].GetName()
 	})
+	queueHighWatermark, redeliveryTimeout, logAppendSlowLimit := s.getBackpressureConfig()
 	return &logservepb.DashboardSnapshot{
 		QueueDepth:          queueDepth,
-		QueueHighWatermark:  s.queueHighWatermark,
-		RedeliveryTimeoutMs: s.redeliveryTimeout.Milliseconds(),
-		SchedulingPolicy:    s.schedulingPolicy,
+		QueueHighWatermark:  queueHighWatermark,
+		RedeliveryTimeoutMs: redeliveryTimeout.Milliseconds(),
+		SchedulingPolicy:    s.getSchedulingPolicy(),
 		Tasks:               dashboardTasks,
 		Workflows:           dashboardWorkflows,
 		Actors:              dashboardActors,
 		Workers:             dashboardWorkers,
 		Models:              models,
+		LastLogAppendMs:     s.lastLogAppendMs.Load(),
+		LogAppendSlowMs:     logAppendSlowLimit.Milliseconds(),
 	}, nil
 }
 
 func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
-	requeued := s.meta.RequeueExpiredRunningTasks(s.redeliveryTimeout)
+	_, redeliveryTimeout, _ := s.getBackpressureConfig()
+	requeued := s.meta.RequeueExpiredRunningTasks(redeliveryTimeout)
 	if len(requeued) == 0 {
 		return nil
 	}
@@ -127,7 +142,7 @@ func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
 			"task_name":    task.TaskName,
 			"timestamp_ms": time.Now().UnixMilli(),
 		})
-		_, _ = s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+		_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
 			StreamId:       taskStream(task.TaskID),
 			EventType:      "TaskRedelivered",
 			IdempotencyKey: task.TaskID + ":redelivered:" + time.Now().Format("150405.000000000"),

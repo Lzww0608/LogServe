@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
@@ -38,11 +39,14 @@ type Service struct {
 	workflowMu            sync.Mutex
 	actorLocksMu          sync.Mutex
 	actorLocks            map[string]*sync.Mutex
-	resultStore           *objectstore.LocalStore
+	resultStore           objectstore.Store
 	resultInlineThreshold int
+	configMu              sync.RWMutex
 	schedulingPolicy      logservepb.SchedulingPolicy
 	queueHighWatermark    uint32
 	redeliveryTimeout     time.Duration
+	logAppendSlowLimit    time.Duration
+	lastLogAppendMs       atomic.Int64
 }
 
 func NewService(meta *metadata.MemoryStore, logClient logservepb.LogServiceClient) *Service {
@@ -50,7 +54,7 @@ func NewService(meta *metadata.MemoryStore, logClient logservepb.LogServiceClien
 	return NewServiceWithResultStore(meta, logClient, store, defaultResultInlineThreshold)
 }
 
-func NewServiceWithResultStore(meta *metadata.MemoryStore, logClient logservepb.LogServiceClient, store *objectstore.LocalStore, threshold int) *Service {
+func NewServiceWithResultStore(meta *metadata.MemoryStore, logClient logservepb.LogServiceClient, store objectstore.Store, threshold int) *Service {
 	if threshold <= 0 {
 		threshold = defaultResultInlineThreshold
 	}
@@ -66,6 +70,29 @@ func NewServiceWithResultStore(meta *metadata.MemoryStore, logClient logservepb.
 		queueHighWatermark:    defaultQueueHighWatermark,
 		redeliveryTimeout:     defaultRedeliveryTimeout,
 	}
+}
+
+func (s *Service) appendLog(ctx context.Context, req *logservepb.AppendLogRequest) (*logservepb.AppendLogResponse, error) {
+	start := time.Now()
+	resp, err := s.log.AppendLog(ctx, req)
+	elapsedMs := time.Since(start).Milliseconds()
+	if elapsedMs == 0 {
+		elapsedMs = 1
+	}
+	s.lastLogAppendMs.Store(elapsedMs)
+	return resp, err
+}
+
+func (s *Service) getBackpressureConfig() (uint32, time.Duration, time.Duration) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.queueHighWatermark, s.redeliveryTimeout, s.logAppendSlowLimit
+}
+
+func (s *Service) getSchedulingPolicy() logservepb.SchedulingPolicy {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.schedulingPolicy
 }
 
 func (s *Service) SubmitTask(ctx context.Context, req *logservepb.SubmitTaskRequest) (*logservepb.SubmitTaskResponse, error) {
@@ -143,7 +170,7 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 		DefinitionJSON: definitionJSON,
 		TimestampMs:    now,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       workflowStream(workflowID),
 		EventType:      "WorkflowStarted",
 		IdempotencyKey: workflowID + ":started",
@@ -204,7 +231,7 @@ func (s *Service) RegisterWorker(ctx context.Context, req *logservepb.RegisterWo
 		"cached_models": req.GetCachedModels(),
 		"capacity":      req.GetCapacity(),
 	})
-	_, _ = s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	_, _ = s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       "system:workers",
 		EventType:      "WorkerRegistered",
 		IdempotencyKey: req.GetWorkerId() + ":registered",
@@ -236,10 +263,17 @@ func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest)
 		s.specMu.RUnlock()
 		if !ok {
 			s.queue = append(s.queue[:i], s.queue[i+1:]...)
-			return &logservepb.PollTaskResponse{HasTask: false}, nil
+			continue
 		}
 		if !s.canAssignTaskToWorker(taskID, spec, req.GetWorkerId()) {
 			continue
+		}
+		before, _ := s.meta.GetTask(taskID)
+		if _, err := s.meta.SetTaskRunning(taskID, req.GetWorkerId()); err != nil {
+			return nil, err
+		}
+		if before.Status == logservepb.TaskStatus_TASK_STATUS_QUEUED {
+			s.meta.IncrementWorkerLoad(req.GetWorkerId())
 		}
 		s.queue = append(s.queue[:i], s.queue[i+1:]...)
 		return &logservepb.PollTaskResponse{HasTask: true, Task: cloneSpec(spec)}, nil
@@ -273,6 +307,9 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 	}
 	existing, ok := s.meta.GetTask(req.GetTaskId())
 	if ok && existing.ActorID != "" {
+		if isTerminalTaskStatus(existing.Status) {
+			return &logservepb.CompleteTaskResponse{Accepted: true}, nil
+		}
 		if err := s.completeActorCall(ctx, existing, req); err != nil {
 			return nil, err
 		}
@@ -309,11 +346,22 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 	if spec.GetTaskId() == "" {
 		spec.TaskId = newTaskID()
 	}
+	if task, ok := s.meta.GetTaskByIdempotencyKey(spec.GetIdempotencyKey()); ok {
+		return task, true, nil
+	}
+
+	queueHighWatermark, _, logAppendSlowLimit := s.getBackpressureConfig()
+	if logAppendSlowLimit > 0 {
+		lastLogAppend := time.Duration(s.lastLogAppendMs.Load()) * time.Millisecond
+		if lastLogAppend >= logAppendSlowLimit {
+			return metadata.Task{}, false, fmt.Errorf("backpressure: last log append latency %dms exceeds slow threshold %dms", lastLogAppend.Milliseconds(), logAppendSlowLimit.Milliseconds())
+		}
+	}
 	s.queueMu.Lock()
-	if s.queueHighWatermark > 0 && len(s.queue) >= int(s.queueHighWatermark) {
+	if queueHighWatermark > 0 && len(s.queue) >= int(queueHighWatermark) {
 		backlog := len(s.queue)
 		s.queueMu.Unlock()
-		return metadata.Task{}, false, fmt.Errorf("backpressure: queue backlog %d exceeds high watermark %d", backlog, s.queueHighWatermark)
+		return metadata.Task{}, false, fmt.Errorf("backpressure: queue backlog %d exceeds high watermark %d", backlog, queueHighWatermark)
 	}
 	s.queueMu.Unlock()
 
@@ -346,7 +394,7 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 		"llm_model_name":    spec.GetLlmModelName(),
 		"llm_model_version": spec.GetLlmModelVersion(),
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       taskStream(task.TaskID),
 		EventType:      "TaskSubmitted",
 		IdempotencyKey: task.TaskID + ":submitted",
@@ -402,6 +450,7 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			LlmModelVersion: stepDef.LLMModelVersion,
 			LlmAdapter:      stepDef.LLMAdapter,
 			LlmMaxTokens:    stepDef.LLMMaxTokens,
+			TimeoutMs:       stepDef.TimeoutMs,
 		}
 		now := workflow.NowMs()
 		payload, _ := json.Marshal(workflow.EventPayload{
@@ -412,7 +461,7 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			InputHash:   inputHash,
 			TimestampMs: now,
 		})
-		if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 			StreamId:       workflowStream(workflowID),
 			EventType:      "StepScheduled",
 			IdempotencyKey: fmt.Sprintf("%s:%s:%s:scheduled:%d", workflowID, stepDef.StepID, inputHash, attempt),
@@ -465,10 +514,10 @@ func (s *Service) markWorkflowStepStarted(ctx context.Context, task metadata.Tas
 		TaskID:      task.TaskID,
 		TimestampMs: now,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       workflowStream(task.WorkflowID),
 		EventType:      "StepStarted",
-		IdempotencyKey: task.WorkflowID + ":" + task.StepID + ":" + task.TaskID + ":started",
+		IdempotencyKey: task.WorkflowID + ":" + task.StepID + ":" + task.TaskID + ":started:" + workerID,
 		Payload:        payload,
 	}); err != nil {
 		return err
@@ -520,7 +569,7 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 			TimestampMs: now,
 			LatencyMs:   latencyMs,
 		})
-		if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 			StreamId:       workflowStream(task.WorkflowID),
 			EventType:      "StepSucceeded",
 			IdempotencyKey: task.WorkflowID + ":" + task.StepID + ":" + step.LastInputHash + ":succeeded",
@@ -565,7 +614,7 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 		TimestampMs: now,
 		LatencyMs:   latencyMs,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       workflowStream(task.WorkflowID),
 		EventType:      "StepFailed",
 		IdempotencyKey: task.WorkflowID + ":" + task.StepID + ":" + task.TaskID + ":failed",
@@ -631,7 +680,7 @@ func (s *Service) completeWorkflow(ctx context.Context, state workflow.State) er
 		TimestampMs: now,
 		LatencyMs:   latencyMs,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       workflowStream(state.WorkflowID),
 		EventType:      "WorkflowCompleted",
 		IdempotencyKey: state.WorkflowID + ":completed",
@@ -663,7 +712,7 @@ func (s *Service) failWorkflow(ctx context.Context, state workflow.State, taskEr
 		Error:       taskErr,
 		TimestampMs: now,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       workflowStream(state.WorkflowID),
 		EventType:      "WorkflowFailed",
 		IdempotencyKey: state.WorkflowID + ":failed",
@@ -705,6 +754,10 @@ func workflowDone(state workflow.State) bool {
 		}
 	}
 	return true
+}
+
+func isTerminalTaskStatus(status logservepb.TaskStatus) bool {
+	return status == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED || status == logservepb.TaskStatus_TASK_STATUS_FAILED
 }
 
 func taskStatusResponse(task metadata.Task) *logservepb.GetTaskStatusResponse {
@@ -778,6 +831,7 @@ func cloneSpec(spec *logservepb.TaskSpec) *logservepb.TaskSpec {
 		LlmModelVersion:   spec.GetLlmModelVersion(),
 		LlmAdapter:        spec.GetLlmAdapter(),
 		LlmMaxTokens:      spec.GetLlmMaxTokens(),
+		TimeoutMs:         spec.GetTimeoutMs(),
 	}
 }
 

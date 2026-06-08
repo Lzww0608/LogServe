@@ -38,7 +38,7 @@ func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRe
 		SnapshotEvery: state.SnapshotEvery,
 		TimestampMs:   now,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       actorStream(actorID),
 		EventType:      "ActorCreated",
 		IdempotencyKey: actorID + ":created",
@@ -196,7 +196,7 @@ func (s *Service) ensureActorOwner(ctx context.Context, actorID string) (actor.S
 		Epoch:       epoch,
 		TimestampMs: now,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       actorStream(actorID),
 		EventType:      "ActorOwnershipGranted",
 		IdempotencyKey: fmt.Sprintf("%s:ownership:%d", actorID, epoch),
@@ -244,7 +244,7 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 		CommandCount: commandCount,
 		TimestampMs:  now,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       actorStream(task.ActorID),
 		EventType:      "ActorCommandApplied",
 		IdempotencyKey: task.ActorID + ":" + task.ActorCallID + ":applied",
@@ -294,7 +294,7 @@ func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) er
 		SnapshotCommandCount: state.CommandCount,
 		TimestampMs:          now,
 	})
-	if _, err := s.log.AppendLog(ctx, &logservepb.AppendLogRequest{
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       actorStream(state.ActorID),
 		EventType:      "ActorSnapshotCreated",
 		IdempotencyKey: fmt.Sprintf("%s:snapshot:%d", state.ActorID, state.CommandCount),
