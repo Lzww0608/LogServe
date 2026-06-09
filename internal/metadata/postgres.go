@@ -272,12 +272,12 @@ func (s *PostgresStore) persistTask(ctx context.Context, task Task) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO task_instances (
   task_id, task_name, status, worker_id, workflow_id, step_id, target_worker_id,
-  actor_id, actor_call_id, actor_epoch, task_lease_epoch, llm_model_name,
+  actor_id, actor_call_id, actor_epoch, actor_command_seq, task_lease_epoch, llm_model_name,
   llm_model_version, idempotency_key, idempotency_fingerprint, result_json, error, created_at, updated_at
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7,
-  $8, $9, $10, $11, $12,
-  $13, $14, $15, $16::jsonb, $17, $18, $19
+  $8, $9, $10, $11, $12, $13,
+  $14, $15, $16, $17::jsonb, $18, $19, $20
 ) ON CONFLICT (task_id) DO UPDATE SET
   task_name = EXCLUDED.task_name,
   status = EXCLUDED.status,
@@ -288,6 +288,7 @@ INSERT INTO task_instances (
   actor_id = EXCLUDED.actor_id,
   actor_call_id = EXCLUDED.actor_call_id,
   actor_epoch = EXCLUDED.actor_epoch,
+  actor_command_seq = EXCLUDED.actor_command_seq,
   task_lease_epoch = EXCLUDED.task_lease_epoch,
   llm_model_name = EXCLUDED.llm_model_name,
   llm_model_version = EXCLUDED.llm_model_version,
@@ -306,6 +307,7 @@ INSERT INTO task_instances (
 		nullString(task.ActorID),
 		nullString(task.ActorCallID),
 		task.ActorEpoch,
+		task.ActorCommandSeq,
 		task.TaskLeaseEpoch,
 		nullString(task.LLMModelName),
 		nullString(task.LLMModelVersion),

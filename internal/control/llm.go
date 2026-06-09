@@ -12,15 +12,19 @@ import (
 )
 
 type llmEventPayload struct {
-	TaskID         string `json:"task_id,omitempty"`
-	ModelName      string `json:"model_name,omitempty"`
-	ModelVersion   string `json:"model_version,omitempty"`
-	WorkerID       string `json:"worker_id,omitempty"`
-	CacheHit       bool   `json:"cache_hit,omitempty"`
-	ModelLoadMs    int64  `json:"model_load_ms,omitempty"`
-	FirstTokenMs   int64  `json:"first_token_ms,omitempty"`
-	TotalLatencyMs int64  `json:"total_latency_ms,omitempty"`
-	TimestampMs    int64  `json:"timestamp_ms,omitempty"`
+	TaskID             string `json:"task_id,omitempty"`
+	ModelName          string `json:"model_name,omitempty"`
+	ModelVersion       string `json:"model_version,omitempty"`
+	WorkerID           string `json:"worker_id,omitempty"`
+	CacheHit           bool   `json:"cache_hit,omitempty"`
+	CheckpointFetchMs  int64  `json:"checkpoint_fetch_ms,omitempty"`
+	CacheUsedBytes     int64  `json:"cache_used_bytes,omitempty"`
+	CacheCapacityBytes int64  `json:"cache_capacity_bytes,omitempty"`
+	EvictionCount      int64  `json:"eviction_count,omitempty"`
+	ModelLoadMs        int64  `json:"model_load_ms,omitempty"`
+	FirstTokenMs       int64  `json:"first_token_ms,omitempty"`
+	TotalLatencyMs     int64  `json:"total_latency_ms,omitempty"`
+	TimestampMs        int64  `json:"timestamp_ms,omitempty"`
 }
 
 func (s *Service) RegisterModel(ctx context.Context, req *logservepb.RegisterModelRequest) (*logservepb.RegisterModelResponse, error) {
@@ -138,16 +142,20 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 			payload.TimestampMs = rec.GetTimestampMs()
 		}
 		event := &logservepb.LLMEvent{
-			EventType:      rec.GetEventType(),
-			TimestampMs:    payload.TimestampMs,
-			TaskId:         payload.TaskID,
-			ModelName:      payload.ModelName,
-			ModelVersion:   payload.ModelVersion,
-			WorkerId:       payload.WorkerID,
-			CacheHit:       payload.CacheHit,
-			ModelLoadMs:    payload.ModelLoadMs,
-			FirstTokenMs:   payload.FirstTokenMs,
-			TotalLatencyMs: payload.TotalLatencyMs,
+			EventType:          rec.GetEventType(),
+			TimestampMs:        payload.TimestampMs,
+			TaskId:             payload.TaskID,
+			ModelName:          payload.ModelName,
+			ModelVersion:       payload.ModelVersion,
+			WorkerId:           payload.WorkerID,
+			CacheHit:           payload.CacheHit,
+			CheckpointFetchMs:  payload.CheckpointFetchMs,
+			CacheUsedBytes:     payload.CacheUsedBytes,
+			CacheCapacityBytes: payload.CacheCapacityBytes,
+			EvictionCount:      payload.EvictionCount,
+			ModelLoadMs:        payload.ModelLoadMs,
+			FirstTokenMs:       payload.FirstTokenMs,
+			TotalLatencyMs:     payload.TotalLatencyMs,
 		}
 		out.Events = append(out.Events, event)
 		if payload.ModelName != "" {
@@ -161,10 +169,18 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 		}
 		if rec.GetEventType() == "ModelLoaded" {
 			out.CacheHit = payload.CacheHit
+			out.CheckpointFetchMs = payload.CheckpointFetchMs
+			out.CacheUsedBytes = payload.CacheUsedBytes
+			out.CacheCapacityBytes = payload.CacheCapacityBytes
+			out.EvictionCount = payload.EvictionCount
 			out.ModelLoadMs = payload.ModelLoadMs
 		}
 		if rec.GetEventType() == "LLMCompleted" {
 			out.CacheHit = payload.CacheHit
+			out.CheckpointFetchMs = payload.CheckpointFetchMs
+			out.CacheUsedBytes = payload.CacheUsedBytes
+			out.CacheCapacityBytes = payload.CacheCapacityBytes
+			out.EvictionCount = payload.EvictionCount
 			out.FirstTokenMs = payload.FirstTokenMs
 			out.TotalLatencyMs = payload.TotalLatencyMs
 		}

@@ -12,7 +12,7 @@ Phase 1 focuses on the smallest distributed task execution path:
 Phase 2 adds a multi-step workflow runtime with replay and retry. Phase 3 adds
 stateful Python actors with mailbox serialization, log replay, snapshots, and
 epoch fencing. Phase 4 adds LLM serving with model registry, worker model-cache
-reporting, and locality-aware scheduling.
+reporting, checkpoint-cache mock loading, and locality-aware scheduling.
 
 ## Repository Layout
 
@@ -265,7 +265,7 @@ Actor source of truth is the shared log stream `actor:<actor_id>`. Metadata is a
 materialized current view. Replay applies:
 
 ```text
-ActorCreated -> ActorOwnershipGranted -> ActorCommandApplied -> ActorSnapshotCreated
+ActorCreated -> ActorOwnershipGranted -> ActorCommandSubmitted -> ActorCommandApplied -> ActorSnapshotCreated
 ```
 
 LogServe Phase 3 provides exactly-once-ish actor command application, not strict
@@ -276,6 +276,17 @@ state through an idempotent log key:
 ```text
 actor_id + actor_call_id + applied
 ```
+
+Each actor command is assigned a monotonic `command_seq` when it is submitted.
+The control plane writes `ActorCommandSubmitted` before enqueueing the actor
+task, and accepts completion only when:
+
+```text
+completion.command_seq == actor.command_count + 1
+```
+
+This prevents a later command from being applied ahead of an earlier command in
+the actor stream.
 
 The mailbox is enforced in the control plane with one lock per actor. While this
 single control-plane implementation is running, only one call for a given actor
@@ -331,12 +342,46 @@ Expected output contains:
 mock:model-A:v1
 ```
 
+For a single-node Ubuntu experiment with file-backed mock checkpoints, prepare a
+source checkpoint tree and start a worker with a local cache directory:
+
+```bash
+mkdir -p /tmp/logserve-checkpoints/model-A-v1
+dd if=/dev/zero of=/tmp/logserve-checkpoints/model-A-v1/checkpoint.bin bs=1M count=16
+
+go run ./cmd/logserve-dev \
+  --model-source-dir /tmp/logserve-checkpoints \
+  --model-cache-dir /tmp/logserve-model-cache \
+  --model-cache-capacity-bytes 1073741824
+```
+
+In another shell, run the RAG example through the Python SDK:
+
+```bash
+export PYTHONPATH=$PWD/sdk/python
+export LOGSERVE_SDK_TRANSPORT=grpc
+export LOGSERVE_CONTROL_ADDR=127.0.0.1:50052
+python examples/rag_llm/workflow.py
+```
+
+The mock checkpoint source supports these layouts:
+
+```text
+<source>/<model>-<version>/checkpoint.bin
+<source>/<model>/<version>/checkpoint.bin
+<source>/<model>-<version>.bin
+```
+
 ## Phase 4 Semantics
 
 The model registry records model name, version, size, path, and adapter. Workers
-report local model cache entries during registration and heartbeat. A mock LLM
-adapter simulates cold model load and first-token latency on machines without a
-GPU. The `vllm` adapter calls a vLLM OpenAI-compatible
+report local model cache entries during registration and heartbeat. The mock
+checkpoint cache copies a checkpoint from `--model-source-dir` into
+`--model-cache-dir` on a cold miss, writes a small manifest beside the cached
+checkpoint, scans that manifest on worker restart, and evicts least-recently
+used checkpoints when `--model-cache-capacity-bytes` is exceeded. A mock LLM
+adapter simulates model load and first-token latency on machines without a GPU.
+The `vllm` adapter calls a vLLM OpenAI-compatible
 `/v1/chat/completions` endpoint using `LOGSERVE_VLLM_BASE_URL` or
 `--vllm-base-url`.
 
@@ -358,9 +403,9 @@ LLM event stream `llm:<task_id>`:
 ModelLoadStarted -> ModelLoaded -> LLMCompleted
 ```
 
-`ReplayLLM` reconstructs model name/version, worker id, cache hit, model load
-time, first-token latency, total latency, and the raw event sequence from that
-stream.
+`ReplayLLM` reconstructs model name/version, worker id, cache hit, checkpoint
+fetch time, cache bytes used/capacity, eviction count, model load time,
+first-token latency, total latency, and the raw event sequence from that stream.
 
 Covered Phase 4 checks:
 
@@ -371,6 +416,8 @@ Covered Phase 4 checks:
 - locality-aware experiment has higher cache hit rate and lower cold-start,
   p95, and p99 latency than resource-only
 - mock LLM event replay includes model load and completion metrics
+- file-backed checkpoint cache fetches on the first request, hits on the second
+  request, and reports persisted cache entries after worker restart
 - a RAG workflow can use `llm_generate()` as a real workflow step
 
 ## Phase 5 Analysis And Hardening

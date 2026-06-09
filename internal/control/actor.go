@@ -112,6 +112,7 @@ func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorReques
 	if idem == "" {
 		idem = callID
 	}
+	commandSeq := state.CommandCount + 1
 	spec := &logservepb.TaskSpec{
 		TaskId:            callID,
 		TaskName:          "actor:" + req.GetMethodName(),
@@ -128,9 +129,43 @@ func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorReques
 		ActorInitArgsJson: append([]byte(nil), state.InitArgsJSON...),
 		ActorEpoch:        state.Epoch,
 	}
-	task, _, err := s.enqueueTask(ctx, spec)
+	fingerprint, err := taskSpecFingerprint(spec)
 	if err != nil {
 		return nil, err
+	}
+	var task metadata.Task
+	if existing, ok := s.meta.GetTaskByIdempotencyKey(idem); ok {
+		if err := ensureIdempotencyFingerprint("task", idem, existing.IdempotencyFingerprint, fingerprint); err != nil {
+			return nil, err
+		}
+		task = existing
+	} else {
+		now := actor.NowMs()
+		payload, _ := json.Marshal(actor.EventPayload{
+			ActorID:     state.ActorID,
+			CallID:      callID,
+			CommandSeq:  commandSeq,
+			MethodName:  req.GetMethodName(),
+			ArgsJSON:    argsJSON,
+			WorkerID:    state.OwnerWorkerID,
+			Epoch:       state.Epoch,
+			TimestampMs: now,
+		})
+		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+			StreamId:       actorStream(state.ActorID),
+			EventType:      "ActorCommandSubmitted",
+			IdempotencyKey: state.ActorID + ":" + callID + ":submitted",
+			Payload:        payload,
+		}); err != nil {
+			return nil, err
+		}
+		created, _, err := s.enqueueTaskWithMetadata(ctx, spec, func(task *metadata.Task) {
+			task.ActorCommandSeq = commandSeq
+		})
+		if err != nil {
+			return nil, err
+		}
+		task = created
 	}
 
 	remaining := time.Until(deadlineAt)
@@ -274,17 +309,26 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 	if req.GetStatus() == logservepb.TaskStatus_TASK_STATUS_FAILED {
 		return nil
 	}
+	commandSeq := task.ActorCommandSeq
+	if commandSeq == 0 {
+		commandSeq = state.CommandCount + 1
+	}
+	if commandSeq != state.CommandCount+1 {
+		return fmt.Errorf("out-of-order actor command rejected: actor=%s call_id=%s command_seq=%d expected=%d",
+			task.ActorID, task.ActorCallID, commandSeq, state.CommandCount+1)
+	}
 	spec := s.specForTask(task.TaskID)
 	if spec == nil {
 		return errors.New("actor task spec not found")
 	}
 
 	stateJSON := actor.NormalizeJSON(req.GetActorStateJson())
-	commandCount := state.CommandCount + 1
+	commandCount := commandSeq
 	now := actor.NowMs()
 	payload, _ := json.Marshal(actor.EventPayload{
 		ActorID:      task.ActorID,
 		CallID:       task.ActorCallID,
+		CommandSeq:   commandSeq,
 		MethodName:   spec.GetActorMethod(),
 		ArgsJSON:     spec.GetArgsJson(),
 		ResultJSON:   req.GetResultJson(),

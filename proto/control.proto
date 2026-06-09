@@ -315,6 +315,10 @@ message LLMEvent {
   int64 model_load_ms = 8;
   int64 first_token_ms = 9;
   int64 total_latency_ms = 10;
+  int64 checkpoint_fetch_ms = 11;
+  int64 cache_used_bytes = 12;
+  int64 cache_capacity_bytes = 13;
+  int64 eviction_count = 14;
 }
 
 message ReplayLLMRequest {
@@ -331,6 +335,10 @@ message ReplayLLMResponse {
   int64 first_token_ms = 7;
   int64 total_latency_ms = 8;
   repeated LLMEvent events = 9;
+  int64 checkpoint_fetch_ms = 10;
+  int64 cache_used_bytes = 11;
+  int64 cache_capacity_bytes = 12;
+  int64 eviction_count = 13;
 }
 
 message SetBackpressureRequest {

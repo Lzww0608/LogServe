@@ -23,6 +23,7 @@ type Task struct {
 	ActorID                string
 	ActorCallID            string
 	ActorEpoch             uint64
+	ActorCommandSeq        uint64
 	TaskLeaseEpoch         uint64
 	LLMModelName           string
 	LLMModelVersion        string

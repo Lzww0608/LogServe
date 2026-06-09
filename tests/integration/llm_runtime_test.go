@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -156,6 +157,72 @@ func TestLLMReplayRecordsModelLoadAndCompletion(t *testing.T) {
 	}
 	if got := llmEventTypes(replayed.GetEvents()); strings.Join(got, ",") != "ModelLoadStarted,ModelLoaded,LLMCompleted" {
 		t.Fatalf("llm events = %v", got)
+	}
+}
+
+func TestLLMCheckpointCacheFetchThenHit(t *testing.T) {
+	env := startWorkflowEnv(t)
+	defer env.stop()
+	registerTestModels(t, env.controlClient)
+	setPolicy(t, env.controlClient, logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE)
+
+	sourceDir := t.TempDir()
+	cacheDir := t.TempDir()
+	writeLLMCheckpoint(t, sourceDir, "model-A", "v1", []byte(strings.Repeat("checkpoint", 256)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runWorkerForTestWithConfig(ctx, t, env, worker.Config{
+		WorkerID:                 "checkpoint-worker",
+		MaxTasks:                 2,
+		ModelCheckpointSourceDir: sourceDir,
+		ModelCacheDir:            cacheDir,
+		ModelCacheCapacityBytes:  1 << 20,
+	})
+
+	first := submitLLMForTest(t, env.controlClient, "model-A", "first")
+	waitTask(t, env.controlClient, first.GetTaskId(), logservepb.TaskStatus_TASK_STATUS_SUCCEEDED)
+	second := submitLLMForTest(t, env.controlClient, "model-A", "second")
+	waitTask(t, env.controlClient, second.GetTaskId(), logservepb.TaskStatus_TASK_STATUS_SUCCEEDED)
+
+	firstLoad := llmEventPayloadForTest(t, env.logClient, first.GetTaskId(), "ModelLoaded")
+	if firstLoad.CacheHit {
+		t.Fatal("first checkpoint request should be a cache miss")
+	}
+	if firstLoad.CheckpointFetchMs <= 0 || firstLoad.ModelLoadMs <= 0 {
+		t.Fatalf("first checkpoint metrics missing: fetch=%d load=%d", firstLoad.CheckpointFetchMs, firstLoad.ModelLoadMs)
+	}
+
+	secondLoad := llmEventPayloadForTest(t, env.logClient, second.GetTaskId(), "ModelLoaded")
+	if !secondLoad.CacheHit {
+		t.Fatal("second checkpoint request should be a cache hit")
+	}
+	if secondLoad.CheckpointFetchMs != 0 {
+		t.Fatalf("cache hit checkpoint_fetch_ms = %d, want 0", secondLoad.CheckpointFetchMs)
+	}
+	if secondLoad.ModelLoadMs <= 0 {
+		t.Fatalf("cache hit model_load_ms = %d, want > 0", secondLoad.ModelLoadMs)
+	}
+
+	firstReplayed, err := env.controlClient.ReplayLLM(context.Background(), &logservepb.ReplayLLMRequest{TaskId: first.GetTaskId()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstReplayed.GetCheckpointFetchMs() <= 0 || firstReplayed.GetCacheUsedBytes() <= 0 || firstReplayed.GetCacheCapacityBytes() <= 0 {
+		t.Fatalf("ReplayLLM first checkpoint metrics missing: fetch=%d used=%d capacity=%d",
+			firstReplayed.GetCheckpointFetchMs(), firstReplayed.GetCacheUsedBytes(), firstReplayed.GetCacheCapacityBytes())
+	}
+
+	replayed, err := env.controlClient.ReplayLLM(context.Background(), &logservepb.ReplayLLMRequest{TaskId: second.GetTaskId()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayed.GetCacheHit() {
+		t.Fatal("ReplayLLM should reconstruct second request as cache hit")
+	}
+	if replayed.GetCheckpointFetchMs() != 0 || replayed.GetCacheUsedBytes() <= 0 || replayed.GetCacheCapacityBytes() <= 0 {
+		t.Fatalf("ReplayLLM cache-hit metrics = fetch:%d used:%d capacity:%d",
+			replayed.GetCheckpointFetchMs(), replayed.GetCacheUsedBytes(), replayed.GetCacheCapacityBytes())
 	}
 }
 
@@ -354,6 +421,74 @@ func runWorkerForTestWithModels(ctx context.Context, t *testing.T, env *workflow
 	if err != nil && err != context.Canceled {
 		t.Errorf("worker %s stopped: %v", workerID, err)
 	}
+}
+
+func runWorkerForTestWithConfig(ctx context.Context, t *testing.T, env *workflowTestEnv, cfg worker.Config) {
+	t.Helper()
+	if cfg.WorkerID == "" {
+		cfg.WorkerID = "worker"
+	}
+	cfg.ControlAddr = env.controlServer.Addr()
+	cfg.LogAddr = env.logServer.Addr()
+	cfg.PythonPath = "python"
+	cfg.ExecutorPath = filepath.Join(env.root, "executor", "python", "server.py")
+	if cfg.PollInterval == 0 {
+		cfg.PollInterval = 20 * time.Millisecond
+	}
+	err := worker.Run(ctx, cfg)
+	if err != nil && err != context.Canceled {
+		t.Errorf("worker %s stopped: %v", cfg.WorkerID, err)
+	}
+}
+
+func writeLLMCheckpoint(t *testing.T, root, name, version string, data []byte) {
+	t.Helper()
+	dir := filepath.Join(root, name+"-"+version)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "checkpoint.bin"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func llmEventPayloadForTest(t *testing.T, client logservepb.LogServiceClient, taskID, eventType string) struct {
+	CacheHit          bool  `json:"cache_hit"`
+	ModelLoadMs       int64 `json:"model_load_ms"`
+	CheckpointFetchMs int64 `json:"checkpoint_fetch_ms"`
+	EvictionCount     int64 `json:"eviction_count"`
+} {
+	t.Helper()
+	records, err := client.ReadLog(context.Background(), &logservepb.ReadLogRequest{
+		StreamId: "llm:" + taskID,
+		FromSeq:  1,
+		Limit:    100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range records.GetRecords() {
+		if rec.GetEventType() != eventType {
+			continue
+		}
+		var payload struct {
+			CacheHit          bool  `json:"cache_hit"`
+			ModelLoadMs       int64 `json:"model_load_ms"`
+			CheckpointFetchMs int64 `json:"checkpoint_fetch_ms"`
+			EvictionCount     int64 `json:"eviction_count"`
+		}
+		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+	t.Fatalf("event %s not found for task %s", eventType, taskID)
+	return struct {
+		CacheHit          bool  `json:"cache_hit"`
+		ModelLoadMs       int64 `json:"model_load_ms"`
+		CheckpointFetchMs int64 `json:"checkpoint_fetch_ms"`
+		EvictionCount     int64 `json:"eviction_count"`
+	}{}
 }
 
 func llmEventTypes(events []*logservepb.LLMEvent) []string {

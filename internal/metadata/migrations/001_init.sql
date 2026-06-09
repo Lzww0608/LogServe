@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS task_instances (
   actor_id TEXT,
   actor_call_id TEXT,
   actor_epoch BIGINT NOT NULL DEFAULT 0,
+  actor_command_seq BIGINT NOT NULL DEFAULT 0,
   task_lease_epoch BIGINT NOT NULL DEFAULT 0,
   llm_model_name TEXT,
   llm_model_version TEXT,
@@ -91,6 +92,7 @@ CREATE TABLE IF NOT EXISTS actor_commands (
   method_name TEXT NOT NULL,
   worker_id TEXT NOT NULL,
   epoch BIGINT NOT NULL,
+  command_seq BIGINT NOT NULL DEFAULT 0,
   args_json JSONB,
   result_json JSONB,
   state_json JSONB,
@@ -148,6 +150,7 @@ ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS target_worker_id TEXT;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS actor_id TEXT;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS actor_call_id TEXT;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS actor_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS actor_command_seq BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS task_lease_epoch BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS llm_model_name TEXT;
 ALTER TABLE task_instances ADD COLUMN IF NOT EXISTS llm_model_version TEXT;

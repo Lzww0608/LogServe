@@ -81,6 +81,10 @@ func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 	if got := countWorkflowEvent(records.GetRecords(), "ActorCommandApplied"); got != 101 {
 		t.Fatalf("ActorCommandApplied events = %d, want 101", got)
 	}
+	if got := countWorkflowEvent(records.GetRecords(), "ActorCommandSubmitted"); got != 101 {
+		t.Fatalf("ActorCommandSubmitted events = %d, want 101", got)
+	}
+	assertActorCommandSubmittedBeforeApplied(t, records.GetRecords())
 	if got := countWorkflowEvent(records.GetRecords(), "ActorSnapshotCreated"); got == 0 {
 		t.Fatal("ActorSnapshotCreated event missing")
 	}
@@ -186,4 +190,39 @@ class Counter:
     def get(self):
         return self.value
 `
+}
+
+func assertActorCommandSubmittedBeforeApplied(t *testing.T, records []*logservepb.LogRecord) {
+	t.Helper()
+	submittedAt := map[uint64]int{}
+	for i, rec := range records {
+		if rec.GetEventType() != "ActorCommandSubmitted" && rec.GetEventType() != "ActorCommandApplied" {
+			continue
+		}
+		var payload struct {
+			CommandSeq uint64 `json:"command_seq"`
+			CallID     string `json:"call_id"`
+		}
+		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.CommandSeq == 0 {
+			t.Fatalf("%s missing command_seq in payload %s", rec.GetEventType(), string(rec.GetPayload()))
+		}
+		switch rec.GetEventType() {
+		case "ActorCommandSubmitted":
+			if _, exists := submittedAt[payload.CommandSeq]; exists {
+				t.Fatalf("duplicate ActorCommandSubmitted for command_seq=%d", payload.CommandSeq)
+			}
+			submittedAt[payload.CommandSeq] = i
+		case "ActorCommandApplied":
+			submittedIndex, exists := submittedAt[payload.CommandSeq]
+			if !exists {
+				t.Fatalf("ActorCommandApplied command_seq=%d has no submitted event", payload.CommandSeq)
+			}
+			if submittedIndex > i {
+				t.Fatalf("ActorCommandApplied command_seq=%d appears before submitted", payload.CommandSeq)
+			}
+		}
+	}
 }

@@ -27,6 +27,9 @@ func main() {
 	models := flag.String("models", "", "comma-separated cached models, for example model-A:v1")
 	capacity := flag.Uint("capacity", 1, "worker task capacity")
 	vllmBaseURL := flag.String("vllm-base-url", "", "vLLM OpenAI-compatible base URL")
+	modelSourceDir := flag.String("model-source-dir", "", "source directory for mock model checkpoints")
+	modelCacheDir := flag.String("model-cache-dir", "", "local directory used as the mock model checkpoint cache")
+	modelCacheCapacityBytes := flag.Int64("model-cache-capacity-bytes", 0, "optional local model cache capacity in bytes; 0 means unlimited")
 	flag.Parse()
 
 	logServer, err := logd.Start(*logAddr, *dataDir)
@@ -44,15 +47,18 @@ func main() {
 	defer stop()
 	go func() {
 		err := worker.Run(ctx, worker.Config{
-			WorkerID:     *workerID,
-			ControlAddr:  controlServer.Addr(),
-			LogAddr:      logServer.Addr(),
-			PythonPath:   *pythonPath,
-			ExecutorPath: *executorPath,
-			PollInterval: 100 * time.Millisecond,
-			CachedModels: splitCSV(*models),
-			Capacity:     uint32(*capacity),
-			VLLMBaseURL:  *vllmBaseURL,
+			WorkerID:                 *workerID,
+			ControlAddr:              controlServer.Addr(),
+			LogAddr:                  logServer.Addr(),
+			PythonPath:               *pythonPath,
+			ExecutorPath:             *executorPath,
+			PollInterval:             100 * time.Millisecond,
+			CachedModels:             splitCSV(*models),
+			Capacity:                 uint32(*capacity),
+			VLLMBaseURL:              *vllmBaseURL,
+			ModelCheckpointSourceDir: *modelSourceDir,
+			ModelCacheDir:            *modelCacheDir,
+			ModelCacheCapacityBytes:  *modelCacheCapacityBytes,
 		})
 		if err != nil && err != context.Canceled {
 			observability.Error("dev_worker_stopped", err, map[string]any{"worker_id": *workerID})

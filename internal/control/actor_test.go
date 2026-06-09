@@ -47,3 +47,43 @@ func TestActorEpochFencingRejectsStaleCompletion(t *testing.T) {
 		t.Fatalf("stale completion mutated actor: command_count=%d state=%s", current.CommandCount, current.StateJSON)
 	}
 }
+
+func TestActorCommandSeqRejectsOutOfOrderCompletion(t *testing.T) {
+	meta := metadata.NewMemoryStore()
+	state := actor.NewState("actor-seq", "Counter", "class Counter: pass", []byte(`{"args":[],"kwargs":{}}`), 10, actor.NowMs())
+	state.OwnerWorkerID = "worker-1"
+	state.Epoch = 1
+	state.CommandCount = 1
+	if _, duplicate := meta.CreateActor(state, ""); duplicate {
+		t.Fatal("unexpected duplicate actor")
+	}
+	service := &Service{meta: meta}
+
+	err := service.completeActorCall(context.Background(), metadata.Task{
+		TaskID:          "actor-call-out-of-order",
+		ActorID:         "actor-seq",
+		ActorCallID:     "actor-call-out-of-order",
+		ActorEpoch:      1,
+		ActorCommandSeq: 3,
+	}, &logservepb.CompleteTaskRequest{
+		TaskId:         "actor-call-out-of-order",
+		WorkerId:       "worker-1",
+		Status:         logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
+		ResultJson:     []byte(`3`),
+		ActorStateJson: []byte(`{"value":3}`),
+		ActorEpoch:     1,
+	})
+	if err == nil {
+		t.Fatal("expected out-of-order actor command completion to be rejected")
+	}
+	if !strings.Contains(err.Error(), "out-of-order actor command rejected") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	current, ok := meta.GetActor("actor-seq")
+	if !ok {
+		t.Fatal("actor missing")
+	}
+	if current.CommandCount != 1 || len(current.StateJSON) != 0 {
+		t.Fatalf("out-of-order completion mutated actor: command_count=%d state=%s", current.CommandCount, current.StateJSON)
+	}
+}

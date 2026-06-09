@@ -23,7 +23,6 @@ func taskSpecFingerprint(spec *logservepb.TaskSpec) (string, error) {
 		"args_json":          args,
 		"workflow_id":        spec.GetWorkflowId(),
 		"step_id":            spec.GetStepId(),
-		"target_worker_id":   spec.GetTargetWorkerId(),
 		"actor_id":           spec.GetActorId(),
 		"actor_class_name":   spec.GetActorClassName(),
 		"actor_class_source": spec.GetActorClassSource(),

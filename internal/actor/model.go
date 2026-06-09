@@ -36,6 +36,7 @@ type EventPayload struct {
 	WorkerID               string          `json:"worker_id,omitempty"`
 	Epoch                  uint64          `json:"epoch,omitempty"`
 	CallID                 string          `json:"call_id,omitempty"`
+	CommandSeq             uint64          `json:"command_seq,omitempty"`
 	MethodName             string          `json:"method_name,omitempty"`
 	ArgsJSON               json.RawMessage `json:"args_json,omitempty"`
 	ResultJSON             json.RawMessage `json:"result_json,omitempty"`
@@ -162,7 +163,11 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			if useSnapshot && payload.CommandCount <= snapshotCommandCount {
 				continue
 			}
-			state.CommandCount = payload.CommandCount
+			if payload.CommandSeq > 0 {
+				state.CommandCount = payload.CommandSeq
+			} else {
+				state.CommandCount = payload.CommandCount
+			}
 			state.StateJSON = NormalizeJSON(payload.StateJSON)
 			state.UpdatedAtMs = payload.TimestampMs
 			commands++

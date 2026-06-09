@@ -366,6 +366,10 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 }
 
 func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (metadata.Task, bool, error) {
+	return s.enqueueTaskWithMetadata(ctx, spec, nil)
+}
+
+func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.TaskSpec, mutate func(*metadata.Task)) (metadata.Task, bool, error) {
 	if spec.GetTaskId() == "" {
 		spec.TaskId = newTaskID()
 	}
@@ -408,7 +412,7 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 		return metadata.Task{}, false, err
 	}
 
-	task, duplicate := s.meta.CreateTask(metadata.Task{
+	taskRecord := metadata.Task{
 		TaskID:                 spec.GetTaskId(),
 		TaskName:               spec.GetTaskName(),
 		Status:                 logservepb.TaskStatus_TASK_STATUS_QUEUED,
@@ -422,7 +426,11 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 		LLMModelName:           spec.GetLlmModelName(),
 		LLMModelVersion:        spec.GetLlmModelVersion(),
 		IdempotencyFingerprint: fingerprint,
-	}, spec.GetIdempotencyKey())
+	}
+	if mutate != nil {
+		mutate(&taskRecord)
+	}
+	task, duplicate := s.meta.CreateTask(taskRecord, spec.GetIdempotencyKey())
 	if duplicate {
 		if err := ensureIdempotencyFingerprint("task", spec.GetIdempotencyKey(), task.IdempotencyFingerprint, fingerprint); err != nil {
 			return metadata.Task{}, false, err

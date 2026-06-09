@@ -23,18 +23,21 @@ import (
 )
 
 type Config struct {
-	WorkerID       string
-	ControlAddr    string
-	LogAddr        string
-	PythonPath     string
-	ExecutorPath   string
-	PollInterval   time.Duration
-	MaxTasks       int
-	CachedModels   []string
-	Capacity       uint32
-	MockModelLoad  time.Duration
-	MockFirstToken time.Duration
-	VLLMBaseURL    string
+	WorkerID                 string
+	ControlAddr              string
+	LogAddr                  string
+	PythonPath               string
+	ExecutorPath             string
+	PollInterval             time.Duration
+	MaxTasks                 int
+	CachedModels             []string
+	Capacity                 uint32
+	MockModelLoad            time.Duration
+	MockFirstToken           time.Duration
+	VLLMBaseURL              string
+	ModelCheckpointSourceDir string
+	ModelCacheDir            string
+	ModelCacheCapacityBytes  int64
 }
 
 type executorRequest struct {
@@ -66,15 +69,19 @@ type llmArgsPayload struct {
 }
 
 type llmEventPayload struct {
-	TaskID         string `json:"task_id,omitempty"`
-	ModelName      string `json:"model_name,omitempty"`
-	ModelVersion   string `json:"model_version,omitempty"`
-	WorkerID       string `json:"worker_id,omitempty"`
-	CacheHit       bool   `json:"cache_hit,omitempty"`
-	ModelLoadMs    int64  `json:"model_load_ms,omitempty"`
-	FirstTokenMs   int64  `json:"first_token_ms,omitempty"`
-	TotalLatencyMs int64  `json:"total_latency_ms,omitempty"`
-	TimestampMs    int64  `json:"timestamp_ms,omitempty"`
+	TaskID             string `json:"task_id,omitempty"`
+	ModelName          string `json:"model_name,omitempty"`
+	ModelVersion       string `json:"model_version,omitempty"`
+	WorkerID           string `json:"worker_id,omitempty"`
+	CacheHit           bool   `json:"cache_hit,omitempty"`
+	CheckpointFetchMs  int64  `json:"checkpoint_fetch_ms,omitempty"`
+	CacheUsedBytes     int64  `json:"cache_used_bytes,omitempty"`
+	CacheCapacityBytes int64  `json:"cache_capacity_bytes,omitempty"`
+	EvictionCount      int64  `json:"eviction_count,omitempty"`
+	ModelLoadMs        int64  `json:"model_load_ms,omitempty"`
+	FirstTokenMs       int64  `json:"first_token_ms,omitempty"`
+	TotalLatencyMs     int64  `json:"total_latency_ms,omitempty"`
+	TimestampMs        int64  `json:"timestamp_ms,omitempty"`
 }
 
 type pythonRunner struct {
@@ -109,8 +116,36 @@ func (b *lockedBuffer) String() string {
 }
 
 type modelCache struct {
-	mu     sync.RWMutex
-	models map[string]bool
+	mu            sync.RWMutex
+	models        map[string]bool
+	checkpoints   map[string]modelCacheEntry
+	sourceDir     string
+	cacheDir      string
+	capacityBytes int64
+	usedBytes     int64
+}
+
+type modelCacheEntry struct {
+	path       string
+	size       int64
+	lastAccess time.Time
+}
+
+type modelCacheManifest struct {
+	Name           string `json:"name"`
+	Version        string `json:"version"`
+	CheckpointFile string `json:"checkpoint_file"`
+	SizeBytes      int64  `json:"size_bytes"`
+	LastAccessMs   int64  `json:"last_access_ms"`
+}
+
+type checkpointLoadResult struct {
+	CacheHit           bool
+	CheckpointFetchMs  int64
+	ModelLoadMs        int64
+	CacheUsedBytes     int64
+	CacheCapacityBytes int64
+	EvictionCount      int64
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -152,7 +187,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	controlClient := logservepb.NewControlServiceClient(controlConn)
 	logClient := logservepb.NewLogServiceClient(logConn)
-	cache := newModelCache(cfg.CachedModels)
+	cache := newModelCache(cfg)
 
 	if _, err := controlClient.RegisterWorker(ctx, &logservepb.RegisterWorkerRequest{
 		WorkerId:     cfg.WorkerID,
@@ -317,26 +352,45 @@ func runLLMExecutor(ctx context.Context, cfg Config, cache *modelCache, controlC
 	}
 
 	loadStart := time.Now()
-	if !cacheHit && adapter == "mock" {
+	checkpoint := checkpointLoadResult{
+		CacheHit:           cacheHit,
+		CacheUsedBytes:     cache.used(),
+		CacheCapacityBytes: cache.capacity(),
+	}
+	if cache.usesCheckpointStore() {
+		checkpoint, err = cache.ensureCheckpoint(ctx, modelName, version)
+		if err != nil {
+			return nil, err
+		}
+		cacheHit = checkpoint.CacheHit
+	} else if !cacheHit && adapter == "mock" {
 		if err := sleepContext(ctx, cfg.MockModelLoad); err != nil {
 			return nil, err
 		}
 	}
-	loadMs := int64(0)
+	loadMs := checkpoint.ModelLoadMs
 	if !cacheHit {
-		loadMs = time.Since(loadStart).Milliseconds()
+		if loadMs == 0 {
+			loadMs = time.Since(loadStart).Milliseconds()
+		}
 		if loadMs == 0 {
 			loadMs = 1
 		}
-		cache.add(modelName, version)
+		if !cache.usesCheckpointStore() {
+			cache.add(modelName, version)
+		}
 		_, _ = controlClient.Heartbeat(ctx, &logservepb.HeartbeatRequest{
 			WorkerId:     cfg.WorkerID,
 			CachedModels: cache.entries(),
 		})
 	}
 	if err := appendLLMEvent(ctx, logClient, task, cfg.WorkerID, "ModelLoaded", llmEventPayload{
-		CacheHit:    cacheHit,
-		ModelLoadMs: loadMs,
+		CacheHit:           cacheHit,
+		CheckpointFetchMs:  checkpoint.CheckpointFetchMs,
+		CacheUsedBytes:     checkpoint.CacheUsedBytes,
+		CacheCapacityBytes: checkpoint.CacheCapacityBytes,
+		EvictionCount:      checkpoint.EvictionCount,
+		ModelLoadMs:        loadMs,
 	}); err != nil {
 		return nil, err
 	}
@@ -363,10 +417,14 @@ func runLLMExecutor(ctx context.Context, cfg Config, cache *modelCache, controlC
 		totalMs = 1
 	}
 	if err := appendLLMEvent(ctx, logClient, task, cfg.WorkerID, "LLMCompleted", llmEventPayload{
-		CacheHit:       cacheHit,
-		ModelLoadMs:    loadMs,
-		FirstTokenMs:   firstTokenMs,
-		TotalLatencyMs: totalMs,
+		CacheHit:           cacheHit,
+		CheckpointFetchMs:  checkpoint.CheckpointFetchMs,
+		CacheUsedBytes:     checkpoint.CacheUsedBytes,
+		CacheCapacityBytes: checkpoint.CacheCapacityBytes,
+		EvictionCount:      checkpoint.EvictionCount,
+		ModelLoadMs:        loadMs,
+		FirstTokenMs:       firstTokenMs,
+		TotalLatencyMs:     totalMs,
 	}); err != nil {
 		return nil, err
 	}
@@ -537,9 +595,19 @@ func taskStream(taskID string) string {
 	return "task:" + taskID
 }
 
-func newModelCache(models []string) *modelCache {
-	cache := &modelCache{models: map[string]bool{}}
-	for _, model := range models {
+func newModelCache(cfg Config) *modelCache {
+	cache := &modelCache{
+		models:        map[string]bool{},
+		checkpoints:   map[string]modelCacheEntry{},
+		sourceDir:     cfg.ModelCheckpointSourceDir,
+		cacheDir:      cfg.ModelCacheDir,
+		capacityBytes: cfg.ModelCacheCapacityBytes,
+	}
+	if cache.cacheDir != "" {
+		_ = os.MkdirAll(cache.cacheDir, 0o755)
+		cache.loadCheckpointManifests()
+	}
+	for _, model := range cfg.CachedModels {
 		name, version := splitModelKey(model)
 		if name == "" {
 			continue
@@ -550,9 +618,16 @@ func newModelCache(models []string) *modelCache {
 }
 
 func (c *modelCache) has(name, version string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.models[modelKey(name, version)]
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := modelKey(name, version)
+	if c.models[key] {
+		return true
+	}
+	if c.cacheDir == "" {
+		return false
+	}
+	return c.indexCheckpointLocked(name, version, time.Now())
 }
 
 func (c *modelCache) add(name, version string) {
@@ -572,6 +647,348 @@ func (c *modelCache) entries() []*logservepb.ModelCacheEntry {
 	return entries
 }
 
+func (c *modelCache) loadCheckpointManifests() {
+	manifestPaths, err := filepath.Glob(filepath.Join(c.cacheDir, "*.manifest.json"))
+	if err != nil {
+		return
+	}
+	for _, manifestPath := range manifestPaths {
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			continue
+		}
+		var manifest modelCacheManifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			continue
+		}
+		name, version := manifest.Name, firstNonEmpty(manifest.Version, "v1")
+		if name == "" {
+			continue
+		}
+		checkpointFile := filepath.Base(manifest.CheckpointFile)
+		if checkpointFile == "." || checkpointFile == string(filepath.Separator) || checkpointFile == "" {
+			continue
+		}
+		checkpointPath := filepath.Join(c.cacheDir, checkpointFile)
+		info, err := os.Stat(checkpointPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		lastAccess := time.UnixMilli(manifest.LastAccessMs)
+		if manifest.LastAccessMs == 0 {
+			lastAccess = info.ModTime()
+		}
+		key := modelKey(name, version)
+		c.checkpoints[key] = modelCacheEntry{
+			path:       checkpointPath,
+			size:       info.Size(),
+			lastAccess: lastAccess,
+		}
+		c.models[key] = true
+	}
+	c.recalculateUsedLocked()
+}
+
+func (c *modelCache) usesCheckpointStore() bool {
+	return c.sourceDir != "" && c.cacheDir != ""
+}
+
+func (c *modelCache) capacity() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.capacityBytes
+}
+
+func (c *modelCache) used() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.usedBytes
+}
+
+func (c *modelCache) ensureCheckpoint(ctx context.Context, name, version string) (checkpointLoadResult, error) {
+	if !c.usesCheckpointStore() {
+		return checkpointLoadResult{}, errors.New("checkpoint cache is not configured")
+	}
+	key := modelKey(name, version)
+	now := time.Now()
+
+	c.mu.Lock()
+	if c.indexCheckpointLocked(name, version, now) {
+		entry := c.checkpoints[key]
+		c.mu.Unlock()
+		loadMs, err := readCheckpoint(ctx, entry.path)
+		if err != nil {
+			return checkpointLoadResult{}, err
+		}
+		return checkpointLoadResult{
+			CacheHit:           true,
+			ModelLoadMs:        loadMs,
+			CacheUsedBytes:     c.used(),
+			CacheCapacityBytes: c.capacity(),
+		}, nil
+	}
+	c.mu.Unlock()
+
+	sourcePath, err := c.sourcePath(name, version)
+	if err != nil {
+		return checkpointLoadResult{}, err
+	}
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return checkpointLoadResult{}, err
+	}
+	size := info.Size()
+	if c.capacityBytes > 0 && size > c.capacityBytes {
+		return checkpointLoadResult{}, fmt.Errorf("checkpoint %s:%s size %d exceeds cache capacity %d", name, version, size, c.capacityBytes)
+	}
+
+	c.mu.Lock()
+	evictions, err := c.evictForLocked(size)
+	c.mu.Unlock()
+	if err != nil {
+		return checkpointLoadResult{}, err
+	}
+
+	targetPath := c.checkpointPath(name, version)
+	fetchMs, err := copyCheckpoint(ctx, sourcePath, targetPath)
+	if err != nil {
+		return checkpointLoadResult{}, err
+	}
+	loadMs, err := readCheckpoint(ctx, targetPath)
+	if err != nil {
+		return checkpointLoadResult{}, err
+	}
+	lastAccess := time.Now()
+	if err := writeCheckpointManifest(targetPath, name, version, size, lastAccess); err != nil {
+		return checkpointLoadResult{}, err
+	}
+
+	c.mu.Lock()
+	c.checkpoints[key] = modelCacheEntry{path: targetPath, size: size, lastAccess: lastAccess}
+	c.models[key] = true
+	c.recalculateUsedLocked()
+	used := c.usedBytes
+	capacity := c.capacityBytes
+	c.mu.Unlock()
+
+	return checkpointLoadResult{
+		CacheHit:           false,
+		CheckpointFetchMs:  fetchMs,
+		ModelLoadMs:        loadMs,
+		CacheUsedBytes:     used,
+		CacheCapacityBytes: capacity,
+		EvictionCount:      evictions,
+	}, nil
+}
+
+func (c *modelCache) indexCheckpointLocked(name, version string, at time.Time) bool {
+	key := modelKey(name, version)
+	if entry, ok := c.checkpoints[key]; ok {
+		if _, err := os.Stat(entry.path); err == nil {
+			entry.lastAccess = at
+			c.checkpoints[key] = entry
+			c.models[key] = true
+			_ = writeCheckpointManifest(entry.path, name, version, entry.size, at)
+			return true
+		}
+		delete(c.checkpoints, key)
+		delete(c.models, key)
+		c.recalculateUsedLocked()
+	}
+	path := c.checkpointPath(name, version)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	c.checkpoints[key] = modelCacheEntry{path: path, size: info.Size(), lastAccess: at}
+	c.models[key] = true
+	c.recalculateUsedLocked()
+	_ = writeCheckpointManifest(path, name, version, info.Size(), at)
+	return true
+}
+
+func (c *modelCache) evictForLocked(incomingBytes int64) (int64, error) {
+	if c.capacityBytes <= 0 {
+		return 0, nil
+	}
+	var evictions int64
+	for c.usedBytes+incomingBytes > c.capacityBytes && len(c.checkpoints) > 0 {
+		oldestKey := ""
+		var oldest modelCacheEntry
+		for key, entry := range c.checkpoints {
+			if oldestKey == "" || entry.lastAccess.Before(oldest.lastAccess) {
+				oldestKey = key
+				oldest = entry
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		if err := os.Remove(oldest.path); err != nil && !os.IsNotExist(err) {
+			return evictions, err
+		}
+		if err := os.Remove(checkpointManifestPath(oldest.path)); err != nil && !os.IsNotExist(err) {
+			return evictions, err
+		}
+		delete(c.checkpoints, oldestKey)
+		delete(c.models, oldestKey)
+		c.usedBytes -= oldest.size
+		if c.usedBytes < 0 {
+			c.usedBytes = 0
+		}
+		evictions++
+	}
+	return evictions, nil
+}
+
+func (c *modelCache) recalculateUsedLocked() {
+	var used int64
+	for _, entry := range c.checkpoints {
+		used += entry.size
+	}
+	c.usedBytes = used
+}
+
+func (c *modelCache) checkpointPath(name, version string) string {
+	return filepath.Join(c.cacheDir, safeModelFileName(name, version)+".checkpoint")
+}
+
+func checkpointManifestPath(checkpointPath string) string {
+	return checkpointPath + ".manifest.json"
+}
+
+func writeCheckpointManifest(checkpointPath, name, version string, size int64, lastAccess time.Time) error {
+	manifest := modelCacheManifest{
+		Name:           name,
+		Version:        firstNonEmpty(version, "v1"),
+		CheckpointFile: filepath.Base(checkpointPath),
+		SizeBytes:      size,
+		LastAccessMs:   lastAccess.UnixMilli(),
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	manifestPath := checkpointManifestPath(checkpointPath)
+	tmpPath := manifestPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return err
+	}
+	_ = os.Remove(manifestPath)
+	if err := os.Rename(tmpPath, manifestPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func (c *modelCache) sourcePath(name, version string) (string, error) {
+	version = firstNonEmpty(version, "v1")
+	candidates := []string{
+		filepath.Join(c.sourceDir, name+"-"+version, "checkpoint.bin"),
+		filepath.Join(c.sourceDir, name, version, "checkpoint.bin"),
+		filepath.Join(c.sourceDir, name+"-"+version+".bin"),
+		filepath.Join(c.sourceDir, safeModelFileName(name, version)+".bin"),
+	}
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("checkpoint source for %s:%s not found under %s", name, version, c.sourceDir)
+}
+
+func safeModelFileName(name, version string) string {
+	version = firstNonEmpty(version, "v1")
+	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", " ", "_")
+	return replacer.Replace(name) + "-" + replacer.Replace(version)
+}
+
+func copyCheckpoint(ctx context.Context, sourcePath, targetPath string) (int64, error) {
+	start := time.Now()
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return 0, err
+	}
+	tmpPath := targetPath + ".tmp"
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return 0, err
+	}
+	defer source.Close()
+	target, err := os.Create(tmpPath)
+	if err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 64*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			_ = target.Close()
+			_ = os.Remove(tmpPath)
+			return 0, ctx.Err()
+		default:
+		}
+		n, readErr := source.Read(buf)
+		if n > 0 {
+			if _, err := target.Write(buf[:n]); err != nil {
+				_ = target.Close()
+				_ = os.Remove(tmpPath)
+				return 0, err
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			_ = target.Close()
+			_ = os.Remove(tmpPath)
+			return 0, readErr
+		}
+	}
+	if err := target.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, err
+	}
+	return positiveElapsedMs(start), nil
+}
+
+func readCheckpoint(ctx context.Context, path string) (int64, error) {
+	start := time.Now()
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	buf := make([]byte, 64*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+		}
+		_, err := file.Read(buf)
+		if errors.Is(err, io.EOF) {
+			return positiveElapsedMs(start), nil
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+}
+
+func positiveElapsedMs(start time.Time) int64 {
+	elapsed := time.Since(start).Milliseconds()
+	if elapsed == 0 {
+		return 1
+	}
+	return elapsed
+}
+
 func modelKey(name, version string) string {
 	if version == "" {
 		version = "v1"
@@ -588,6 +1005,15 @@ func splitModelKey(value string) (string, string) {
 		return parts[0], "v1"
 	}
 	return parts[0], parts[1]
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func promptFromArgs(data []byte) (string, error) {
