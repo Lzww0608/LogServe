@@ -8,6 +8,8 @@ STATUS_FILE="$RUN_DIR/command_status.jsonl"
 DATA_DIR="${LOGSERVE_EXPERIMENT_DATA_DIR:-"$RUN_DIR/runtime"}"
 LOG_ADDR="${LOGSERVE_EXPERIMENT_LOG_ADDR:-127.0.0.1:59051}"
 CONTROL_ADDR="${LOGSERVE_EXPERIMENT_CONTROL_ADDR:-127.0.0.1:59052}"
+CHECKPOINT_SOURCE_DIR="${LOGSERVE_CHECKPOINT_SOURCE_DIR:-"$DATA_DIR/checkpoints"}"
+CHECKPOINT_CACHE_BYTES="${LOGSERVE_CHECKPOINT_CACHE_BYTES:-16777216}"
 
 mkdir -p "$RUN_DIR" "$DATA_DIR"
 cd "$ROOT" || exit 1
@@ -81,6 +83,18 @@ start_bg() {
   echo "    pid ${PIDS[-1]} log $log"
 }
 
+prepare_checkpoints() {
+  local size_mb="${LOGSERVE_CHECKPOINT_MB:-1}"
+  local model
+  for model in model-A model-B model-C model-D; do
+    local dir="$CHECKPOINT_SOURCE_DIR/${model}-v1"
+    mkdir -p "$dir"
+    if [ ! -f "$dir/checkpoint.bin" ]; then
+      dd if=/dev/zero of="$dir/checkpoint.bin" bs=1M count="$size_mb" status=none
+    fi
+  done
+}
+
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
     if kill -0 "$pid" 2>/dev/null; then
@@ -136,6 +150,7 @@ write_environment() {
 
 start_runtime() {
   mkdir -p "$DATA_DIR/logstore"
+  prepare_checkpoints
   start_bg logd go run ./cmd/logserve-logd --addr "$LOG_ADDR" --data-dir "$DATA_DIR/logstore" --segment-size-bytes 67108864 --fsync-policy always
   if ! wait_tcp 127.0.0.1 "${LOG_ADDR##*:}" 30; then
     record_status runtime_logd_start 1 30 logd.log
@@ -150,9 +165,9 @@ start_runtime() {
   fi
   record_status runtime_control_start 0 0 control.log
 
-  start_bg worker_1 go run ./cmd/logserve-worker --worker-id bench-worker-1 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity 1
-  start_bg worker_2 go run ./cmd/logserve-worker --worker-id bench-worker-2 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity 1
-  start_bg worker_3 go run ./cmd/logserve-worker --worker-id bench-worker-3 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity 1
+  start_bg worker_1 go run ./cmd/logserve-worker --worker-id bench-worker-1 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-1" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  start_bg worker_2 go run ./cmd/logserve-worker --worker-id bench-worker-2 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-2" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  start_bg worker_3 go run ./cmd/logserve-worker --worker-id bench-worker-3 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-3" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
   sleep 4
   record_status runtime_workers_start 0 4 worker_1.log
   return 0
@@ -215,11 +230,13 @@ fi
 if [ "${LOGSERVE_RUN_PHASE5_BENCH:-1}" = "1" ]; then
   if start_runtime; then
     run_json_step phase5_benchmark "$RUN_DIR/phase5_benchmark.json" "$RUN_DIR/phase5_benchmark.stderr.log" python examples/phase5/benchmark.py
+    run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" python examples/phase5/checkpoint_cache.py
     run_json_step dashboard_snapshot "$RUN_DIR/dashboard_snapshot.json" "$RUN_DIR/dashboard_snapshot.stderr.log" go run ./cmd/logservectl dashboard-snapshot --control-addr "$CONTROL_ADDR"
   fi
 fi
 
 run_step summarize_experiment "$RUN_DIR/summarize_experiment.log" python scripts/summarize_experiment.py "$RUN_DIR"
+python scripts/summarize_experiment.py "$RUN_DIR" >> "$RUN_DIR/summarize_experiment.log" 2>&1 || true
 
 echo
 echo "Experiment directory: $RUN_DIR"

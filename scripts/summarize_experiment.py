@@ -8,7 +8,7 @@ def read_json(path):
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError:
         return None
 
@@ -18,7 +18,7 @@ def read_statuses(run_dir):
     if not path.exists():
         return []
     out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -94,19 +94,47 @@ def logstore_highlights(data):
     if not isinstance(data, dict):
         return {}
     if "policies" in data and isinstance(data["policies"], list):
-        return {
-            f"logstore_{item.get('policy', 'unknown')}_append_tps": item.get("append_records_per_sec")
-            for item in data["policies"]
-            if isinstance(item, dict)
-        }
+        out = {}
+        for item in data["policies"]:
+            if not isinstance(item, dict):
+                continue
+            policy = item.get("policy", "unknown")
+            out[f"logstore_{policy}_append_tps"] = item.get("append_records_sec")
+            out[f"logstore_{policy}_read_tps"] = item.get("read_records_sec")
+            out[f"logstore_{policy}_recover_ms"] = item.get("recover_ms")
+            out[f"logstore_{policy}_segments"] = item.get("segment_count")
+        return out
     return data
+
+
+def checkpoint_highlights(data):
+    if not isinstance(data, dict):
+        return {}
+    cold = data.get("cold") or {}
+    warm = data.get("warm") or {}
+    return {
+        "checkpoint_model": data.get("model"),
+        "checkpoint_cold_cache_hit": cold.get("cache_hit"),
+        "checkpoint_warm_cache_hit": warm.get("cache_hit"),
+        "checkpoint_cold_fetch_ms": cold.get("checkpoint_fetch_ms"),
+        "checkpoint_warm_fetch_ms": warm.get("checkpoint_fetch_ms"),
+        "checkpoint_cache_used_bytes": warm.get("cache_used_bytes") or cold.get("cache_used_bytes"),
+        "checkpoint_cache_capacity_bytes": warm.get("cache_capacity_bytes") or cold.get("cache_capacity_bytes"),
+    }
+
+
+def pick_present(data, *keys):
+    for key in keys:
+        if key in data:
+            return data[key]
+    return None
 
 
 def dashboard_highlights(data):
     if not isinstance(data, dict):
         return {}
     return {
-        "dashboard_queue_depth": data.get("queue_depth") or data.get("queueDepth"),
+        "dashboard_queue_depth": pick_present(data, "queue_depth", "queueDepth"),
         "dashboard_tasks": len(data.get("tasks") or []),
         "dashboard_workflows": len(data.get("workflows") or []),
         "dashboard_actors": len(data.get("actors") or []),
@@ -115,9 +143,10 @@ def dashboard_highlights(data):
     }
 
 
-def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard):
+def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard, checkpoint):
     phase5_summary, notes = phase5_highlights(phase5)
     logstore_summary = logstore_highlights(logstore)
+    checkpoint_summary = checkpoint_highlights(checkpoint)
     dashboard_summary = dashboard_highlights(dashboard)
 
     summary = {
@@ -125,6 +154,7 @@ def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard):
         "commands": statuses,
         "phase5": phase5_summary,
         "logstore": logstore_summary,
+        "checkpoint_cache": checkpoint_summary,
         "fault_injection": fault or {},
         "dashboard": dashboard_summary,
         "notes": notes,
@@ -160,6 +190,13 @@ def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard):
         for key, value in logstore_summary.items():
             lines.append(f"- `{key}`: {pct(value)}")
 
+    if checkpoint_summary:
+        lines.append("")
+        lines.append("## Checkpoint Cache Probe")
+        lines.append("")
+        for key, value in checkpoint_summary.items():
+            lines.append(f"- `{key}`: {pct(value)}")
+
     if fault:
         lines.append("")
         lines.append("## Fault Injection")
@@ -188,6 +225,7 @@ def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard):
         "environment.txt",
         "command_status.jsonl",
         "phase5_benchmark.json",
+        "checkpoint_cache_probe.json",
         "logstore_v1_latest.json",
         "fault_injection.json",
         "dashboard_snapshot.json",
@@ -210,7 +248,8 @@ def main():
     logstore = read_json(run_dir / "logstore_v1_latest.json")
     fault = read_json(run_dir / "fault_injection.json")
     dashboard = read_json(run_dir / "dashboard_snapshot.json")
-    write_summary(run_dir, statuses, phase5, logstore, fault, dashboard)
+    checkpoint = read_json(run_dir / "checkpoint_cache_probe.json")
+    write_summary(run_dir, statuses, phase5, logstore, fault, dashboard, checkpoint)
     print(run_dir / "summary.md")
     return 0
 

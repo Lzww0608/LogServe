@@ -458,6 +458,8 @@ The runner creates `reports/experiment-<utc timestamp>/` and writes:
 - `logstore_v1_latest.json`: shared-log fsync policy benchmark
 - `phase5_benchmark.json`: workflow latency, task throughput, actor snapshot
   ablation, LLM cold/warm cache, locality scheduler comparison
+- `checkpoint_cache_probe.json`: file-backed mock checkpoint cache cold/warm
+  fetch metrics
 - `fault_injection.json`: fault/recovery probe status
 - `dashboard_snapshot.json`: final materialized dashboard state
 - `summary.md` and `summary.json`: compact report for later writeup
