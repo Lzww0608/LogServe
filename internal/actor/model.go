@@ -18,6 +18,7 @@ type State struct {
 	OwnerWorkerID          string
 	Epoch                  uint64
 	CommandCount           uint64
+	SubmittedCommandCount  uint64
 	SnapshotEvery          uint32
 	SnapshotRef            string
 	SnapshotCommandCount   uint64
@@ -121,6 +122,7 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			state.SnapshotRef = payload.SnapshotRef
 			state.SnapshotCommandCount = payload.SnapshotCommandCount
 			state.CommandCount = payload.SnapshotCommandCount
+			state.SubmittedCommandCount = payload.SnapshotCommandCount
 			state.UpdatedAtMs = payload.TimestampMs
 			snapshotCommandCount = payload.SnapshotCommandCount
 		}
@@ -159,6 +161,11 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			state.OwnerWorkerID = payload.WorkerID
 			state.Epoch = payload.Epoch
 			state.UpdatedAtMs = payload.TimestampMs
+		case "ActorCommandSubmitted":
+			if payload.CommandSeq > state.SubmittedCommandCount {
+				state.SubmittedCommandCount = payload.CommandSeq
+			}
+			state.UpdatedAtMs = payload.TimestampMs
 		case "ActorCommandApplied":
 			if useSnapshot && payload.CommandCount <= snapshotCommandCount {
 				continue
@@ -168,7 +175,24 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			} else {
 				state.CommandCount = payload.CommandCount
 			}
+			if state.CommandCount > state.SubmittedCommandCount {
+				state.SubmittedCommandCount = state.CommandCount
+			}
 			state.StateJSON = NormalizeJSON(payload.StateJSON)
+			state.UpdatedAtMs = payload.TimestampMs
+			commands++
+		case "ActorCommandFailed":
+			if useSnapshot && payload.CommandCount <= snapshotCommandCount {
+				continue
+			}
+			if payload.CommandSeq > 0 {
+				state.CommandCount = payload.CommandSeq
+			} else {
+				state.CommandCount = payload.CommandCount
+			}
+			if state.CommandCount > state.SubmittedCommandCount {
+				state.SubmittedCommandCount = state.CommandCount
+			}
 			state.UpdatedAtMs = payload.TimestampMs
 			commands++
 		case "ActorSnapshotCreated":
@@ -203,6 +227,7 @@ func Consistent(a, b State) bool {
 		a.OwnerWorkerID == b.OwnerWorkerID &&
 		a.Epoch == b.Epoch &&
 		a.CommandCount == b.CommandCount &&
+		a.SubmittedCommandCount == b.SubmittedCommandCount &&
 		a.SnapshotRef == b.SnapshotRef &&
 		a.SnapshotCommandCount == b.SnapshotCommandCount &&
 		bytes.Equal(NormalizeJSON(a.StateJSON), NormalizeJSON(b.StateJSON))

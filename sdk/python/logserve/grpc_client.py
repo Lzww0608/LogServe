@@ -131,8 +131,12 @@ class GrpcControlTransport:
             "worker_id": resp.worker_id,
             "cache_hit": resp.cache_hit,
             "model_load_ms": resp.model_load_ms,
+            "checkpoint_fetch_ms": resp.checkpoint_fetch_ms,
             "first_token_ms": resp.first_token_ms,
             "total_latency_ms": resp.total_latency_ms,
+            "cache_used_bytes": resp.cache_used_bytes,
+            "cache_capacity_bytes": resp.cache_capacity_bytes,
+            "eviction_count": resp.eviction_count,
             "events": [_llm_event_dict(event) for event in resp.events],
         }
 
@@ -350,8 +354,12 @@ def _llm_event_dict(event):
         "worker_id": event.worker_id,
         "cache_hit": event.cache_hit,
         "model_load_ms": event.model_load_ms,
+        "checkpoint_fetch_ms": event.checkpoint_fetch_ms,
         "first_token_ms": event.first_token_ms,
         "total_latency_ms": event.total_latency_ms,
+        "cache_used_bytes": event.cache_used_bytes,
+        "cache_capacity_bytes": event.cache_capacity_bytes,
+        "eviction_count": event.eviction_count,
     }
 
 

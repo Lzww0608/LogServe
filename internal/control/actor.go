@@ -85,87 +85,16 @@ func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorReques
 	if req.GetMethodName() == "" {
 		return nil, errors.New("method_name is required")
 	}
-	lock := s.actorLock(req.GetActorId())
-	lock.Lock()
-	defer lock.Unlock()
 
 	timeout := time.Duration(req.GetTimeoutMs()) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 	deadlineAt := time.Now().Add(timeout)
-	state, err := s.waitActorOwner(ctx, req.GetActorId(), deadlineAt)
-	if err != nil {
-		return nil, err
-	}
-	if state.CommandCount > 0 && len(state.StateJSON) == 0 {
-		replayed, err := s.replayActor(ctx, req.GetActorId())
-		if err != nil {
-			return nil, err
-		}
-		state.StateJSON = replayed.State.StateJSON
-	}
 
-	callID := newActorCallID()
-	argsJSON := defaultJSON(req.GetArgsJson(), []byte(`{"args":[],"kwargs":{}}`))
-	idem := req.GetIdempotencyKey()
-	if idem == "" {
-		idem = callID
-	}
-	commandSeq := state.CommandCount + 1
-	spec := &logservepb.TaskSpec{
-		TaskId:            callID,
-		TaskName:          "actor:" + req.GetMethodName(),
-		FunctionName:      req.GetMethodName(),
-		ArgsJson:          argsJSON,
-		IdempotencyKey:    idem,
-		TargetWorkerId:    state.OwnerWorkerID,
-		ActorId:           state.ActorID,
-		ActorCallId:       callID,
-		ActorClassName:    state.ClassName,
-		ActorClassSource:  state.ClassSource,
-		ActorMethod:       req.GetMethodName(),
-		ActorStateJson:    append([]byte(nil), state.StateJSON...),
-		ActorInitArgsJson: append([]byte(nil), state.InitArgsJSON...),
-		ActorEpoch:        state.Epoch,
-	}
-	fingerprint, err := taskSpecFingerprint(spec)
+	task, err := s.submitActorCommand(ctx, req, deadlineAt)
 	if err != nil {
 		return nil, err
-	}
-	var task metadata.Task
-	if existing, ok := s.meta.GetTaskByIdempotencyKey(idem); ok {
-		if err := ensureIdempotencyFingerprint("task", idem, existing.IdempotencyFingerprint, fingerprint); err != nil {
-			return nil, err
-		}
-		task = existing
-	} else {
-		now := actor.NowMs()
-		payload, _ := json.Marshal(actor.EventPayload{
-			ActorID:     state.ActorID,
-			CallID:      callID,
-			CommandSeq:  commandSeq,
-			MethodName:  req.GetMethodName(),
-			ArgsJSON:    argsJSON,
-			WorkerID:    state.OwnerWorkerID,
-			Epoch:       state.Epoch,
-			TimestampMs: now,
-		})
-		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
-			StreamId:       actorStream(state.ActorID),
-			EventType:      "ActorCommandSubmitted",
-			IdempotencyKey: state.ActorID + ":" + callID + ":submitted",
-			Payload:        payload,
-		}); err != nil {
-			return nil, err
-		}
-		created, _, err := s.enqueueTaskWithMetadata(ctx, spec, func(task *metadata.Task) {
-			task.ActorCommandSeq = commandSeq
-		})
-		if err != nil {
-			return nil, err
-		}
-		task = created
 	}
 
 	remaining := time.Until(deadlineAt)
@@ -210,6 +139,99 @@ func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorReques
 			}
 		}
 	}
+}
+
+func (s *Service) submitActorCommand(ctx context.Context, req *logservepb.CallActorRequest, deadlineAt time.Time) (metadata.Task, error) {
+	lock := s.actorLock(req.GetActorId())
+	lock.Lock()
+	defer lock.Unlock()
+
+	state, err := s.waitActorOwner(ctx, req.GetActorId(), deadlineAt)
+	if err != nil {
+		return metadata.Task{}, err
+	}
+	if state.CommandCount > 0 && len(state.StateJSON) == 0 {
+		replayed, err := s.replayActor(ctx, req.GetActorId())
+		if err != nil {
+			return metadata.Task{}, err
+		}
+		state.StateJSON = replayed.State.StateJSON
+	}
+
+	callID := newActorCallID()
+	argsJSON := defaultJSON(req.GetArgsJson(), []byte(`{"args":[],"kwargs":{}}`))
+	idem := req.GetIdempotencyKey()
+	if idem == "" {
+		idem = callID
+	}
+	submittedCount := state.SubmittedCommandCount
+	if state.CommandCount > submittedCount {
+		submittedCount = state.CommandCount
+	}
+	commandSeq := submittedCount + 1
+	spec := &logservepb.TaskSpec{
+		TaskId:            callID,
+		TaskName:          "actor:" + req.GetMethodName(),
+		FunctionName:      req.GetMethodName(),
+		ArgsJson:          argsJSON,
+		IdempotencyKey:    idem,
+		TargetWorkerId:    state.OwnerWorkerID,
+		ActorId:           state.ActorID,
+		ActorCallId:       callID,
+		ActorClassName:    state.ClassName,
+		ActorClassSource:  state.ClassSource,
+		ActorMethod:       req.GetMethodName(),
+		ActorStateJson:    append([]byte(nil), state.StateJSON...),
+		ActorInitArgsJson: append([]byte(nil), state.InitArgsJSON...),
+		ActorEpoch:        state.Epoch,
+	}
+	fingerprint, err := taskSpecFingerprint(spec)
+	if err != nil {
+		return metadata.Task{}, err
+	}
+	var task metadata.Task
+	if existing, ok := s.meta.GetTaskByIdempotencyKey(idem); ok {
+		if err := ensureIdempotencyFingerprint("task", idem, existing.IdempotencyFingerprint, fingerprint); err != nil {
+			return metadata.Task{}, err
+		}
+		task = existing
+	} else {
+		now := actor.NowMs()
+		payload, _ := json.Marshal(actor.EventPayload{
+			ActorID:     state.ActorID,
+			CallID:      callID,
+			CommandSeq:  commandSeq,
+			MethodName:  req.GetMethodName(),
+			ArgsJSON:    argsJSON,
+			WorkerID:    state.OwnerWorkerID,
+			Epoch:       state.Epoch,
+			TimestampMs: now,
+		})
+		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+			StreamId:       actorStream(state.ActorID),
+			EventType:      "ActorCommandSubmitted",
+			IdempotencyKey: state.ActorID + ":" + callID + ":submitted",
+			Payload:        payload,
+		}); err != nil {
+			return metadata.Task{}, err
+		}
+		created, _, err := s.enqueueTaskWithMetadata(ctx, spec, func(task *metadata.Task) {
+			task.ActorCommandSeq = commandSeq
+		})
+		if err != nil {
+			return metadata.Task{}, err
+		}
+		if _, err := s.meta.UpdateActor(state.ActorID, func(current *actor.State) error {
+			if commandSeq > current.SubmittedCommandCount {
+				current.SubmittedCommandCount = commandSeq
+			}
+			return nil
+		}); err != nil {
+			return metadata.Task{}, err
+		}
+		task = created
+	}
+	return task, nil
 }
 
 func (s *Service) GetActorStatus(ctx context.Context, req *logservepb.GetActorStatusRequest) (*logservepb.GetActorStatusResponse, error) {
@@ -302,12 +324,9 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 	if !ok {
 		return errors.New("actor not found")
 	}
-	if req.GetWorkerId() != state.OwnerWorkerID || req.GetActorEpoch() != state.Epoch || task.ActorEpoch != state.Epoch {
+	if req.GetWorkerId() != state.OwnerWorkerID || req.GetActorEpoch() != state.Epoch {
 		return fmt.Errorf("stale actor completion rejected: actor=%s task_epoch=%d request_epoch=%d current_epoch=%d owner=%s worker=%s",
 			task.ActorID, task.ActorEpoch, req.GetActorEpoch(), state.Epoch, state.OwnerWorkerID, req.GetWorkerId())
-	}
-	if req.GetStatus() == logservepb.TaskStatus_TASK_STATUS_FAILED {
-		return nil
 	}
 	commandSeq := task.ActorCommandSeq
 	if commandSeq == 0 {
@@ -320,6 +339,9 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 	spec := s.specForTask(task.TaskID)
 	if spec == nil {
 		return errors.New("actor task spec not found")
+	}
+	if req.GetStatus() == logservepb.TaskStatus_TASK_STATUS_FAILED {
+		return s.failActorCommand(ctx, task, req, spec, commandSeq)
 	}
 
 	stateJSON := actor.NormalizeJSON(req.GetActorStateJson())
@@ -371,6 +393,40 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 		})
 	}
 	return nil
+}
+
+func (s *Service) failActorCommand(ctx context.Context, task metadata.Task, req *logservepb.CompleteTaskRequest, spec *logservepb.TaskSpec, commandSeq uint64) error {
+	now := actor.NowMs()
+	payload, _ := json.Marshal(actor.EventPayload{
+		ActorID:      task.ActorID,
+		CallID:       task.ActorCallID,
+		CommandSeq:   commandSeq,
+		MethodName:   spec.GetActorMethod(),
+		ArgsJSON:     spec.GetArgsJson(),
+		Error:        req.GetError(),
+		WorkerID:     req.GetWorkerId(),
+		Epoch:        req.GetActorEpoch(),
+		CommandCount: commandSeq,
+		TimestampMs:  now,
+	})
+	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+		StreamId:       actorStream(task.ActorID),
+		EventType:      "ActorCommandFailed",
+		IdempotencyKey: task.ActorID + ":" + task.ActorCallID + ":failed",
+		Payload:        payload,
+	}); err != nil {
+		return err
+	}
+	_, err := s.meta.UpdateActor(task.ActorID, func(current *actor.State) error {
+		current.CommandCount = commandSeq
+		if commandSeq > current.SubmittedCommandCount {
+			current.SubmittedCommandCount = commandSeq
+		}
+		current.OwnerWorkerID = req.GetWorkerId()
+		current.Epoch = req.GetActorEpoch()
+		return nil
+	})
+	return err
 }
 
 func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) error {

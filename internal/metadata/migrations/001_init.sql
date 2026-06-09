@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS actor_instances (
   owner_worker_id TEXT,
   epoch BIGINT NOT NULL DEFAULT 0,
   command_count BIGINT NOT NULL DEFAULT 0,
+  submitted_command_count BIGINT NOT NULL DEFAULT 0,
   snapshot_ref TEXT,
   snapshot_command_count BIGINT NOT NULL DEFAULT 0,
   state_json JSONB,
@@ -160,3 +161,4 @@ ALTER TABLE workers ADD COLUMN IF NOT EXISTS running_tasks INTEGER NOT NULL DEFA
 ALTER TABLE actor_instances ADD COLUMN IF NOT EXISTS class_source TEXT;
 ALTER TABLE actor_instances ADD COLUMN IF NOT EXISTS idempotency_key TEXT UNIQUE;
 ALTER TABLE actor_instances ADD COLUMN IF NOT EXISTS idempotency_fingerprint TEXT;
+ALTER TABLE actor_instances ADD COLUMN IF NOT EXISTS submitted_command_count BIGINT NOT NULL DEFAULT 0;

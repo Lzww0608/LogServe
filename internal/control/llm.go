@@ -189,7 +189,7 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 }
 
 func (s *Service) canAssignTaskToWorker(taskID string, spec *logservepb.TaskSpec, workerID string) bool {
-	if spec.GetTargetWorkerId() != "" && spec.GetTargetWorkerId() != workerID {
+	if spec.GetActorId() == "" && spec.GetTargetWorkerId() != "" && spec.GetTargetWorkerId() != workerID {
 		return false
 	}
 	if spec.GetLlmModelName() == "" {

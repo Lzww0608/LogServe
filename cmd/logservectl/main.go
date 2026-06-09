@@ -93,18 +93,22 @@ type backpressureInput struct {
 }
 
 type llmOutput struct {
-	TaskID         string                 `json:"task_id"`
-	Status         string                 `json:"status,omitempty"`
-	Result         json.RawMessage        `json:"result,omitempty"`
-	Error          string                 `json:"error,omitempty"`
-	WorkerID       string                 `json:"worker_id,omitempty"`
-	ModelName      string                 `json:"model_name,omitempty"`
-	ModelVersion   string                 `json:"model_version,omitempty"`
-	CacheHit       bool                   `json:"cache_hit,omitempty"`
-	ModelLoadMs    int64                  `json:"model_load_ms,omitempty"`
-	FirstTokenMs   int64                  `json:"first_token_ms,omitempty"`
-	TotalLatencyMs int64                  `json:"total_latency_ms,omitempty"`
-	Events         []*logservepb.LLMEvent `json:"events,omitempty"`
+	TaskID             string                 `json:"task_id"`
+	Status             string                 `json:"status,omitempty"`
+	Result             json.RawMessage        `json:"result,omitempty"`
+	Error              string                 `json:"error,omitempty"`
+	WorkerID           string                 `json:"worker_id,omitempty"`
+	ModelName          string                 `json:"model_name,omitempty"`
+	ModelVersion       string                 `json:"model_version,omitempty"`
+	CacheHit           bool                   `json:"cache_hit,omitempty"`
+	ModelLoadMs        int64                  `json:"model_load_ms,omitempty"`
+	CheckpointFetchMs  int64                  `json:"checkpoint_fetch_ms,omitempty"`
+	FirstTokenMs       int64                  `json:"first_token_ms,omitempty"`
+	TotalLatencyMs     int64                  `json:"total_latency_ms,omitempty"`
+	CacheUsedBytes     int64                  `json:"cache_used_bytes,omitempty"`
+	CacheCapacityBytes int64                  `json:"cache_capacity_bytes,omitempty"`
+	EvictionCount      int64                  `json:"eviction_count,omitempty"`
+	Events             []*logservepb.LLMEvent `json:"events,omitempty"`
 }
 
 type actorOutput struct {
@@ -581,15 +585,19 @@ func llmReplay(args []string) error {
 		return err
 	}
 	return writeJSON(llmOutput{
-		TaskID:         resp.GetTaskId(),
-		ModelName:      resp.GetModelName(),
-		ModelVersion:   resp.GetModelVersion(),
-		WorkerID:       resp.GetWorkerId(),
-		CacheHit:       resp.GetCacheHit(),
-		ModelLoadMs:    resp.GetModelLoadMs(),
-		FirstTokenMs:   resp.GetFirstTokenMs(),
-		TotalLatencyMs: resp.GetTotalLatencyMs(),
-		Events:         resp.GetEvents(),
+		TaskID:             resp.GetTaskId(),
+		ModelName:          resp.GetModelName(),
+		ModelVersion:       resp.GetModelVersion(),
+		WorkerID:           resp.GetWorkerId(),
+		CacheHit:           resp.GetCacheHit(),
+		ModelLoadMs:        resp.GetModelLoadMs(),
+		CheckpointFetchMs:  resp.GetCheckpointFetchMs(),
+		FirstTokenMs:       resp.GetFirstTokenMs(),
+		TotalLatencyMs:     resp.GetTotalLatencyMs(),
+		CacheUsedBytes:     resp.GetCacheUsedBytes(),
+		CacheCapacityBytes: resp.GetCacheCapacityBytes(),
+		EvictionCount:      resp.GetEvictionCount(),
+		Events:             resp.GetEvents(),
 	})
 }
 

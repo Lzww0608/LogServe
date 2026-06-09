@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +41,38 @@ func TestSubmitWorkflowAppendFailureDoesNotCreateMetadataOnlyWorkflow(t *testing
 	}
 	if workflows := meta.ListWorkflows(); len(workflows) != 0 {
 		t.Fatalf("metadata-only workflows = %d, want 0", len(workflows))
+	}
+}
+
+func TestWorkflowScheduleBackpressureDoesNotLeavePhantomTaskID(t *testing.T) {
+	meta := metadata.NewMemoryStore()
+	service := NewServiceWithResultStore(meta, acceptingLogClient{}, nil, 0)
+	service.configMu.Lock()
+	service.queueHighWatermark = 1
+	service.configMu.Unlock()
+	service.queue = append(service.queue, "already-queued")
+
+	_, err := service.SubmitWorkflow(context.Background(), &logservepb.SubmitWorkflowRequest{
+		WorkflowName:   "backpressured_workflow",
+		DefinitionJson: minimalWorkflowDefinition(t),
+		IdempotencyKey: "backpressured-workflow",
+	})
+	if err == nil {
+		t.Fatal("SubmitWorkflow succeeded despite queue backpressure")
+	}
+	if !strings.Contains(err.Error(), "backpressure") {
+		t.Fatalf("error = %v, want backpressure", err)
+	}
+	workflows := meta.ListWorkflows()
+	if len(workflows) != 1 {
+		t.Fatalf("workflows = %d, want 1", len(workflows))
+	}
+	step := workflows[0].Steps["finish"]
+	if step.TaskID != "" {
+		t.Fatalf("workflow step has phantom task_id %q after enqueue failure", step.TaskID)
+	}
+	if tasks := meta.ListTasks(); len(tasks) != 0 {
+		t.Fatalf("metadata tasks = %d, want 0", len(tasks))
 	}
 }
 

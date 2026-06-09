@@ -1,4 +1,5 @@
 import json
+import os
 import statistics
 import time
 
@@ -99,6 +100,17 @@ def pick_int(data, snake, camel):
     return int(pick(data, snake, camel) or 0)
 
 
+def env_int(name, default):
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
 def task_throughput(n):
     latencies = []
     start = time.perf_counter()
@@ -160,14 +172,22 @@ def llm_cold_start():
         "cold": {
             "cache_hit": pick_bool(cold_replay, "cache_hit", "cacheHit"),
             "model_load_ms": pick_int(cold_replay, "model_load_ms", "modelLoadMs"),
+            "checkpoint_fetch_ms": pick_int(cold_replay, "checkpoint_fetch_ms", "checkpointFetchMs"),
             "first_token_ms": pick_int(cold_replay, "first_token_ms", "firstTokenMs"),
             "total_latency_ms": pick_int(cold_replay, "total_latency_ms", "totalLatencyMs"),
+            "cache_used_bytes": pick_int(cold_replay, "cache_used_bytes", "cacheUsedBytes"),
+            "cache_capacity_bytes": pick_int(cold_replay, "cache_capacity_bytes", "cacheCapacityBytes"),
+            "eviction_count": pick_int(cold_replay, "eviction_count", "evictionCount"),
         },
         "warm": {
             "cache_hit": pick_bool(warm_replay, "cache_hit", "cacheHit"),
             "model_load_ms": pick_int(warm_replay, "model_load_ms", "modelLoadMs"),
+            "checkpoint_fetch_ms": pick_int(warm_replay, "checkpoint_fetch_ms", "checkpointFetchMs"),
             "first_token_ms": pick_int(warm_replay, "first_token_ms", "firstTokenMs"),
             "total_latency_ms": pick_int(warm_replay, "total_latency_ms", "totalLatencyMs"),
+            "cache_used_bytes": pick_int(warm_replay, "cache_used_bytes", "cacheUsedBytes"),
+            "cache_capacity_bytes": pick_int(warm_replay, "cache_capacity_bytes", "cacheCapacityBytes"),
+            "eviction_count": pick_int(warm_replay, "eviction_count", "evictionCount"),
         },
     }
 
@@ -213,11 +233,11 @@ def main():
     register_model("model-C", version="v1", size_bytes=100, path="mock://model-C", adapter="mock")
     set_scheduling_policy("LOCALITY_AWARE")
     report = {
-        "workflow_latency": workflow_latency(3),
-        "task_throughput": task_throughput(8),
-        "actor_recovery_snapshot_ablation": actor_snapshot_ablation(20),
+        "workflow_latency": workflow_latency(env_int("LOGSERVE_BENCH_WORKFLOWS", 3)),
+        "task_throughput": task_throughput(env_int("LOGSERVE_BENCH_TASKS", 8)),
+        "actor_recovery_snapshot_ablation": actor_snapshot_ablation(env_int("LOGSERVE_BENCH_ACTOR_COMMANDS", 20)),
         "llm_cold_start": llm_cold_start(),
-        "locality_ablation": locality_ablation(6),
+        "locality_ablation": locality_ablation(env_int("LOGSERVE_BENCH_LLM_REQUESTS", 6)),
         "replay_ablation": {
             "enabled": "workflow/actor/llm state can be reconstructed from log streams",
             "disabled": "no independent recovery validation; dashboard marks this as analysis-only baseline",

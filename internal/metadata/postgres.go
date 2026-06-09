@@ -505,9 +505,9 @@ func (s *PostgresStore) persistActor(ctx context.Context, state actor.State) err
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO actor_instances (
   actor_id, class_name, class_source, status, owner_worker_id, epoch,
-  command_count, snapshot_ref, snapshot_command_count, state_json,
+  command_count, submitted_command_count, snapshot_ref, snapshot_command_count, state_json,
   init_args_json, snapshot_every, idempotency_key, idempotency_fingerprint, created_at, updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14, $15, $16)
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17)
 ON CONFLICT (actor_id) DO UPDATE SET
   class_name = EXCLUDED.class_name,
   class_source = EXCLUDED.class_source,
@@ -515,6 +515,7 @@ ON CONFLICT (actor_id) DO UPDATE SET
   owner_worker_id = EXCLUDED.owner_worker_id,
   epoch = EXCLUDED.epoch,
   command_count = EXCLUDED.command_count,
+  submitted_command_count = EXCLUDED.submitted_command_count,
   snapshot_ref = EXCLUDED.snapshot_ref,
   snapshot_command_count = EXCLUDED.snapshot_command_count,
   state_json = EXCLUDED.state_json,
@@ -530,6 +531,7 @@ ON CONFLICT (actor_id) DO UPDATE SET
 		nullString(state.OwnerWorkerID),
 		state.Epoch,
 		state.CommandCount,
+		state.SubmittedCommandCount,
 		nullString(state.SnapshotRef),
 		state.SnapshotCommandCount,
 		jsonValue(state.StateJSON),

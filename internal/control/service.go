@@ -289,10 +289,17 @@ func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest)
 			s.queue = append(s.queue[:i], s.queue[i+1:]...)
 			continue
 		}
+		before, ok := s.meta.GetTask(taskID)
+		if !ok {
+			s.queue = append(s.queue[:i], s.queue[i+1:]...)
+			continue
+		}
+		if !s.actorMailboxReady(before, req.GetWorkerId()) {
+			continue
+		}
 		if !s.canAssignTaskToWorker(taskID, spec, req.GetWorkerId()) {
 			continue
 		}
-		before, _ := s.meta.GetTask(taskID)
 		leased, err := s.meta.LeaseTask(taskID, req.GetWorkerId())
 		if err != nil {
 			return nil, err
@@ -301,11 +308,41 @@ func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest)
 			s.meta.IncrementWorkerLoad(req.GetWorkerId())
 		}
 		s.queue = append(s.queue[:i], s.queue[i+1:]...)
-		leasedSpec := cloneSpec(spec)
-		leasedSpec.TaskLeaseEpoch = leased.TaskLeaseEpoch
+		leasedSpec := s.leasedTaskSpec(spec, leased)
 		return &logservepb.PollTaskResponse{HasTask: true, Task: leasedSpec}, nil
 	}
 	return &logservepb.PollTaskResponse{HasTask: false}, nil
+}
+
+func (s *Service) actorMailboxReady(task metadata.Task, workerID string) bool {
+	if task.ActorID == "" {
+		return true
+	}
+	state, ok := s.meta.GetActor(task.ActorID)
+	if !ok || state.OwnerWorkerID == "" || state.OwnerWorkerID != workerID {
+		return false
+	}
+	commandSeq := task.ActorCommandSeq
+	if commandSeq == 0 {
+		commandSeq = state.CommandCount + 1
+	}
+	return commandSeq == state.CommandCount+1
+}
+
+func (s *Service) leasedTaskSpec(spec *logservepb.TaskSpec, leased metadata.Task) *logservepb.TaskSpec {
+	leasedSpec := cloneSpec(spec)
+	leasedSpec.TaskLeaseEpoch = leased.TaskLeaseEpoch
+	if leased.ActorID == "" {
+		return leasedSpec
+	}
+	state, ok := s.meta.GetActor(leased.ActorID)
+	if !ok {
+		return leasedSpec
+	}
+	leasedSpec.TargetWorkerId = state.OwnerWorkerID
+	leasedSpec.ActorEpoch = state.Epoch
+	leasedSpec.ActorStateJson = append([]byte(nil), state.StateJSON...)
+	return leasedSpec
 }
 
 func (s *Service) StartTask(ctx context.Context, req *logservepb.StartTaskRequest) (*logservepb.StartTaskResponse, error) {
@@ -332,6 +369,9 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 	if ok && existing.ActorID != "" {
 		if isTerminalTaskStatus(existing.Status) {
 			return &logservepb.CompleteTaskResponse{Accepted: true}, nil
+		}
+		if _, err := s.meta.ValidateTaskLease(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch()); err != nil {
+			return nil, err
 		}
 		if err := s.completeActorCall(ctx, existing, req); err != nil {
 			return nil, err
@@ -500,10 +540,14 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			TimeoutMs:       stepDef.TimeoutMs,
 		}
 		now := workflow.NowMs()
+		task, _, err := s.enqueueTask(ctx, spec)
+		if err != nil {
+			return err
+		}
 		payload, _ := json.Marshal(workflow.EventPayload{
 			WorkflowID:  workflowID,
 			StepID:      stepDef.StepID,
-			TaskID:      taskID,
+			TaskID:      task.TaskID,
 			Attempt:     attempt,
 			InputHash:   inputHash,
 			TimestampMs: now,
@@ -519,7 +563,7 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 		if _, err := s.meta.UpdateWorkflow(workflowID, func(current *workflow.State) error {
 			currentStep := current.Steps[stepDef.StepID]
 			currentStep.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED
-			currentStep.TaskID = taskID
+			currentStep.TaskID = task.TaskID
 			currentStep.Attempts = attempt
 			currentStep.LastInputHash = inputHash
 			currentStep.LastScheduledAtMs = now
@@ -527,9 +571,6 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			current.Steps[stepDef.StepID] = currentStep
 			return nil
 		}); err != nil {
-			return err
-		}
-		if _, _, err := s.enqueueTask(ctx, spec); err != nil {
 			return err
 		}
 		observability.Info("workflow_step_scheduled", map[string]any{

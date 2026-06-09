@@ -288,10 +288,13 @@ completion.command_seq == actor.command_count + 1
 This prevents a later command from being applied ahead of an earlier command in
 the actor stream.
 
-The mailbox is enforced in the control plane with one lock per actor. While this
-single control-plane implementation is running, only one call for a given actor
-can be scheduled and committed at a time, so in-memory actor state is not written
-concurrently.
+The mailbox is enforced in the control plane with one short submission lock per
+actor plus dispatch-time gating. Calls for the same actor are assigned monotonic
+`command_seq` values and can wait for their own results without blocking later
+commands from entering the mailbox. A worker only receives an actor task when
+its `command_seq` is the next command after `actor.command_count`, and the
+leased task is populated with the latest actor state, owner, and epoch at poll
+time.
 
 Actor ownership is represented by `owner_worker_id` and a monotonically
 increasing `epoch`. Actor tasks are routed only to the owner. If the owner stops
@@ -440,4 +443,37 @@ Useful commands:
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_benchmark.ps1
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_fault_injection.ps1
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_dashboard.ps1
+```
+
+On the Ubuntu single-node experiment machine, use the Linux experiment runner:
+
+```bash
+bash scripts/run_experiment.sh
+```
+
+The runner creates `reports/experiment-<utc timestamp>/` and writes:
+
+- `environment.txt`: kernel, Go/Python versions, git state
+- `command_status.jsonl`: exit code and duration for each verification step
+- `logstore_v1_latest.json`: shared-log fsync policy benchmark
+- `phase5_benchmark.json`: workflow latency, task throughput, actor snapshot
+  ablation, LLM cold/warm cache, locality scheduler comparison
+- `fault_injection.json`: fault/recovery probe status
+- `dashboard_snapshot.json`: final materialized dashboard state
+- `summary.md` and `summary.json`: compact report for later writeup
+
+Workload sizes can be increased on the experiment machine without editing code:
+
+```bash
+LOGSERVE_BENCH_WORKFLOWS=10 \
+LOGSERVE_BENCH_TASKS=100 \
+LOGSERVE_BENCH_ACTOR_COMMANDS=100 \
+LOGSERVE_BENCH_LLM_REQUESTS=20 \
+bash scripts/run_experiment.sh
+```
+
+For a quick smoke run, disable the heavier parts:
+
+```bash
+LOGSERVE_RUN_RACE=0 LOGSERVE_RUN_LOGSTORE_BENCH=0 bash scripts/run_experiment.sh
 ```
