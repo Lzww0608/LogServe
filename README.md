@@ -451,6 +451,10 @@ On the Ubuntu single-node experiment machine, use the Linux experiment runner:
 bash scripts/run_experiment.sh
 ```
 
+By default the runner chooses fresh local ports for logd/control on each run.
+Set `LOGSERVE_EXPERIMENT_LOG_ADDR` and `LOGSERVE_EXPERIMENT_CONTROL_ADDR` only
+when you intentionally want fixed ports.
+
 The runner creates `reports/experiment-<utc timestamp>/` and writes:
 
 - `environment.txt`: kernel, Go/Python versions, git state
@@ -460,6 +464,8 @@ The runner creates `reports/experiment-<utc timestamp>/` and writes:
   ablation, LLM cold/warm cache, locality scheduler comparison
 - `checkpoint_cache_probe.json`: file-backed mock checkpoint cache cold/warm
   fetch metrics
+- `checkpoint_cache_artifact.log`: file-level proof that the requested
+  checkpoint landed in a worker-local model cache directory
 - `fault_injection.json`: fault/recovery probe status
 - `dashboard_snapshot.json`: final materialized dashboard state
 - `summary.md` and `summary.json`: compact report for later writeup

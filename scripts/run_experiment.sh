@@ -2,16 +2,34 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ID="${LOGSERVE_EXPERIMENT_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_ID="${LOGSERVE_EXPERIMENT_ID:-$(date -u +%Y%m%dT%H%M%S%NZ)}"
 RUN_DIR="${LOGSERVE_EXPERIMENT_DIR:-"$ROOT/reports/experiment-$RUN_ID"}"
 STATUS_FILE="$RUN_DIR/command_status.jsonl"
 DATA_DIR="${LOGSERVE_EXPERIMENT_DATA_DIR:-"$RUN_DIR/runtime"}"
-LOG_ADDR="${LOGSERVE_EXPERIMENT_LOG_ADDR:-127.0.0.1:59051}"
-CONTROL_ADDR="${LOGSERVE_EXPERIMENT_CONTROL_ADDR:-127.0.0.1:59052}"
+DEFAULT_ADDRS="$(python - <<'PY'
+import socket
+
+sockets = []
+ports = []
+for _ in range(2):
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sockets.append(sock)
+    ports.append(sock.getsockname()[1])
+print(f"127.0.0.1:{ports[0]} 127.0.0.1:{ports[1]}")
+for sock in sockets:
+    sock.close()
+PY
+)"
+DEFAULT_LOG_ADDR="${DEFAULT_ADDRS%% *}"
+DEFAULT_CONTROL_ADDR="${DEFAULT_ADDRS##* }"
+LOG_ADDR="${LOGSERVE_EXPERIMENT_LOG_ADDR:-$DEFAULT_LOG_ADDR}"
+CONTROL_ADDR="${LOGSERVE_EXPERIMENT_CONTROL_ADDR:-$DEFAULT_CONTROL_ADDR}"
 CHECKPOINT_SOURCE_DIR="${LOGSERVE_CHECKPOINT_SOURCE_DIR:-"$DATA_DIR/checkpoints"}"
 CHECKPOINT_CACHE_BYTES="${LOGSERVE_CHECKPOINT_CACHE_BYTES:-16777216}"
 
 mkdir -p "$RUN_DIR" "$DATA_DIR"
+: > "$STATUS_FILE"
 cd "$ROOT" || exit 1
 
 export GOCACHE="${GOCACHE:-"$ROOT/.gocache"}"
@@ -20,6 +38,7 @@ export LOGSERVE_SDK_TRANSPORT="${LOGSERVE_SDK_TRANSPORT:-grpc}"
 export LOGSERVE_CONTROL_ADDR="$CONTROL_ADDR"
 
 PIDS=()
+LAST_BG_PID=""
 ANY_FAIL=0
 
 record_status() {
@@ -79,8 +98,20 @@ start_bg() {
   local log="$RUN_DIR/$name.log"
   echo "==> start $name"
   "$@" > "$log" 2>&1 &
-  PIDS+=("$!")
-  echo "    pid ${PIDS[-1]} log $log"
+  LAST_BG_PID="$!"
+  PIDS+=("$LAST_BG_PID")
+  echo "    pid $LAST_BG_PID log $log"
+}
+
+ensure_bg_alive() {
+  local name="$1"
+  local pid="$2"
+  if kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  echo "$name process exited unexpectedly"
+  tail -n 40 "$RUN_DIR/$name.log" 2>/dev/null || true
+  return 1
 }
 
 prepare_checkpoints() {
@@ -93,6 +124,23 @@ prepare_checkpoints() {
       dd if=/dev/zero of="$dir/checkpoint.bin" bs=1M count="$size_mb" status=none
     fi
   done
+}
+
+verify_checkpoint_cache_artifact() {
+  local model="${LOGSERVE_CHECKPOINT_MODEL:-model-D}"
+  local version="${LOGSERVE_CHECKPOINT_VERSION:-v1}"
+  local checkpoint_name="${model}-${version}.checkpoint"
+  local matches
+  matches="$(find "$DATA_DIR/model-cache" -type f -name "$checkpoint_name" 2>/dev/null || true)"
+  if [ -z "$matches" ]; then
+    echo "missing local checkpoint cache artifact: $checkpoint_name under $DATA_DIR/model-cache"
+    echo
+    echo "existing model-cache files:"
+    find "$DATA_DIR/model-cache" -maxdepth 3 -type f -print 2>/dev/null || true
+    return 1
+  fi
+  echo "$matches"
+  return 0
 }
 
 cleanup() {
@@ -138,6 +186,8 @@ write_environment() {
     echo "run_dir=$RUN_DIR"
     echo "log_addr=$LOG_ADDR"
     echo "control_addr=$CONTROL_ADDR"
+    echo "checkpoint_source_dir=$CHECKPOINT_SOURCE_DIR"
+    echo "checkpoint_cache_bytes=$CHECKPOINT_CACHE_BYTES"
     echo "generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo
     uname -a || true
@@ -152,24 +202,44 @@ start_runtime() {
   mkdir -p "$DATA_DIR/logstore"
   prepare_checkpoints
   start_bg logd go run ./cmd/logserve-logd --addr "$LOG_ADDR" --data-dir "$DATA_DIR/logstore" --segment-size-bytes 67108864 --fsync-policy always
+  local logd_pid="$LAST_BG_PID"
   if ! wait_tcp 127.0.0.1 "${LOG_ADDR##*:}" 30; then
     record_status runtime_logd_start 1 30 logd.log
+    return 1
+  fi
+  if ! ensure_bg_alive logd "$logd_pid"; then
+    record_status runtime_logd_start 1 0 logd.log
     return 1
   fi
   record_status runtime_logd_start 0 0 logd.log
 
   start_bg control go run ./cmd/logserve-control --addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR"
+  local control_pid="$LAST_BG_PID"
   if ! wait_tcp 127.0.0.1 "${CONTROL_ADDR##*:}" 30; then
     record_status runtime_control_start 1 30 control.log
+    return 1
+  fi
+  if ! ensure_bg_alive control "$control_pid"; then
+    record_status runtime_control_start 1 0 control.log
     return 1
   fi
   record_status runtime_control_start 0 0 control.log
 
   start_bg worker_1 go run ./cmd/logserve-worker --worker-id bench-worker-1 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-1" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  local worker_1_pid="$LAST_BG_PID"
   start_bg worker_2 go run ./cmd/logserve-worker --worker-id bench-worker-2 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-2" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  local worker_2_pid="$LAST_BG_PID"
   start_bg worker_3 go run ./cmd/logserve-worker --worker-id bench-worker-3 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-3" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  local worker_3_pid="$LAST_BG_PID"
   sleep 4
-  record_status runtime_workers_start 0 4 worker_1.log
+  local worker_start_code=0
+  ensure_bg_alive worker_1 "$worker_1_pid" || worker_start_code=1
+  ensure_bg_alive worker_2 "$worker_2_pid" || worker_start_code=1
+  ensure_bg_alive worker_3 "$worker_3_pid" || worker_start_code=1
+  record_status runtime_workers_start "$worker_start_code" 4 worker_1.log
+  if [ "$worker_start_code" -ne 0 ]; then
+    return 1
+  fi
   return 0
 }
 
@@ -231,6 +301,7 @@ if [ "${LOGSERVE_RUN_PHASE5_BENCH:-1}" = "1" ]; then
   if start_runtime; then
     run_json_step phase5_benchmark "$RUN_DIR/phase5_benchmark.json" "$RUN_DIR/phase5_benchmark.stderr.log" python examples/phase5/benchmark.py
     run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" python examples/phase5/checkpoint_cache.py
+    run_step checkpoint_cache_artifact "$RUN_DIR/checkpoint_cache_artifact.log" verify_checkpoint_cache_artifact
     run_json_step dashboard_snapshot "$RUN_DIR/dashboard_snapshot.json" "$RUN_DIR/dashboard_snapshot.stderr.log" go run ./cmd/logservectl dashboard-snapshot --control-addr "$CONTROL_ADDR"
   fi
 fi

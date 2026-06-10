@@ -116,10 +116,13 @@ def checkpoint_highlights(data):
         "checkpoint_model": data.get("model"),
         "checkpoint_cold_cache_hit": cold.get("cache_hit"),
         "checkpoint_warm_cache_hit": warm.get("cache_hit"),
+        "checkpoint_cold_worker_id": cold.get("worker_id"),
+        "checkpoint_warm_worker_id": warm.get("worker_id"),
         "checkpoint_cold_fetch_ms": cold.get("checkpoint_fetch_ms"),
         "checkpoint_warm_fetch_ms": warm.get("checkpoint_fetch_ms"),
         "checkpoint_cache_used_bytes": warm.get("cache_used_bytes") or cold.get("cache_used_bytes"),
         "checkpoint_cache_capacity_bytes": warm.get("cache_capacity_bytes") or cold.get("cache_capacity_bytes"),
+        "checkpoint_validation_errors": data.get("validation_errors") or [],
     }
 
 
@@ -226,6 +229,7 @@ def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard, checkpo
         "command_status.jsonl",
         "phase5_benchmark.json",
         "checkpoint_cache_probe.json",
+        "checkpoint_cache_artifact.log",
         "logstore_v1_latest.json",
         "fault_injection.json",
         "dashboard_snapshot.json",
