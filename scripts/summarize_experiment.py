@@ -60,8 +60,11 @@ def phase5_highlights(data):
     no_snap = actor.get("snapshot_disabled") or {}
     if snap or no_snap:
         highlights["actor_snapshot_replay_commands"] = snap.get("snapshot_replay_commands")
+        highlights["actor_trimmed_replay_commands"] = snap.get("trimmed_replay_commands")
         highlights["actor_full_replay_commands"] = snap.get("full_replay_commands")
         highlights["actor_no_snapshot_replay_commands"] = no_snap.get("snapshot_replay_commands")
+        highlights["actor_compactable_log_records"] = actor.get("compactable_log_records")
+        highlights["actor_compactable_log_bytes"] = actor.get("compactable_log_bytes")
 
     llm = data.get("llm_cold_start") or {}
     cold = llm.get("cold") or {}
@@ -143,6 +146,8 @@ def dashboard_highlights(data):
         "dashboard_actors": len(data.get("actors") or []),
         "dashboard_workers": len(data.get("workers") or []),
         "dashboard_models": len(data.get("models") or []),
+        "dashboard_compactable_log_records": pick_present(data, "compactable_log_records", "compactableLogRecords"),
+        "dashboard_compactable_log_bytes": pick_present(data, "compactable_log_bytes", "compactableLogBytes"),
     }
 
 

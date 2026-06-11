@@ -32,6 +32,9 @@ type Config struct {
 	MaxTasks                 int
 	CachedModels             []string
 	Capacity                 uint32
+	TaskPoolSize             int
+	LLMPoolSize              int
+	ActorPoolSize            int
 	MockModelLoad            time.Duration
 	MockFirstToken           time.Duration
 	VLLMBaseURL              string
@@ -117,6 +120,7 @@ func (b *lockedBuffer) String() string {
 
 type modelCache struct {
 	mu            sync.RWMutex
+	checkpointMu  sync.Mutex
 	models        map[string]bool
 	checkpoints   map[string]modelCacheEntry
 	sourceDir     string
@@ -148,6 +152,31 @@ type checkpointLoadResult struct {
 	EvictionCount      int64
 }
 
+type workerJob struct {
+	task       *logservepb.TaskSpec
+	enqueuedAt time.Time
+}
+
+type workerJobResult struct {
+	task *logservepb.TaskSpec
+	err  error
+}
+
+type localExecutorPool struct {
+	cfg           Config
+	cache         *modelCache
+	controlClient logservepb.ControlServiceClient
+	logClient     logservepb.LogServiceClient
+	taskQueue     chan workerJob
+	llmQueue      chan workerJob
+	actorQueue    chan workerJob
+	results       chan workerJobResult
+	actorLocksMu  sync.Mutex
+	actorLocks    map[string]*sync.Mutex
+	closeOnce     sync.Once
+	wg            sync.WaitGroup
+}
+
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.WorkerID == "" {
 		cfg.WorkerID = "worker-1"
@@ -163,6 +192,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.Capacity == 0 {
 		cfg.Capacity = 1
+	}
+	if cfg.TaskPoolSize <= 0 {
+		cfg.TaskPoolSize = int(cfg.Capacity)
+	}
+	if cfg.LLMPoolSize <= 0 {
+		cfg.LLMPoolSize = int(cfg.Capacity)
+	}
+	if cfg.ActorPoolSize <= 0 {
+		cfg.ActorPoolSize = int(cfg.Capacity)
 	}
 	if cfg.MockModelLoad == 0 {
 		cfg.MockModelLoad = 80 * time.Millisecond
@@ -198,20 +236,38 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	observability.Info("worker_registered", map[string]any{"worker_id": cfg.WorkerID})
 
-	runner, err := startPythonRunner(ctx, cfg)
+	pool, err := startLocalExecutorPool(ctx, cfg, cache, controlClient, logClient)
 	if err != nil {
 		return err
 	}
-	defer runner.Close()
+	defer pool.Close()
 
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
 	completedTasks := 0
+	dispatchedTasks := 0
+	inFlight := 0
+	localCapacity := int(cfg.Capacity)
+	if localCapacity <= 0 {
+		localCapacity = 1
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case result := <-pool.results:
+			inFlight--
+			completedTasks++
+			if result.task == nil {
+				continue
+			}
+			if result.err != nil {
+				observability.Error("task_execution_failed", result.err, map[string]any{"worker_id": cfg.WorkerID, "task_id": result.task.GetTaskId()})
+			}
+			if cfg.MaxTasks > 0 && completedTasks >= cfg.MaxTasks {
+				return nil
+			}
 		case <-ticker.C:
 			if _, err := controlClient.Heartbeat(ctx, &logservepb.HeartbeatRequest{
 				WorkerId:     cfg.WorkerID,
@@ -220,34 +276,212 @@ func Run(ctx context.Context, cfg Config) error {
 				observability.Error("worker_heartbeat_failed", err, map[string]any{"worker_id": cfg.WorkerID})
 				continue
 			}
-			resp, err := controlClient.PollTask(ctx, &logservepb.PollTaskRequest{WorkerId: cfg.WorkerID})
-			if err != nil {
-				observability.Error("worker_poll_failed", err, map[string]any{"worker_id": cfg.WorkerID})
-				continue
-			}
-			if !resp.GetHasTask() {
-				continue
-			}
-			if err := executeTask(ctx, cfg, runner, cache, controlClient, logClient, resp.GetTask()); err != nil {
-				observability.Error("task_execution_failed", err, map[string]any{"worker_id": cfg.WorkerID, "task_id": resp.GetTask().GetTaskId()})
-			}
-			completedTasks++
-			if cfg.MaxTasks > 0 && completedTasks >= cfg.MaxTasks {
-				return nil
+			for inFlight < localCapacity {
+				if cfg.MaxTasks > 0 && dispatchedTasks >= cfg.MaxTasks {
+					break
+				}
+				resp, err := controlClient.PollTask(ctx, &logservepb.PollTaskRequest{WorkerId: cfg.WorkerID})
+				if err != nil {
+					observability.Error("worker_poll_failed", err, map[string]any{"worker_id": cfg.WorkerID})
+					break
+				}
+				if !resp.GetHasTask() {
+					break
+				}
+				if err := pool.Dispatch(ctx, resp.GetTask()); err != nil {
+					observability.Error("worker_dispatch_failed", err, map[string]any{"worker_id": cfg.WorkerID, "task_id": resp.GetTask().GetTaskId()})
+					break
+				}
+				inFlight++
+				dispatchedTasks++
 			}
 		}
 	}
 }
 
-func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *modelCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient, task *logservepb.TaskSpec) error {
+func startLocalExecutorPool(ctx context.Context, cfg Config, cache *modelCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient) (*localExecutorPool, error) {
+	queueSize := positiveInt(int(cfg.Capacity), 1)
+	taskPoolSize := positiveInt(cfg.TaskPoolSize, 1)
+	llmPoolSize := positiveInt(cfg.LLMPoolSize, 1)
+	actorPoolSize := positiveInt(cfg.ActorPoolSize, 1)
+
+	taskRunners := make([]*pythonRunner, 0, taskPoolSize)
+	actorRunners := make([]*pythonRunner, 0, actorPoolSize)
+	for i := 0; i < taskPoolSize; i++ {
+		runner, err := startPythonRunner(ctx, cfg)
+		if err != nil {
+			closeRunners(taskRunners)
+			return nil, err
+		}
+		taskRunners = append(taskRunners, runner)
+	}
+	for i := 0; i < actorPoolSize; i++ {
+		runner, err := startPythonRunner(ctx, cfg)
+		if err != nil {
+			closeRunners(taskRunners)
+			closeRunners(actorRunners)
+			return nil, err
+		}
+		actorRunners = append(actorRunners, runner)
+	}
+
+	pool := &localExecutorPool{
+		cfg:           cfg,
+		cache:         cache,
+		controlClient: controlClient,
+		logClient:     logClient,
+		taskQueue:     make(chan workerJob, queueSize),
+		llmQueue:      make(chan workerJob, queueSize),
+		actorQueue:    make(chan workerJob, queueSize),
+		results:       make(chan workerJobResult, queueSize),
+		actorLocks:    map[string]*sync.Mutex{},
+	}
+
+	for _, runner := range taskRunners {
+		pool.wg.Add(1)
+		go pool.runPythonWorker(ctx, runner, pool.taskQueue, false)
+	}
+	for _, runner := range actorRunners {
+		pool.wg.Add(1)
+		go pool.runPythonWorker(ctx, runner, pool.actorQueue, true)
+	}
+	for i := 0; i < llmPoolSize; i++ {
+		pool.wg.Add(1)
+		go pool.runLLMWorker(ctx, pool.llmQueue)
+	}
+
+	observability.Info("worker_executor_pool_started", map[string]any{
+		"worker_id":       cfg.WorkerID,
+		"capacity":        cfg.Capacity,
+		"task_pool_size":  taskPoolSize,
+		"llm_pool_size":   llmPoolSize,
+		"actor_pool_size": actorPoolSize,
+	})
+	return pool, nil
+}
+
+func (p *localExecutorPool) Dispatch(ctx context.Context, task *logservepb.TaskSpec) error {
+	if task == nil {
+		return errors.New("task is nil")
+	}
+	job := workerJob{task: task, enqueuedAt: time.Now()}
+	queue := p.taskQueue
+	if task.GetLlmModelName() != "" {
+		queue = p.llmQueue
+	} else if task.GetActorId() != "" {
+		queue = p.actorQueue
+	}
+
+	select {
+	case queue <- job:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *localExecutorPool) Close() {
+	p.closeOnce.Do(func() {
+		close(p.taskQueue)
+		close(p.llmQueue)
+		close(p.actorQueue)
+		p.wg.Wait()
+	})
+}
+
+func (p *localExecutorPool) runPythonWorker(ctx context.Context, runner *pythonRunner, queue <-chan workerJob, actorOrdered bool) {
+	defer p.wg.Done()
+	defer runner.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-queue:
+			if !ok {
+				return
+			}
+			var unlock func()
+			if actorOrdered {
+				unlock = p.lockActor(job.task.GetActorId())
+			}
+			err := executeTask(ctx, p.cfg, runner, p.cache, p.controlClient, p.logClient, job.task, job.enqueuedAt)
+			if unlock != nil {
+				unlock()
+			}
+			p.finish(ctx, job.task, err)
+		}
+	}
+}
+
+func (p *localExecutorPool) runLLMWorker(ctx context.Context, queue <-chan workerJob) {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-queue:
+			if !ok {
+				return
+			}
+			err := executeTask(ctx, p.cfg, nil, p.cache, p.controlClient, p.logClient, job.task, job.enqueuedAt)
+			p.finish(ctx, job.task, err)
+		}
+	}
+}
+
+func (p *localExecutorPool) finish(ctx context.Context, task *logservepb.TaskSpec, err error) {
+	select {
+	case p.results <- workerJobResult{task: task, err: err}:
+	case <-ctx.Done():
+	}
+}
+
+func (p *localExecutorPool) lockActor(actorID string) func() {
+	if actorID == "" {
+		return nil
+	}
+	p.actorLocksMu.Lock()
+	lock, ok := p.actorLocks[actorID]
+	if !ok {
+		lock = &sync.Mutex{}
+		p.actorLocks[actorID] = lock
+	}
+	p.actorLocksMu.Unlock()
+
+	lock.Lock()
+	return lock.Unlock
+}
+
+func closeRunners(runners []*pythonRunner) {
+	for _, runner := range runners {
+		_ = runner.Close()
+	}
+}
+
+func positiveInt(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *modelCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient, task *logservepb.TaskSpec, enqueuedAt time.Time) error {
 	if task == nil {
 		return errors.New("task is nil")
 	}
 
+	localQueueWaitMs := int64(0)
+	if !enqueuedAt.IsZero() {
+		localQueueWaitMs = time.Since(enqueuedAt).Milliseconds()
+		if localQueueWaitMs < 0 {
+			localQueueWaitMs = 0
+		}
+	}
 	startPayload, _ := json.Marshal(map[string]any{
-		"task_id":          task.GetTaskId(),
-		"worker_id":        cfg.WorkerID,
-		"task_lease_epoch": task.GetTaskLeaseEpoch(),
+		"task_id":             task.GetTaskId(),
+		"worker_id":           cfg.WorkerID,
+		"task_lease_epoch":    task.GetTaskLeaseEpoch(),
+		"local_queue_wait_ms": localQueueWaitMs,
 	})
 	if _, err := logClient.AppendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       taskStream(task.GetTaskId()),
@@ -272,14 +506,13 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 	}
 	result, actorState, execErr := runExecutor(execCtx, cfg, runner, cache, controlClient, logClient, task)
 	cancelExec()
-	if errors.Is(execErr, context.DeadlineExceeded) && task.GetLlmModelName() == "" {
+	if errors.Is(execErr, context.DeadlineExceeded) && task.GetLlmModelName() == "" && runner != nil {
 		if err := runner.Restart(ctx, cfg); err != nil {
 			observability.Error("python_executor_restart_failed", err, map[string]any{"worker_id": cfg.WorkerID})
 		}
 	}
 	status := logservepb.TaskStatus_TASK_STATUS_SUCCEEDED
 	errText := ""
-	payload := result
 	eventType := "TaskCompleted"
 	if execErr != nil {
 		status = logservepb.TaskStatus_TASK_STATUS_FAILED
@@ -288,9 +521,9 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 		} else {
 			errText = execErr.Error()
 		}
-		payload, _ = json.Marshal(map[string]string{"error": errText})
 		eventType = "TaskFailed"
 	}
+	payload := taskTerminalLogPayload(task, cfg.WorkerID, status, result, errText)
 
 	if _, err := logClient.AppendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       taskStream(task.GetTaskId()),
@@ -313,6 +546,24 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 		return err
 	}
 	return execErr
+}
+
+func taskTerminalLogPayload(task *logservepb.TaskSpec, workerID string, status logservepb.TaskStatus, result []byte, errText string) []byte {
+	payload := map[string]any{
+		"task_id":          task.GetTaskId(),
+		"worker_id":        workerID,
+		"status":           status.String(),
+		"task_lease_epoch": task.GetTaskLeaseEpoch(),
+		"timestamp_ms":     time.Now().UnixMilli(),
+	}
+	if len(result) > 0 {
+		payload["result_json"] = json.RawMessage(result)
+	}
+	if errText != "" {
+		payload["error"] = errText
+	}
+	data, _ := json.Marshal(payload)
+	return data
 }
 
 func runExecutor(ctx context.Context, cfg Config, runner *pythonRunner, cache *modelCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient, task *logservepb.TaskSpec) ([]byte, []byte, error) {
@@ -432,6 +683,9 @@ func runLLMExecutor(ctx context.Context, cfg Config, cache *modelCache, controlC
 }
 
 func runPythonExecutor(ctx context.Context, runner *pythonRunner, task *logservepb.TaskSpec) ([]byte, error) {
+	if runner == nil {
+		return nil, errors.New("python runner is required for task execution")
+	}
 	req := executorRequest{
 		FunctionSource: task.GetFunctionSource(),
 		FunctionName:   task.GetFunctionName(),
@@ -451,6 +705,9 @@ func runPythonExecutor(ctx context.Context, runner *pythonRunner, task *logserve
 }
 
 func runActorExecutor(ctx context.Context, runner *pythonRunner, task *logservepb.TaskSpec) ([]byte, []byte, error) {
+	if runner == nil {
+		return nil, nil, errors.New("python runner is required for actor execution")
+	}
 	req := actorExecutorRequest{
 		Mode:         "actor",
 		ClassSource:  task.GetActorClassSource(),
@@ -709,6 +966,9 @@ func (c *modelCache) ensureCheckpoint(ctx context.Context, name, version string)
 	if !c.usesCheckpointStore() {
 		return checkpointLoadResult{}, errors.New("checkpoint cache is not configured")
 	}
+	c.checkpointMu.Lock()
+	defer c.checkpointMu.Unlock()
+
 	key := modelKey(name, version)
 	now := time.Now()
 

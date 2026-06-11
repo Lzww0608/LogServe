@@ -1,18 +1,22 @@
 # LogServe
 
-LogServe is a lightweight shared-log-based runtime for AI workflow infrastructure.
-Phase 1 focuses on the smallest distributed task execution path:
+LogServe is a lightweight shared-log-based runtime for AI workflow
+infrastructure. It is built around a log-first control plane, Python SDK,
+workers, workflow DAG runtime, stateful actors, and LLM serving with
+model-cache-aware scheduling.
 
-1. Python SDK submits a `@task`.
-2. Control plane appends `TaskSubmitted` and queues the task.
-3. Worker heartbeats, polls, appends `TaskStarted`, executes Python, and appends `TaskCompleted`.
-4. Task status can be queried from the control plane.
-5. Shared log can be read by stream for replay/debugging.
+The project covers:
 
-Phase 2 adds a multi-step workflow runtime with replay and retry. Phase 3 adds
-stateful Python actors with mailbox serialization, log replay, snapshots, and
-epoch fencing. Phase 4 adds LLM serving with model registry, worker model-cache
-reporting, checkpoint-cache mock loading, and locality-aware scheduling.
+1. Distributed task execution through `@task`, shared-log task events, and
+   worker polling.
+2. Multi-step workflow execution with DAG scheduling, replay, retry, timeout,
+   idempotency, and result references.
+3. Stateful Python actors with mailbox serialization, command sequencing,
+   snapshot replay, ownership transfer, and epoch fencing.
+4. LLM serving with model registry, mock/vLLM adapters, worker model-cache
+   reporting, file-backed checkpoint cache, and locality-aware scheduling.
+5. Phase 5 hardening with fault injection, benchmark scripts, ablation studies,
+   dashboard snapshots, backpressure, and Kubernetes manifests.
 
 ## Repository Layout
 
@@ -32,7 +36,9 @@ internal/worker      Worker polling and task execution
 internal/objectstore Local result store v0 for large workflow results
 sdk/python/logserve  Python SDK
 executor/python      Python function executor
-deployments/         Docker Compose skeleton for Phase 1 infra
+deployments/         Docker Compose and Kubernetes manifests
+docs/report.md       Project report and experiment writeup
+docs/resume.md       Resume-ready project summary
 ```
 
 ## Local Demo Without Docker
@@ -100,6 +106,34 @@ go run ./cmd/logserve-worker --worker-id worker-1 --control-addr 127.0.0.1:50052
 ```
 
 Then run the same Python demo.
+
+## Worker Local Executor Pool
+
+Workers dispatch polled tasks into local executor queues before completing them
+back to the control plane:
+
+```text
+PollTask -> local queue -> executor goroutine pool -> CompleteTask
+```
+
+Use these flags to size local execution independently by task type:
+
+```text
+--capacity 4
+--task-pool-size 4
+--llm-pool-size 4
+--actor-pool-size 2
+```
+
+If a pool size is `0` or omitted, it follows `--capacity` for backward
+compatibility. Ordinary Python tasks and LLM requests can run concurrently.
+Actor work is dispatched through an actor pool, but each `actor_id` is still
+protected by a per-actor lock and the control-plane mailbox/`command_seq`
+rules, so methods for the same actor remain ordered.
+
+Each `TaskStarted` event includes `local_queue_wait_ms`, which records how long
+the task waited in the worker-local queue before an executor goroutine started
+it. This is the worker-side signal for queue wait and pool saturation.
 
 ## Python SDK Transport And Idempotency
 
@@ -308,6 +342,13 @@ only `snapshot_ref`. The local development adapter stores snapshot objects under
 the same result-store boundary is where an S3-compatible MinIO adapter should be
 plugged in for production-style deployments.
 
+When an actor snapshot is created, LogServe records a stream-level logical trim
+point in the shared log. `ReadLog` hides records before that point by default,
+but segment files are not physically deleted. The retained actor tail starts at
+`ActorSnapshotCreated`, which carries the actor metadata needed to replay from
+`snapshot_ref` plus later command events. This is snapshot-aware retention, not
+full physical compaction.
+
 Observability is emitted as structured logs. Workflow runs include end-to-end
 latency and step latency; actor commands include actor id, call id, epoch, and
 command count, with replay exposing full versus snapshot command counts.
@@ -395,9 +436,25 @@ Three scheduler policies are implemented:
 - `LOCALITY_AWARE`: score active workers by cache hit, available capacity, and
   queue wait. Cached workers are preferred while they have capacity; cold workers
   can run work when cached capacity is unavailable.
-- `PREDICTED_LATENCY`: replay recent `llm:*` completion events and prefer the
-  worker with the lowest observed latency for the requested model/version,
-  adjusted by current worker load.
+- `PREDICTED_LATENCY`: use materialized LLM stats and prefer the worker with the
+  lowest predicted latency for the requested model/version. Scheduling is an
+  `O(number_of_workers)` lookup instead of a replay-all scan over `llm:*`
+  streams.
+
+The predicted-latency stats are keyed by `(model_name, model_version,
+worker_id)` and maintained from `LLMCompleted` events when LLM tasks finish.
+Each entry tracks request count, cache-hit count, EWMA total latency, EWMA model
+load latency, EWMA checkpoint fetch latency, and last update time. On control
+restart, the stats are rebuilt once from LLM event streams. The runtime
+prediction is:
+
+```text
+predicted_latency =
+  ewma_total_latency_ms
+  + queue_penalty
+  + cold_start_penalty
+  + eviction_penalty
+```
 
 LLM requests are task instances with extra model metadata. The worker writes the
 LLM event stream `llm:<task_id>`:
@@ -432,7 +489,7 @@ Phase 5 adds operational analysis assets and runtime hardening:
 - dashboard snapshot API and static dashboard
 - benchmark harness for workflow latency, task throughput, actor replay, and
   LLM cold start
-- ablation report for locality, snapshots, and replay semantics
+- ablation report for locality, snapshots, trimmed replay, and replay semantics
 - fault-injection script for worker/control/logd probes, including control
   metadata bootstrap from the shared log
 - optional Kubernetes manifests for kind or minikube
@@ -480,8 +537,59 @@ LOGSERVE_BENCH_LLM_REQUESTS=20 \
 bash scripts/run_experiment.sh
 ```
 
+Worker-local executor pool sizing can also be varied without changing scripts:
+
+```bash
+LOGSERVE_WORKER_CAPACITY=4 \
+LOGSERVE_TASK_POOL_SIZE=4 \
+LOGSERVE_LLM_POOL_SIZE=4 \
+LOGSERVE_ACTOR_POOL_SIZE=2 \
+bash scripts/run_experiment.sh
+```
+
 For a quick smoke run, disable the heavier parts:
 
 ```bash
 LOGSERVE_RUN_RACE=0 LOGSERVE_RUN_LOGSTORE_BENCH=0 bash scripts/run_experiment.sh
 ```
+
+### Latest Single-Node Experiment Snapshot
+
+The latest validated Ubuntu single-node run used 3 workers, mock LLM serving,
+and file-backed checkpoint cache:
+
+```text
+reports/experiment-20260610T013044794327660Z
+Linux lab2439 6.8.0-111-generic x86_64 GNU/Linux
+```
+
+All verification steps passed: Go tests, `go vet`, race tests for control and
+worker packages, Python unittest/compile checks, gRPC dependency check,
+logstore benchmark, fault-injection tests, Phase 5 benchmark, checkpoint cache
+probe, checkpoint artifact check, and dashboard snapshot.
+
+Representative results:
+
+| Metric | Result |
+|---|---:|
+| Workflow p95 / p99 latency | 823 ms / 823 ms |
+| Task throughput | 5.17 tasks/s |
+| Task p99 latency | 207 ms |
+| Actor snapshot replay commands | 1 vs 21 full replay |
+| Actor trimmed replay commands | 1 |
+| Resource-only cache hit rate | 0.833 |
+| Locality-aware cache hit rate | 1.000 |
+| Resource-only p95 latency | 305 ms |
+| Locality-aware p95 latency | 205 ms |
+| Checkpoint cold fetch | 1 ms |
+| Checkpoint warm fetch | 0 ms |
+| Checkpoint cache used / capacity | 3,145,728 / 16,777,216 bytes |
+
+The checkpoint probe also verified the worker-local artifact:
+
+```text
+runtime/model-cache/worker-1/model-D-v1.checkpoint
+```
+
+See `docs/report.md` for the full written experiment summary and
+`docs/resume.md` for resume-ready project wording.

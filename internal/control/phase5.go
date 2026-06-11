@@ -8,6 +8,7 @@ import (
 
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/metadata"
+	"github.com/logserve/logserve/internal/observability"
 )
 
 func (s *Service) SetBackpressure(ctx context.Context, req *logservepb.SetBackpressureRequest) (*logservepb.SetBackpressureResponse, error) {
@@ -118,19 +119,37 @@ func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetD
 		return models[i].GetName() < models[j].GetName()
 	})
 	queueHighWatermark, redeliveryTimeout, logAppendSlowLimit := s.getBackpressureConfig()
+	compactableRecords, compactableBytes := s.compactableLogStats(ctx)
 	return &logservepb.DashboardSnapshot{
-		QueueDepth:          queueDepth,
-		QueueHighWatermark:  queueHighWatermark,
-		RedeliveryTimeoutMs: redeliveryTimeout.Milliseconds(),
-		SchedulingPolicy:    s.getSchedulingPolicy(),
-		Tasks:               dashboardTasks,
-		Workflows:           dashboardWorkflows,
-		Actors:              dashboardActors,
-		Workers:             dashboardWorkers,
-		Models:              models,
-		LastLogAppendMs:     s.lastLogAppendMs.Load(),
-		LogAppendSlowMs:     logAppendSlowLimit.Milliseconds(),
+		QueueDepth:            queueDepth,
+		QueueHighWatermark:    queueHighWatermark,
+		RedeliveryTimeoutMs:   redeliveryTimeout.Milliseconds(),
+		SchedulingPolicy:      s.getSchedulingPolicy(),
+		Tasks:                 dashboardTasks,
+		Workflows:             dashboardWorkflows,
+		Actors:                dashboardActors,
+		Workers:               dashboardWorkers,
+		Models:                models,
+		LastLogAppendMs:       s.lastLogAppendMs.Load(),
+		LogAppendSlowMs:       logAppendSlowLimit.Milliseconds(),
+		CompactableLogRecords: compactableRecords,
+		CompactableLogBytes:   compactableBytes,
 	}, nil
+}
+
+func (s *Service) compactableLogStats(ctx context.Context) (uint64, uint64) {
+	resp, err := s.log.GetStreamStats(ctx, &logservepb.GetStreamStatsRequest{})
+	if err != nil {
+		observability.Error("log_stats_failed", err, nil)
+		return 0, 0
+	}
+	var records uint64
+	var bytes uint64
+	for _, stream := range resp.GetStreams() {
+		records += stream.GetCompactableRecords()
+		bytes += stream.GetCompactableBytes()
+	}
+	return records, bytes
 }
 
 func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
@@ -155,9 +174,10 @@ func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
 	}
 	for _, task := range expired {
 		payload, _ := json.Marshal(map[string]any{
-			"task_id":      task.TaskID,
-			"task_name":    task.TaskName,
-			"timestamp_ms": time.Now().UnixMilli(),
+			"task_id":          task.TaskID,
+			"task_name":        task.TaskName,
+			"task_lease_epoch": task.TaskLeaseEpoch,
+			"timestamp_ms":     time.Now().UnixMilli(),
 		})
 		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 			StreamId:       taskStream(task.TaskID),

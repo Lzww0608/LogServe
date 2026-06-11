@@ -27,6 +27,22 @@ type llmEventPayload struct {
 	TimestampMs        int64  `json:"timestamp_ms,omitempty"`
 }
 
+type llmStatsKey struct {
+	modelName    string
+	modelVersion string
+	workerID     string
+}
+
+type llmWorkerStats struct {
+	RequestCount          uint64
+	CacheHitCount         uint64
+	EWMATotalLatencyMs    int64
+	EWMAModelLoadMs       int64
+	EWMACheckpointFetchMs int64
+	LastEvictionCount     int64
+	LastUpdatedMs         int64
+}
+
 func (s *Service) RegisterModel(ctx context.Context, req *logservepb.RegisterModelRequest) (*logservepb.RegisterModelResponse, error) {
 	model := req.GetModel()
 	if model.GetName() == "" {
@@ -253,18 +269,14 @@ func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) s
 	return bestWorker
 }
 
-type llmWorkerStats struct {
-	count          int
-	totalLatencyMs int64
-}
-
 func (s *Service) predictedLLMWorker(taskID string, spec *logservepb.TaskSpec) string {
 	workers := s.meta.ActiveWorkers(schedulerWorkerLease)
 	if len(workers) == 0 {
 		return ""
 	}
+	modelName := spec.GetLlmModelName()
+	modelVersion := spec.GetLlmModelVersion()
 	modelKey := metadata.ModelKey(spec.GetLlmModelName(), spec.GetLlmModelVersion())
-	stats := s.observedLLMStats(spec.GetLlmModelName(), spec.GetLlmModelVersion())
 	task, _ := s.meta.GetTask(taskID)
 	queueDelayMs := int64(0)
 	if task.CreatedAtMs > 0 {
@@ -277,7 +289,8 @@ func (s *Service) predictedLLMWorker(taskID string, spec *logservepb.TaskSpec) s
 		if !workerHasCapacity(worker) {
 			continue
 		}
-		predicted := predictedLatencyMs(worker, modelKey, stats[worker.WorkerID])
+		stats, _ := s.llmStatsForWorker(modelName, modelVersion, worker.WorkerID)
+		predicted := predictedLatencyMs(worker, modelKey, stats)
 		predicted += int64(worker.RunningTasks) * 50
 		if queueDelayMs > localityQueueWait.Milliseconds() && !worker.CachedModels[modelKey] {
 			predicted -= 25
@@ -291,28 +304,128 @@ func (s *Service) predictedLLMWorker(taskID string, spec *logservepb.TaskSpec) s
 }
 
 func predictedLatencyMs(worker metadata.Worker, modelKey string, stats llmWorkerStats) int64 {
-	if stats.count > 0 {
-		return stats.totalLatencyMs / int64(stats.count)
+	base := int64(25)
+	if stats.RequestCount > 0 && stats.EWMATotalLatencyMs > 0 {
+		base = stats.EWMATotalLatencyMs
+	} else if !worker.CachedModels[modelKey] {
+		base = 25
 	}
-	if worker.CachedModels[modelKey] {
-		return 25
+
+	coldStartPenalty := int64(0)
+	if !worker.CachedModels[modelKey] {
+		coldStartPenalty = stats.EWMAModelLoadMs + stats.EWMACheckpointFetchMs
+		if coldStartPenalty <= 0 {
+			coldStartPenalty = 100
+		}
 	}
-	return 125
+
+	evictionPenalty := int64(0)
+	if stats.LastEvictionCount > 0 {
+		evictionPenalty = 25 * stats.LastEvictionCount
+	}
+	return base + coldStartPenalty + evictionPenalty
 }
 
-func (s *Service) observedLLMStats(modelName, modelVersion string) map[string]llmWorkerStats {
-	streams, err := s.listStreams(context.Background(), "llm:")
-	if err != nil {
-		return nil
-	}
-	out := make(map[string]llmWorkerStats)
+func (s *Service) materializedLLMStats(modelName, modelVersion string) map[string]llmWorkerStats {
 	if modelVersion == "" {
 		modelVersion = "v1"
 	}
-	for _, streamID := range streams {
-		records, err := s.readAllLog(context.Background(), streamID)
-		if err != nil {
+	out := make(map[string]llmWorkerStats)
+	s.llmStatsMu.RLock()
+	defer s.llmStatsMu.RUnlock()
+	for key, stats := range s.llmStats {
+		if key.modelName == modelName && key.modelVersion == modelVersion {
+			out[key.workerID] = stats
+		}
+	}
+	return out
+}
+
+func (s *Service) llmStatsForWorker(modelName, modelVersion, workerID string) (llmWorkerStats, bool) {
+	if modelVersion == "" {
+		modelVersion = "v1"
+	}
+	s.llmStatsMu.RLock()
+	defer s.llmStatsMu.RUnlock()
+	stats, ok := s.llmStats[llmStatsKey{
+		modelName:    modelName,
+		modelVersion: modelVersion,
+		workerID:     workerID,
+	}]
+	return stats, ok
+}
+
+func (s *Service) materializeLLMTaskCompletion(ctx context.Context, taskID string) error {
+	records, err := s.readAllLog(ctx, llmStream(taskID))
+	if err != nil {
+		return err
+	}
+	for _, rec := range records {
+		if rec.GetEventType() != "LLMCompleted" {
 			continue
+		}
+		var payload llmEventPayload
+		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+			return err
+		}
+		if payload.TimestampMs == 0 {
+			payload.TimestampMs = rec.GetTimestampMs()
+		}
+		s.materializeLLMCompleted(payload)
+		return nil
+	}
+	return nil
+}
+
+func (s *Service) materializeLLMCompleted(payload llmEventPayload) {
+	if payload.ModelName == "" || payload.WorkerID == "" || payload.TotalLatencyMs <= 0 {
+		return
+	}
+	modelVersion := firstNonEmpty(payload.ModelVersion, "v1")
+	updatedAt := payload.TimestampMs
+	if updatedAt == 0 {
+		updatedAt = time.Now().UnixMilli()
+	}
+	key := llmStatsKey{
+		modelName:    payload.ModelName,
+		modelVersion: modelVersion,
+		workerID:     payload.WorkerID,
+	}
+
+	s.llmStatsMu.Lock()
+	defer s.llmStatsMu.Unlock()
+	stats := s.llmStats[key]
+	stats.RequestCount++
+	if payload.CacheHit {
+		stats.CacheHitCount++
+	}
+	stats.EWMATotalLatencyMs = updateEWMA(stats.EWMATotalLatencyMs, payload.TotalLatencyMs, stats.RequestCount)
+	stats.EWMAModelLoadMs = updateEWMA(stats.EWMAModelLoadMs, payload.ModelLoadMs, stats.RequestCount)
+	stats.EWMACheckpointFetchMs = updateEWMA(stats.EWMACheckpointFetchMs, payload.CheckpointFetchMs, stats.RequestCount)
+	stats.LastEvictionCount = payload.EvictionCount
+	stats.LastUpdatedMs = updatedAt
+	s.llmStats[key] = stats
+}
+
+func updateEWMA(previous, sample int64, count uint64) int64 {
+	if count <= 1 {
+		return sample
+	}
+	return (previous*7 + sample*3) / 10
+}
+
+func (s *Service) bootstrapLLMStats(ctx context.Context) error {
+	streams, err := s.listStreams(ctx, "llm:")
+	if err != nil {
+		return err
+	}
+	s.llmStatsMu.Lock()
+	s.llmStats = make(map[llmStatsKey]llmWorkerStats)
+	s.llmStatsMu.Unlock()
+	for _, streamID := range streams {
+		records, err := s.readAllLog(ctx, streamID)
+		if err != nil {
+			return err
 		}
 		for _, rec := range records {
 			if rec.GetEventType() != "LLMCompleted" {
@@ -320,21 +433,15 @@ func (s *Service) observedLLMStats(modelName, modelVersion string) map[string]ll
 			}
 			var payload llmEventPayload
 			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
-				continue
+				return err
 			}
-			if payload.ModelName != modelName || firstNonEmpty(payload.ModelVersion, "v1") != modelVersion {
-				continue
+			if payload.TimestampMs == 0 {
+				payload.TimestampMs = rec.GetTimestampMs()
 			}
-			if payload.WorkerID == "" || payload.TotalLatencyMs <= 0 {
-				continue
-			}
-			stats := out[payload.WorkerID]
-			stats.count++
-			stats.totalLatencyMs += payload.TotalLatencyMs
-			out[payload.WorkerID] = stats
+			s.materializeLLMCompleted(payload)
 		}
 	}
-	return out
+	return nil
 }
 
 func workerHasCapacity(worker metadata.Worker) bool {

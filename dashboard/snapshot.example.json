@@ -4,6 +4,8 @@
   "redeliveryTimeoutMs": 30000,
   "lastLogAppendMs": 0,
   "logAppendSlowMs": 0,
+  "compactableLogRecords": 0,
+  "compactableLogBytes": 0,
   "schedulingPolicy": "SCHEDULING_POLICY_LOCALITY_AWARE",
   "tasks": [],
   "workflows": [],

@@ -440,17 +440,33 @@ func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) er
 	now := actor.NowMs()
 	payload, _ := json.Marshal(actor.EventPayload{
 		ActorID:              state.ActorID,
+		ClassName:            state.ClassName,
+		ClassSource:          state.ClassSource,
+		InitArgsJSON:         state.InitArgsJSON,
 		SnapshotRef:          ref,
+		SnapshotEvery:        state.SnapshotEvery,
 		SnapshotCommandCount: state.CommandCount,
 		TimestampMs:          now,
 	})
-	if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+	snapshotResp, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       actorStream(state.ActorID),
 		EventType:      "ActorSnapshotCreated",
 		IdempotencyKey: fmt.Sprintf("%s:snapshot:%d", state.ActorID, state.CommandCount),
 		Payload:        payload,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
+	}
+	if snapshotResp.GetSeq() > 1 {
+		if _, err := s.log.TrimStream(ctx, &logservepb.TrimStreamRequest{
+			StreamId:  actorStream(state.ActorID),
+			BeforeSeq: snapshotResp.GetSeq(),
+		}); err != nil {
+			observability.Error("actor_stream_trim_failed", err, map[string]any{
+				"actor_id":   state.ActorID,
+				"before_seq": snapshotResp.GetSeq(),
+			})
+		}
 	}
 	_, err = s.meta.UpdateActor(state.ActorID, func(current *actor.State) error {
 		current.SnapshotRef = ref

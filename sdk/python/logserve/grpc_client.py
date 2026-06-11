@@ -216,6 +216,8 @@ class GrpcControlTransport:
             "scheduling_policy": _scheduling_policy_name(resp.scheduling_policy),
             "last_log_append_ms": resp.last_log_append_ms,
             "log_append_slow_ms": resp.log_append_slow_ms,
+            "compactable_log_records": getattr(resp, "compactable_log_records", 0),
+            "compactable_log_bytes": getattr(resp, "compactable_log_bytes", 0),
         }
 
     def _wait_task(self, task_id, timeout=None):

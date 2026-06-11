@@ -394,6 +394,8 @@ message DashboardSnapshot {
   repeated ModelInfo models = 9;
   int64 last_log_append_ms = 10;
   int64 log_append_slow_ms = 11;
+  uint64 compactable_log_records = 12;
+  uint64 compactable_log_bytes = 13;
 }
 
 message GetDashboardSnapshotRequest {}

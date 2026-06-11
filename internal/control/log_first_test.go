@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -26,6 +27,14 @@ func (c failingLogClient) ReadLog(context.Context, *logservepb.ReadLogRequest, .
 
 func (c failingLogClient) ListStreams(context.Context, *logservepb.ListStreamsRequest, ...grpc.CallOption) (*logservepb.ListStreamsResponse, error) {
 	return &logservepb.ListStreamsResponse{}, nil
+}
+
+func (c failingLogClient) TrimStream(context.Context, *logservepb.TrimStreamRequest, ...grpc.CallOption) (*logservepb.TrimStreamResponse, error) {
+	return &logservepb.TrimStreamResponse{}, nil
+}
+
+func (c failingLogClient) GetStreamStats(context.Context, *logservepb.GetStreamStatsRequest, ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error) {
+	return &logservepb.GetStreamStatsResponse{}, nil
 }
 
 func TestSubmitWorkflowAppendFailureDoesNotCreateMetadataOnlyWorkflow(t *testing.T) {
@@ -189,6 +198,55 @@ func TestRedeliveryAppendFailureDoesNotRequeueTask(t *testing.T) {
 	}
 	if len(service.queue) != 0 {
 		t.Fatalf("queue len = %d, want 0", len(service.queue))
+	}
+}
+
+func TestReplayTaskSpecIgnoresStaleCompletionAfterRedelivery(t *testing.T) {
+	spec := &logservepb.TaskSpec{
+		TaskId:         "task-stale-replay",
+		TaskName:       "stale",
+		FunctionName:   "stale",
+		FunctionSource: "def stale():\n    return \"ok\"\n",
+	}
+	submittedPayload, err := marshalTaskSubmittedPayload(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedPayload, _ := json.Marshal(map[string]any{
+		"task_lease_epoch": uint64(1),
+	})
+	redeliveredPayload, _ := json.Marshal(map[string]any{
+		"task_lease_epoch": uint64(1),
+	})
+	completedPayload, _ := json.Marshal(map[string]any{
+		"task_lease_epoch": uint64(1),
+		"result_json":      json.RawMessage(`"stale"`),
+	})
+
+	_, status, _, ok, err := replayTaskSpec([]*logservepb.LogRecord{
+		taskRecord("TaskSubmitted", submittedPayload),
+		taskRecord("TaskStarted", startedPayload),
+		taskRecord("TaskRedelivered", redeliveredPayload),
+		taskRecord("TaskCompleted", completedPayload),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("task spec was not replayed")
+	}
+	if status != logservepb.TaskStatus_TASK_STATUS_QUEUED {
+		t.Fatalf("status = %s, want QUEUED after stale completion", status)
+	}
+}
+
+func taskRecord(eventType string, payload []byte) *logservepb.LogRecord {
+	return &logservepb.LogRecord{
+		StreamId:    "task:task-stale-replay",
+		Seq:         1,
+		EventType:   eventType,
+		Payload:     payload,
+		TimestampMs: time.Now().UnixMilli(),
 	}
 }
 

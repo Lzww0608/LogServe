@@ -22,6 +22,7 @@ const (
 	headerSize                     = 36
 	defaultSegmentSizeBytes int64  = 64 << 20
 	defaultFsyncInterval           = 100 * time.Millisecond
+	retentionFileName              = "retention.json"
 )
 
 var errCorruptRecord = errors.New("corrupt log record")
@@ -77,6 +78,7 @@ type Store struct {
 	nextSeq            map[string]uint64
 	index              map[string][]indexEntry
 	idempotency        map[string]Record
+	trimBefore         map[string]uint64
 	lastSync           time.Time
 }
 
@@ -86,6 +88,15 @@ type indexEntry struct {
 	SegmentID uint64
 	Offset    int64
 	Length    int64
+}
+
+type retentionFile struct {
+	Streams map[string]retentionStream `json:"streams"`
+}
+
+type retentionStream struct {
+	TrimmedBeforeSeq uint64 `json:"trimmed_before_seq"`
+	UpdatedAtMs      int64  `json:"updated_at_ms"`
 }
 
 func Open(dir string) (*Store, error) {
@@ -107,9 +118,13 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 		nextSeq:     make(map[string]uint64),
 		index:       make(map[string][]indexEntry),
 		idempotency: make(map[string]Record),
+		trimBefore:  make(map[string]uint64),
 	}
 
 	if err := s.recover(); err != nil {
+		return nil, err
+	}
+	if err := s.loadRetention(); err != nil {
 		return nil, err
 	}
 	if err := s.openActiveFilesLocked(); err != nil {
@@ -203,6 +218,9 @@ func (s *Store) Read(streamID string, fromSeq uint64, limit int) ([]Record, erro
 	}
 
 	s.mu.Lock()
+	if trimmedBefore := s.trimBefore[streamID]; trimmedBefore > fromSeq {
+		fromSeq = trimmedBefore
+	}
 	entries := s.index[streamID]
 	selected := make([]indexEntry, 0, min(limit, len(entries)))
 	for _, entry := range entries {
@@ -247,6 +265,68 @@ func (s *Store) Read(streamID string, fromSeq uint64, limit int) ([]Record, erro
 	return out, nil
 }
 
+func (s *Store) Trim(streamID string, beforeSeq uint64) (TrimStats, error) {
+	if streamID == "" {
+		return TrimStats{}, errors.New("stream_id is required")
+	}
+	if beforeSeq == 0 {
+		return TrimStats{}, errors.New("before_seq is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.index[streamID]; !ok && s.nextSeq[streamID] == 0 {
+		return TrimStats{}, fmt.Errorf("stream %q not found", streamID)
+	}
+	nextSeq := s.nextSeq[streamID]
+	if nextSeq == 0 {
+		nextSeq = 1
+	}
+	if beforeSeq > nextSeq {
+		beforeSeq = nextSeq
+	}
+	if beforeSeq < 1 {
+		beforeSeq = 1
+	}
+	if beforeSeq > s.trimBefore[streamID] {
+		s.trimBefore[streamID] = beforeSeq
+		if err := s.persistRetentionLocked(); err != nil {
+			return TrimStats{}, err
+		}
+	}
+	return s.streamStatsLocked(streamID), nil
+}
+
+func (s *Store) Stats(streamID, prefix string) []TrimStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	streams := make(map[string]bool)
+	for id := range s.index {
+		streams[id] = true
+	}
+	for id := range s.trimBefore {
+		streams[id] = true
+	}
+	ids := make([]string, 0, len(streams))
+	for id := range streams {
+		if streamID != "" && id != streamID {
+			continue
+		}
+		if prefix != "" && !strings.HasPrefix(id, prefix) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]TrimStats, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, s.streamStatsLocked(id))
+	}
+	return out
+}
+
 func (s *Store) ListStreams(prefix string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -281,6 +361,84 @@ func (s *Store) recover() error {
 		s.activeSegmentBytes = size
 	}
 	return s.rewriteIndex()
+}
+
+func (s *Store) loadRetention() error {
+	path := filepath.Join(s.dir, retentionFileName)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var file retentionFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return err
+	}
+	for streamID, meta := range file.Streams {
+		if streamID == "" || meta.TrimmedBeforeSeq == 0 {
+			continue
+		}
+		s.trimBefore[streamID] = meta.TrimmedBeforeSeq
+	}
+	return nil
+}
+
+func (s *Store) persistRetentionLocked() error {
+	file := retentionFile{Streams: make(map[string]retentionStream, len(s.trimBefore))}
+	now := time.Now().UnixMilli()
+	for streamID, beforeSeq := range s.trimBefore {
+		if beforeSeq == 0 {
+			continue
+		}
+		file.Streams[streamID] = retentionStream{
+			TrimmedBeforeSeq: beforeSeq,
+			UpdatedAtMs:      now,
+		}
+	}
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(s.dir, retentionFileName)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func (s *Store) streamStatsLocked(streamID string) TrimStats {
+	entries := s.index[streamID]
+	trimmedBefore := s.trimBefore[streamID]
+	nextSeq := s.nextSeq[streamID]
+	if nextSeq == 0 {
+		nextSeq = 1
+	}
+	stats := TrimStats{
+		StreamID:         streamID,
+		NextSeq:          nextSeq,
+		TrimmedBeforeSeq: trimmedBefore,
+	}
+	for _, entry := range entries {
+		if trimmedBefore > 0 && entry.Seq < trimmedBefore {
+			stats.CompactableRecords++
+			stats.CompactableBytes += uint64(entry.Length)
+			continue
+		}
+		if stats.FirstSeq == 0 || entry.Seq < stats.FirstSeq {
+			stats.FirstSeq = entry.Seq
+		}
+	}
+	if stats.FirstSeq == 0 {
+		stats.FirstSeq = nextSeq
+	}
+	return stats
 }
 
 func (s *Store) recoverSegment(segmentID uint64) (int64, error) {

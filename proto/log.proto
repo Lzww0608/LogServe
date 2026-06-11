@@ -46,8 +46,40 @@ message ListStreamsResponse {
   repeated string stream_ids = 1;
 }
 
+message TrimStreamRequest {
+  string stream_id = 1;
+  uint64 before_seq = 2;
+}
+
+message TrimStreamResponse {
+  string stream_id = 1;
+  uint64 trimmed_before_seq = 2;
+  uint64 compactable_records = 3;
+  uint64 compactable_bytes = 4;
+}
+
+message StreamStats {
+  string stream_id = 1;
+  uint64 first_seq = 2;
+  uint64 next_seq = 3;
+  uint64 trimmed_before_seq = 4;
+  uint64 compactable_records = 5;
+  uint64 compactable_bytes = 6;
+}
+
+message GetStreamStatsRequest {
+  string stream_id = 1;
+  string prefix = 2;
+}
+
+message GetStreamStatsResponse {
+  repeated StreamStats streams = 1;
+}
+
 service LogService {
   rpc AppendLog(AppendLogRequest) returns (AppendLogResponse);
   rpc ReadLog(ReadLogRequest) returns (ReadLogResponse);
   rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
+  rpc TrimStream(TrimStreamRequest) returns (TrimStreamResponse);
+  rpc GetStreamStats(GetStreamStatsRequest) returns (GetStreamStatsResponse);
 }

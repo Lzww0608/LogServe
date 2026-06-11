@@ -26,6 +26,9 @@ func main() {
 	executorPath := flag.String("executor", filepath.Join("executor", "python", "server.py"), "python executor path")
 	models := flag.String("models", "", "comma-separated cached models, for example model-A:v1")
 	capacity := flag.Uint("capacity", 1, "worker task capacity")
+	taskPoolSize := flag.Int("task-pool-size", 0, "local Python task executor pool size; 0 follows capacity")
+	llmPoolSize := flag.Int("llm-pool-size", 0, "local LLM executor pool size; 0 follows capacity")
+	actorPoolSize := flag.Int("actor-pool-size", 0, "local actor executor pool size; per-actor ordering is still enforced")
 	vllmBaseURL := flag.String("vllm-base-url", "", "vLLM OpenAI-compatible base URL")
 	modelSourceDir := flag.String("model-source-dir", "", "source directory for mock model checkpoints")
 	modelCacheDir := flag.String("model-cache-dir", "", "local directory used as the mock model checkpoint cache")
@@ -55,6 +58,9 @@ func main() {
 			PollInterval:             100 * time.Millisecond,
 			CachedModels:             splitCSV(*models),
 			Capacity:                 uint32(*capacity),
+			TaskPoolSize:             *taskPoolSize,
+			LLMPoolSize:              *llmPoolSize,
+			ActorPoolSize:            *actorPoolSize,
 			VLLMBaseURL:              *vllmBaseURL,
 			ModelCheckpointSourceDir: *modelSourceDir,
 			ModelCacheDir:            *modelCacheDir,

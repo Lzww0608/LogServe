@@ -332,7 +332,9 @@ func (s *MemoryStore) UpsertWorker(worker Worker) {
 	if existing, ok := s.workers[worker.WorkerID]; ok {
 		worker.RunningTasks = existing.RunningTasks
 	}
-	worker.LastHeartbeat = time.Now().UnixMilli()
+	if worker.LastHeartbeat == 0 {
+		worker.LastHeartbeat = time.Now().UnixMilli()
+	}
 	s.workers[worker.WorkerID] = cloneWorker(worker)
 }
 

@@ -75,18 +75,30 @@ func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := countWorkflowEvent(records.GetRecords(), "ActorCreated"); got != 1 {
-		t.Fatalf("ActorCreated events = %d, want 1", got)
+	if got := countWorkflowEvent(records.GetRecords(), "ActorCreated"); got != 0 {
+		t.Fatalf("ActorCreated events after trim = %d, want 0", got)
 	}
-	if got := countWorkflowEvent(records.GetRecords(), "ActorCommandApplied"); got != 101 {
-		t.Fatalf("ActorCommandApplied events = %d, want 101", got)
+	if got := countWorkflowEvent(records.GetRecords(), "ActorCommandApplied"); got != 1 {
+		t.Fatalf("tail ActorCommandApplied events after trim = %d, want 1", got)
 	}
-	if got := countWorkflowEvent(records.GetRecords(), "ActorCommandSubmitted"); got != 101 {
-		t.Fatalf("ActorCommandSubmitted events = %d, want 101", got)
+	if got := countWorkflowEvent(records.GetRecords(), "ActorCommandSubmitted"); got != 1 {
+		t.Fatalf("tail ActorCommandSubmitted events after trim = %d, want 1", got)
 	}
 	assertActorCommandSubmittedBeforeApplied(t, records.GetRecords())
 	if got := countWorkflowEvent(records.GetRecords(), "ActorSnapshotCreated"); got == 0 {
 		t.Fatal("ActorSnapshotCreated event missing")
+	}
+	stats, err := env.logClient.GetStreamStats(context.Background(), &logservepb.GetStreamStatsRequest{
+		StreamId: "actor:" + created.GetActorId(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.GetStreams()) != 1 {
+		t.Fatalf("stream stats = %d, want 1", len(stats.GetStreams()))
+	}
+	if stats.GetStreams()[0].GetCompactableRecords() == 0 || stats.GetStreams()[0].GetCompactableBytes() == 0 {
+		t.Fatalf("actor stream compactable stats missing: %+v", stats.GetStreams()[0])
 	}
 }
 

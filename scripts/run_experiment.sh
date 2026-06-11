@@ -27,6 +27,10 @@ LOG_ADDR="${LOGSERVE_EXPERIMENT_LOG_ADDR:-$DEFAULT_LOG_ADDR}"
 CONTROL_ADDR="${LOGSERVE_EXPERIMENT_CONTROL_ADDR:-$DEFAULT_CONTROL_ADDR}"
 CHECKPOINT_SOURCE_DIR="${LOGSERVE_CHECKPOINT_SOURCE_DIR:-"$DATA_DIR/checkpoints"}"
 CHECKPOINT_CACHE_BYTES="${LOGSERVE_CHECKPOINT_CACHE_BYTES:-16777216}"
+WORKER_CAPACITY="${LOGSERVE_WORKER_CAPACITY:-1}"
+TASK_POOL_SIZE="${LOGSERVE_TASK_POOL_SIZE:-0}"
+LLM_POOL_SIZE="${LOGSERVE_LLM_POOL_SIZE:-0}"
+ACTOR_POOL_SIZE="${LOGSERVE_ACTOR_POOL_SIZE:-0}"
 
 mkdir -p "$RUN_DIR" "$DATA_DIR"
 : > "$STATUS_FILE"
@@ -188,6 +192,10 @@ write_environment() {
     echo "control_addr=$CONTROL_ADDR"
     echo "checkpoint_source_dir=$CHECKPOINT_SOURCE_DIR"
     echo "checkpoint_cache_bytes=$CHECKPOINT_CACHE_BYTES"
+    echo "worker_capacity=$WORKER_CAPACITY"
+    echo "task_pool_size=$TASK_POOL_SIZE"
+    echo "llm_pool_size=$LLM_POOL_SIZE"
+    echo "actor_pool_size=$ACTOR_POOL_SIZE"
     echo "generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo
     uname -a || true
@@ -225,11 +233,11 @@ start_runtime() {
   fi
   record_status runtime_control_start 0 0 control.log
 
-  start_bg worker_1 go run ./cmd/logserve-worker --worker-id bench-worker-1 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-1" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  start_bg worker_1 go run ./cmd/logserve-worker --worker-id bench-worker-1 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-1" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
   local worker_1_pid="$LAST_BG_PID"
-  start_bg worker_2 go run ./cmd/logserve-worker --worker-id bench-worker-2 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-2" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  start_bg worker_2 go run ./cmd/logserve-worker --worker-id bench-worker-2 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-2" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
   local worker_2_pid="$LAST_BG_PID"
-  start_bg worker_3 go run ./cmd/logserve-worker --worker-id bench-worker-3 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity 1 --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-3" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  start_bg worker_3 go run ./cmd/logserve-worker --worker-id bench-worker-3 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-3" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
   local worker_3_pid="$LAST_BG_PID"
   sleep 4
   local worker_start_code=0

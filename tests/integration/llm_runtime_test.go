@@ -60,8 +60,9 @@ func TestLLMPredictedLatencySchedulerUsesObservedHistory(t *testing.T) {
 	defer env.stop()
 	registerLLMWorkers(t, env.controlClient)
 	registerTestModels(t, env.controlClient)
-	seedLLMObservation(t, env.logClient, "slow-cached", "model-A", "v1", "worker-1", true, 200)
-	seedLLMObservation(t, env.logClient, "fast-cold", "model-A", "v1", "worker-2", false, 20)
+	setPolicy(t, env.controlClient, logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY)
+	recordLLMObservation(t, env, "worker-1", "model-A", "v1", true, 200, 5, 0)
+	recordLLMObservation(t, env, "worker-2", "model-A", "v1", false, 20, 1, 1)
 	setPolicy(t, env.controlClient, logservepb.SchedulingPolicy_SCHEDULING_POLICY_PREDICTED_LATENCY)
 
 	predictedTask := submitLLMForTest(t, env.controlClient, "model-A", "hello")
@@ -96,25 +97,45 @@ func TestLLMSubmitRequiresRegisteredModel(t *testing.T) {
 	}
 }
 
-func seedLLMObservation(t *testing.T, client logservepb.LogServiceClient, taskID, modelName, modelVersion, workerID string, cacheHit bool, totalLatencyMs int64) {
+func recordLLMObservation(t *testing.T, env *workflowTestEnv, workerID, modelName, modelVersion string, cacheHit bool, totalLatencyMs, modelLoadMs, checkpointFetchMs int64) {
 	t.Helper()
+	submitted := submitLLMForTest(t, env.controlClient, modelName, "history")
+	poll, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: workerID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !poll.GetHasTask() || poll.GetTask().GetTaskId() != submitted.GetTaskId() {
+		t.Fatalf("history observation poll by %s = %v, want task %s", workerID, poll, submitted.GetTaskId())
+	}
+	taskID := poll.GetTask().GetTaskId()
 	payload, err := json.Marshal(map[string]any{
-		"task_id":          taskID,
-		"model_name":       modelName,
-		"model_version":    modelVersion,
-		"worker_id":        workerID,
-		"cache_hit":        cacheHit,
-		"total_latency_ms": totalLatencyMs,
-		"timestamp_ms":     time.Now().UnixMilli(),
+		"task_id":             taskID,
+		"model_name":          modelName,
+		"model_version":       modelVersion,
+		"worker_id":           workerID,
+		"cache_hit":           cacheHit,
+		"model_load_ms":       modelLoadMs,
+		"checkpoint_fetch_ms": checkpointFetchMs,
+		"total_latency_ms":    totalLatencyMs,
+		"timestamp_ms":        time.Now().UnixMilli(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.AppendLog(context.Background(), &logservepb.AppendLogRequest{
+	if _, err := env.logClient.AppendLog(context.Background(), &logservepb.AppendLogRequest{
 		StreamId:       "llm:" + taskID,
 		EventType:      "LLMCompleted",
 		IdempotencyKey: "seed:" + taskID,
 		Payload:        payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.controlClient.CompleteTask(context.Background(), &logservepb.CompleteTaskRequest{
+		TaskId:         taskID,
+		WorkerId:       workerID,
+		Status:         logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
+		ResultJson:     []byte(`"ok"`),
+		TaskLeaseEpoch: poll.GetTask().GetTaskLeaseEpoch(),
 	}); err != nil {
 		t.Fatal(err)
 	}

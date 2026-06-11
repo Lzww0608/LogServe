@@ -33,6 +33,10 @@ type taskSubmittedPayload struct {
 	TaskSpec json.RawMessage `json:"task_spec,omitempty"`
 }
 
+type taskLifecyclePayload struct {
+	TaskLeaseEpoch uint64 `json:"task_lease_epoch,omitempty"`
+}
+
 type Service struct {
 	logservepb.UnimplementedControlServiceServer
 	meta                  metadata.Store
@@ -41,6 +45,8 @@ type Service struct {
 	queue                 []string
 	specMu                sync.RWMutex
 	specs                 map[string]*logservepb.TaskSpec
+	llmStatsMu            sync.RWMutex
+	llmStats              map[llmStatsKey]llmWorkerStats
 	workflowMu            sync.Mutex
 	actorLocksMu          sync.Mutex
 	actorLocks            map[string]*sync.Mutex
@@ -68,6 +74,7 @@ func NewServiceWithResultStore(meta metadata.Store, logClient logservepb.LogServ
 		log:                   logClient,
 		queue:                 make([]string, 0, 1024),
 		specs:                 make(map[string]*logservepb.TaskSpec),
+		llmStats:              make(map[llmStatsKey]llmWorkerStats),
 		actorLocks:            make(map[string]*sync.Mutex),
 		resultStore:           store,
 		resultInlineThreshold: threshold,
@@ -390,6 +397,12 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 	}
 	if ok && existing.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
 		s.meta.DecrementWorkerLoad(req.GetWorkerId())
+	}
+	wasTerminal := ok && isTerminalTaskStatus(existing.Status)
+	if task.LLMModelName != "" && req.GetStatus() == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED && !wasTerminal {
+		if err := s.materializeLLMTaskCompletion(ctx, task.TaskID); err != nil {
+			observability.Error("llm_stats_materialize_failed", err, map[string]any{"task_id": task.TaskID, "worker_id": req.GetWorkerId()})
+		}
 	}
 	if task.WorkflowID != "" {
 		shouldSchedule, err := s.completeWorkflowStep(ctx, task, req.GetStatus(), req.GetResultJson(), req.GetError())

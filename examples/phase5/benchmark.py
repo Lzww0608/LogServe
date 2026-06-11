@@ -4,6 +4,7 @@ import statistics
 import time
 
 from logserve import (
+    LogServeClient,
     actor,
     create_actor,
     llm_generate,
@@ -150,16 +151,20 @@ def actor_snapshot_ablation(commands):
     without_snapshot.get()
     snap = replay_actor(with_snapshot.actor_id)
     no_snap = replay_actor(without_snapshot.actor_id)
+    dashboard = LogServeClient().transport.run("dashboard-snapshot")
     return {
         "commands": commands,
         "snapshot_enabled": {
             "full_replay_commands": pick(snap, "full_replay_commands", "fullReplayCommands"),
             "snapshot_replay_commands": pick(snap, "snapshot_replay_commands", "snapshotReplayCommands"),
+            "trimmed_replay_commands": pick(snap, "snapshot_replay_commands", "snapshotReplayCommands"),
         },
         "snapshot_disabled": {
             "full_replay_commands": pick(no_snap, "full_replay_commands", "fullReplayCommands"),
             "snapshot_replay_commands": pick(no_snap, "snapshot_replay_commands", "snapshotReplayCommands"),
         },
+        "compactable_log_records": pick_int(dashboard, "compactable_log_records", "compactableLogRecords"),
+        "compactable_log_bytes": pick_int(dashboard, "compactable_log_bytes", "compactableLogBytes"),
     }
 
 

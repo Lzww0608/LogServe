@@ -24,6 +24,14 @@ func (c acceptingLogClient) ListStreams(context.Context, *logservepb.ListStreams
 	return &logservepb.ListStreamsResponse{}, nil
 }
 
+func (c acceptingLogClient) TrimStream(context.Context, *logservepb.TrimStreamRequest, ...grpc.CallOption) (*logservepb.TrimStreamResponse, error) {
+	return &logservepb.TrimStreamResponse{}, nil
+}
+
+func (c acceptingLogClient) GetStreamStats(context.Context, *logservepb.GetStreamStatsRequest, ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error) {
+	return &logservepb.GetStreamStatsResponse{}, nil
+}
+
 func TestSubmitTaskIdempotencyKeyAllowsSamePayload(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), acceptingLogClient{}, nil, 0)
 

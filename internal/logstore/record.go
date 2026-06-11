@@ -16,3 +16,12 @@ type AppendRequest struct {
 	IdempotencyKey string
 	Payload        []byte
 }
+
+type TrimStats struct {
+	StreamID           string
+	FirstSeq           uint64
+	NextSeq            uint64
+	TrimmedBeforeSeq   uint64
+	CompactableRecords uint64
+	CompactableBytes   uint64
+}

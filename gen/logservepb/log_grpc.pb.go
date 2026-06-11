@@ -19,9 +19,11 @@ import (
 const _ = grpc.SupportPackageIsVersion8
 
 const (
-	LogService_AppendLog_FullMethodName   = "/logserve.v1.LogService/AppendLog"
-	LogService_ReadLog_FullMethodName     = "/logserve.v1.LogService/ReadLog"
-	LogService_ListStreams_FullMethodName = "/logserve.v1.LogService/ListStreams"
+	LogService_AppendLog_FullMethodName      = "/logserve.v1.LogService/AppendLog"
+	LogService_ReadLog_FullMethodName        = "/logserve.v1.LogService/ReadLog"
+	LogService_ListStreams_FullMethodName    = "/logserve.v1.LogService/ListStreams"
+	LogService_TrimStream_FullMethodName     = "/logserve.v1.LogService/TrimStream"
+	LogService_GetStreamStats_FullMethodName = "/logserve.v1.LogService/GetStreamStats"
 )
 
 // LogServiceClient is the client API for LogService service.
@@ -31,6 +33,8 @@ type LogServiceClient interface {
 	AppendLog(ctx context.Context, in *AppendLogRequest, opts ...grpc.CallOption) (*AppendLogResponse, error)
 	ReadLog(ctx context.Context, in *ReadLogRequest, opts ...grpc.CallOption) (*ReadLogResponse, error)
 	ListStreams(ctx context.Context, in *ListStreamsRequest, opts ...grpc.CallOption) (*ListStreamsResponse, error)
+	TrimStream(ctx context.Context, in *TrimStreamRequest, opts ...grpc.CallOption) (*TrimStreamResponse, error)
+	GetStreamStats(ctx context.Context, in *GetStreamStatsRequest, opts ...grpc.CallOption) (*GetStreamStatsResponse, error)
 }
 
 type logServiceClient struct {
@@ -71,6 +75,26 @@ func (c *logServiceClient) ListStreams(ctx context.Context, in *ListStreamsReque
 	return out, nil
 }
 
+func (c *logServiceClient) TrimStream(ctx context.Context, in *TrimStreamRequest, opts ...grpc.CallOption) (*TrimStreamResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TrimStreamResponse)
+	err := c.cc.Invoke(ctx, LogService_TrimStream_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *logServiceClient) GetStreamStats(ctx context.Context, in *GetStreamStatsRequest, opts ...grpc.CallOption) (*GetStreamStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetStreamStatsResponse)
+	err := c.cc.Invoke(ctx, LogService_GetStreamStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LogServiceServer is the server API for LogService service.
 // All implementations must embed UnimplementedLogServiceServer
 // for forward compatibility
@@ -78,6 +102,8 @@ type LogServiceServer interface {
 	AppendLog(context.Context, *AppendLogRequest) (*AppendLogResponse, error)
 	ReadLog(context.Context, *ReadLogRequest) (*ReadLogResponse, error)
 	ListStreams(context.Context, *ListStreamsRequest) (*ListStreamsResponse, error)
+	TrimStream(context.Context, *TrimStreamRequest) (*TrimStreamResponse, error)
+	GetStreamStats(context.Context, *GetStreamStatsRequest) (*GetStreamStatsResponse, error)
 	mustEmbedUnimplementedLogServiceServer()
 }
 
@@ -93,6 +119,12 @@ func (UnimplementedLogServiceServer) ReadLog(context.Context, *ReadLogRequest) (
 }
 func (UnimplementedLogServiceServer) ListStreams(context.Context, *ListStreamsRequest) (*ListStreamsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListStreams not implemented")
+}
+func (UnimplementedLogServiceServer) TrimStream(context.Context, *TrimStreamRequest) (*TrimStreamResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TrimStream not implemented")
+}
+func (UnimplementedLogServiceServer) GetStreamStats(context.Context, *GetStreamStatsRequest) (*GetStreamStatsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetStreamStats not implemented")
 }
 func (UnimplementedLogServiceServer) mustEmbedUnimplementedLogServiceServer() {}
 
@@ -161,6 +193,42 @@ func _LogService_ListStreams_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LogService_TrimStream_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TrimStreamRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LogServiceServer).TrimStream(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LogService_TrimStream_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LogServiceServer).TrimStream(ctx, req.(*TrimStreamRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LogService_GetStreamStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetStreamStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LogServiceServer).GetStreamStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LogService_GetStreamStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LogServiceServer).GetStreamStats(ctx, req.(*GetStreamStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LogService_ServiceDesc is the grpc.ServiceDesc for LogService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -179,6 +247,14 @@ var LogService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListStreams",
 			Handler:    _LogService_ListStreams_Handler,
+		},
+		{
+			MethodName: "TrimStream",
+			Handler:    _LogService_TrimStream_Handler,
+		},
+		{
+			MethodName: "GetStreamStats",
+			Handler:    _LogService_GetStreamStats_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

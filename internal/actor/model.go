@@ -56,6 +56,8 @@ type ResultLoader interface {
 	LoadResult(ref string) ([]byte, error)
 }
 
+var errActorCreateEventNotFound = errors.New("actor create event not found")
+
 func NewState(actorID, className, classSource string, initArgsJSON []byte, snapshotEvery uint32, nowMs int64) State {
 	if snapshotEvery == 0 {
 		snapshotEvery = 25
@@ -81,15 +83,22 @@ type ReplayResult struct {
 func Replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader) (ReplayResult, error) {
 	full, err := replay(actorID, records, loader, false)
 	if err != nil {
-		return ReplayResult{}, err
+		if !errors.Is(err, errActorCreateEventNotFound) {
+			return ReplayResult{}, err
+		}
+		full = ReplayResult{}
 	}
 	withSnapshot, err := replay(actorID, records, loader, true)
 	if err != nil {
 		return ReplayResult{}, err
 	}
+	fullReplayCommands := full.FullReplayCommands
+	if withSnapshot.State.SnapshotCommandCount > 0 && fullReplayCommands <= withSnapshot.SnapshotReplayCommands {
+		fullReplayCommands = withSnapshot.State.CommandCount
+	}
 	return ReplayResult{
 		State:                  withSnapshot.State,
-		FullReplayCommands:     full.FullReplayCommands,
+		FullReplayCommands:     fullReplayCommands,
 		SnapshotReplayCommands: withSnapshot.SnapshotReplayCommands,
 	}, nil
 }
@@ -117,12 +126,16 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 				return ReplayResult{}, err
 			}
 			state.ActorID = actorID
+			state.ClassName = payload.ClassName
+			state.ClassSource = payload.ClassSource
+			state.InitArgsJSON = append([]byte(nil), payload.InitArgsJSON...)
 			state.Status = logservepb.ActorStatus_ACTOR_STATUS_ACTIVE
 			state.StateJSON = NormalizeJSON(data)
 			state.SnapshotRef = payload.SnapshotRef
 			state.SnapshotCommandCount = payload.SnapshotCommandCount
 			state.CommandCount = payload.SnapshotCommandCount
 			state.SubmittedCommandCount = payload.SnapshotCommandCount
+			state.SnapshotEvery = payload.SnapshotEvery
 			state.UpdatedAtMs = payload.TimestampMs
 			snapshotCommandCount = payload.SnapshotCommandCount
 		}
@@ -196,6 +209,20 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			state.UpdatedAtMs = payload.TimestampMs
 			commands++
 		case "ActorSnapshotCreated":
+			state.ActorID = actorID
+			if payload.ClassName != "" {
+				state.ClassName = payload.ClassName
+			}
+			if payload.ClassSource != "" {
+				state.ClassSource = payload.ClassSource
+			}
+			if len(payload.InitArgsJSON) > 0 {
+				state.InitArgsJSON = append([]byte(nil), payload.InitArgsJSON...)
+			}
+			if payload.SnapshotEvery > 0 {
+				state.SnapshotEvery = payload.SnapshotEvery
+			}
+			state.Status = logservepb.ActorStatus_ACTOR_STATUS_ACTIVE
 			state.SnapshotRef = payload.SnapshotRef
 			state.SnapshotCommandCount = payload.SnapshotCommandCount
 			state.UpdatedAtMs = payload.TimestampMs
@@ -212,7 +239,7 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 		}
 	}
 	if state.ActorID == "" {
-		return ReplayResult{}, errors.New("actor create event not found")
+		return ReplayResult{}, errActorCreateEventNotFound
 	}
 	if useSnapshot {
 		return ReplayResult{State: state, SnapshotReplayCommands: commands}, nil

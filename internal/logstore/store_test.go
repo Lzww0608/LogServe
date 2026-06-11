@@ -203,6 +203,75 @@ func TestIndexRebuiltFromSegments(t *testing.T) {
 	}
 }
 
+func TestLogicalTrimFiltersReadsAndReportsCompactableBytes(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("x"), 64)
+	for i := 0; i < 5; i++ {
+		if _, _, err := store.Append(AppendRequest{
+			StreamID:  "actor:trim",
+			EventType: "ActorCommandApplied",
+			Payload:   payload,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := store.Trim("actor:trim", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TrimmedBeforeSeq != 4 {
+		t.Fatalf("trimmed_before_seq = %d, want 4", stats.TrimmedBeforeSeq)
+	}
+	if stats.CompactableRecords != 3 {
+		t.Fatalf("compactable_records = %d, want 3", stats.CompactableRecords)
+	}
+	if stats.CompactableBytes == 0 {
+		t.Fatal("compactable bytes should be > 0")
+	}
+
+	records, err := store.Read("actor:trim", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("records = %d, want 2", len(records))
+	}
+	if records[0].Seq != 4 || records[1].Seq != 5 {
+		t.Fatalf("visible seqs = %d,%d want 4,5", records[0].Seq, records[1].Seq)
+	}
+
+	statsList := store.Stats("actor:trim", "")
+	if len(statsList) != 1 {
+		t.Fatalf("stats streams = %d, want 1", len(statsList))
+	}
+	if statsList[0].CompactableRecords != 3 || statsList[0].CompactableBytes != stats.CompactableBytes {
+		t.Fatalf("stats = %+v, want compactable records/bytes from trim response %+v", statsList[0], stats)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	records, err = recovered.Read("actor:trim", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Seq != 4 {
+		t.Fatalf("recovered visible records = %+v, want seq >= 4", records)
+	}
+	if recovered.Stats("actor:trim", "")[0].TrimmedBeforeSeq != 4 {
+		t.Fatalf("trim point was not recovered")
+	}
+}
+
 func TestFsyncPoliciesAppendAndRecover(t *testing.T) {
 	for _, policy := range []FsyncPolicy{FsyncBatch, FsyncInterval} {
 		t.Run(string(policy), func(t *testing.T) {

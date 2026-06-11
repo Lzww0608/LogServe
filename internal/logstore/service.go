@@ -56,3 +56,32 @@ func (s *Service) ReadLog(ctx context.Context, req *logservepb.ReadLogRequest) (
 func (s *Service) ListStreams(ctx context.Context, req *logservepb.ListStreamsRequest) (*logservepb.ListStreamsResponse, error) {
 	return &logservepb.ListStreamsResponse{StreamIds: s.store.ListStreams(req.GetPrefix())}, nil
 }
+
+func (s *Service) TrimStream(ctx context.Context, req *logservepb.TrimStreamRequest) (*logservepb.TrimStreamResponse, error) {
+	stats, err := s.store.Trim(req.GetStreamId(), req.GetBeforeSeq())
+	if err != nil {
+		return nil, err
+	}
+	return &logservepb.TrimStreamResponse{
+		StreamId:           stats.StreamID,
+		TrimmedBeforeSeq:   stats.TrimmedBeforeSeq,
+		CompactableRecords: stats.CompactableRecords,
+		CompactableBytes:   stats.CompactableBytes,
+	}, nil
+}
+
+func (s *Service) GetStreamStats(ctx context.Context, req *logservepb.GetStreamStatsRequest) (*logservepb.GetStreamStatsResponse, error) {
+	stats := s.store.Stats(req.GetStreamId(), req.GetPrefix())
+	out := make([]*logservepb.StreamStats, 0, len(stats))
+	for _, item := range stats {
+		out = append(out, &logservepb.StreamStats{
+			StreamId:           item.StreamID,
+			FirstSeq:           item.FirstSeq,
+			NextSeq:            item.NextSeq,
+			TrimmedBeforeSeq:   item.TrimmedBeforeSeq,
+			CompactableRecords: item.CompactableRecords,
+			CompactableBytes:   item.CompactableBytes,
+		})
+	}
+	return &logservepb.GetStreamStatsResponse{Streams: out}, nil
+}

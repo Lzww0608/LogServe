@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/logserve/logserve/gen/logservepb"
@@ -103,6 +104,65 @@ func TestModelCheckpointCacheReportsExistingCheckpointOnStartup(t *testing.T) {
 	})
 	if !cacheEntriesContain(restarted.entries(), "model-A", "v1") {
 		t.Fatalf("restarted cache entries = %v, want model-A:v1", restarted.entries())
+	}
+}
+
+func TestModelCheckpointCacheSerializesConcurrentColdLoads(t *testing.T) {
+	sourceDir := t.TempDir()
+	cacheDir := t.TempDir()
+	checkpointData := bytes.Repeat([]byte("z"), 2<<20)
+	writeCheckpoint(t, sourceDir, "model-A", "v1", checkpointData)
+
+	cache := newModelCache(Config{
+		ModelCheckpointSourceDir: sourceDir,
+		ModelCacheDir:            cacheDir,
+		ModelCacheCapacityBytes:  int64(len(checkpointData) * 2),
+	})
+
+	const callers = 12
+	start := make(chan struct{})
+	results := make(chan checkpointLoadResult, callers)
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result, err := cache.ensureCheckpoint(context.Background(), "model-A", "v1")
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- result
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	var misses, hits int
+	for result := range results {
+		if result.CacheHit {
+			hits++
+		} else {
+			misses++
+		}
+	}
+	if misses != 1 || hits != callers-1 {
+		t.Fatalf("concurrent cold loads misses/hits = %d/%d, want 1/%d", misses, hits, callers-1)
+	}
+	info, err := os.Stat(cache.checkpointPath("model-A", "v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != int64(len(checkpointData)) {
+		t.Fatalf("checkpoint size = %d, want %d", info.Size(), len(checkpointData))
 	}
 }
 

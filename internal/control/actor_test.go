@@ -36,6 +36,14 @@ func (c *recordingLogClient) ListStreams(context.Context, *logservepb.ListStream
 	return &logservepb.ListStreamsResponse{}, nil
 }
 
+func (c *recordingLogClient) TrimStream(context.Context, *logservepb.TrimStreamRequest, ...grpc.CallOption) (*logservepb.TrimStreamResponse, error) {
+	return &logservepb.TrimStreamResponse{}, nil
+}
+
+func (c *recordingLogClient) GetStreamStats(context.Context, *logservepb.GetStreamStatsRequest, ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error) {
+	return &logservepb.GetStreamStatsResponse{}, nil
+}
+
 func (c *recordingLogClient) countActorEvents(actorID, eventType string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

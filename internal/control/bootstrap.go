@@ -39,6 +39,9 @@ func (s *Service) BootstrapFromLog(ctx context.Context) error {
 	if err := s.bootstrapActors(ctx); err != nil {
 		return err
 	}
+	if err := s.bootstrapLLMStats(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -109,20 +112,28 @@ func replayTaskSpec(records []*logservepb.LogRecord) (*logservepb.TaskSpec, logs
 			spec = decoded
 			status = logservepb.TaskStatus_TASK_STATUS_QUEUED
 		case "TaskStarted":
-			var payload struct {
-				TaskLeaseEpoch uint64 `json:"task_lease_epoch"`
-			}
+			var payload taskLifecyclePayload
 			_ = json.Unmarshal(rec.GetPayload(), &payload)
 			if payload.TaskLeaseEpoch > leaseEpoch {
 				leaseEpoch = payload.TaskLeaseEpoch
 			}
 			status = logservepb.TaskStatus_TASK_STATUS_RUNNING
 		case "TaskRedelivered":
-			status = logservepb.TaskStatus_TASK_STATUS_QUEUED
+			if isTerminalTaskStatus(status) {
+				continue
+			}
+			payloadEpoch := taskEventLeaseEpoch(rec.GetPayload())
+			if payloadEpoch == 0 || payloadEpoch >= leaseEpoch {
+				status = logservepb.TaskStatus_TASK_STATUS_QUEUED
+			}
 		case "TaskCompleted":
-			status = logservepb.TaskStatus_TASK_STATUS_SUCCEEDED
+			if taskTerminalEventApplies(status, leaseEpoch, rec.GetPayload()) {
+				status = logservepb.TaskStatus_TASK_STATUS_SUCCEEDED
+			}
 		case "TaskFailed":
-			status = logservepb.TaskStatus_TASK_STATUS_FAILED
+			if taskTerminalEventApplies(status, leaseEpoch, rec.GetPayload()) {
+				status = logservepb.TaskStatus_TASK_STATUS_FAILED
+			}
 		}
 	}
 	if spec == nil {
@@ -133,6 +144,29 @@ func replayTaskSpec(records []*logservepb.LogRecord) (*logservepb.TaskSpec, logs
 		status = logservepb.TaskStatus_TASK_STATUS_QUEUED
 	}
 	return spec, status, leaseEpoch, true, nil
+}
+
+func taskTerminalEventApplies(status logservepb.TaskStatus, currentLeaseEpoch uint64, payload []byte) bool {
+	if isTerminalTaskStatus(status) {
+		return false
+	}
+	eventLeaseEpoch := taskEventLeaseEpoch(payload)
+	if eventLeaseEpoch == 0 {
+		return true
+	}
+	if status != logservepb.TaskStatus_TASK_STATUS_RUNNING {
+		return false
+	}
+	return eventLeaseEpoch == currentLeaseEpoch
+}
+
+func taskEventLeaseEpoch(payload []byte) uint64 {
+	var decoded taskLifecyclePayload
+	if len(payload) == 0 {
+		return 0
+	}
+	_ = json.Unmarshal(payload, &decoded)
+	return decoded.TaskLeaseEpoch
 }
 
 func (s *Service) bootstrapModels(ctx context.Context) error {
