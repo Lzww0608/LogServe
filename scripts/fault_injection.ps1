@@ -2,8 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $reportDir = Join-Path $root "reports"
-$reportPath = Join-Path $reportDir "phase5_fault_injection.json"
-$dataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("logserve-phase5-fault-" + [guid]::NewGuid().ToString("N"))
+$reportPath = Join-Path $reportDir "fault_injection.json"
+$dataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("logserve-fault-injection-" + [guid]::NewGuid().ToString("N"))
 $logAddr = "127.0.0.1:59151"
 $controlAddr = "127.0.0.1:59152"
 

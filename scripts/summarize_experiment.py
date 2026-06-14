@@ -39,7 +39,7 @@ def pct(value):
     return f"{value:.3f}" if isinstance(value, float) else str(value)
 
 
-def phase5_highlights(data):
+def benchmark_highlights(data):
     if not isinstance(data, dict):
         return {}, []
     highlights = {}
@@ -151,8 +151,8 @@ def dashboard_highlights(data):
     }
 
 
-def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard, checkpoint):
-    phase5_summary, notes = phase5_highlights(phase5)
+def write_summary(run_dir, statuses, benchmark, logstore, fault, dashboard, checkpoint):
+    benchmark_summary, notes = benchmark_highlights(benchmark)
     logstore_summary = logstore_highlights(logstore)
     checkpoint_summary = checkpoint_highlights(checkpoint)
     dashboard_summary = dashboard_highlights(dashboard)
@@ -160,7 +160,7 @@ def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard, checkpo
     summary = {
         "run_dir": str(run_dir),
         "commands": statuses,
-        "phase5": phase5_summary,
+        "benchmark": benchmark_summary,
         "logstore": logstore_summary,
         "checkpoint_cache": checkpoint_summary,
         "fault_injection": fault or {},
@@ -184,11 +184,11 @@ def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard, checkpo
             f"{item.get('duration_sec', 0)} | `{item.get('log', '')}` |"
         )
 
-    if phase5_summary:
+    if benchmark_summary:
         lines.append("")
-        lines.append("## Phase 5 Benchmark")
+        lines.append("## Benchmark")
         lines.append("")
-        for key, value in phase5_summary.items():
+        for key, value in benchmark_summary.items():
             lines.append(f"- `{key}`: {pct(value)}")
 
     if logstore_summary:
@@ -232,10 +232,10 @@ def write_summary(run_dir, statuses, phase5, logstore, fault, dashboard, checkpo
     for name in [
         "environment.txt",
         "command_status.jsonl",
-        "phase5_benchmark.json",
+        "benchmark.json",
         "checkpoint_cache_probe.json",
         "checkpoint_cache_artifact.log",
-        "logstore_v1_latest.json",
+        "logstore_latest.json",
         "fault_injection.json",
         "dashboard_snapshot.json",
         "summary.json",
@@ -253,12 +253,12 @@ def main():
         return 2
     run_dir = Path(sys.argv[1]).resolve()
     statuses = read_statuses(run_dir)
-    phase5 = read_json(run_dir / "phase5_benchmark.json")
-    logstore = read_json(run_dir / "logstore_v1_latest.json")
+    benchmark = read_json(run_dir / "benchmark.json")
+    logstore = read_json(run_dir / "logstore_latest.json")
     fault = read_json(run_dir / "fault_injection.json")
     dashboard = read_json(run_dir / "dashboard_snapshot.json")
     checkpoint = read_json(run_dir / "checkpoint_cache_probe.json")
-    write_summary(run_dir, statuses, phase5, logstore, fault, dashboard, checkpoint)
+    write_summary(run_dir, statuses, benchmark, logstore, fault, dashboard, checkpoint)
     print(run_dir / "summary.md")
     return 0
 

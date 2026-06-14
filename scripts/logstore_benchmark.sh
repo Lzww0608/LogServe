@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="${LOGSERVE_LOGBENCH_OUT:-"$ROOT/benchmarks/logstore_v1_latest.json"}"
+OUT="${LOGSERVE_LOGBENCH_OUT:-"$ROOT/benchmarks/logstore_latest.json"}"
 
 mkdir -p "$(dirname "$OUT")"
 cd "$ROOT"

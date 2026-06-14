@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$dataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("logserve-phase2-" + [guid]::NewGuid().ToString("N"))
+$dataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("logserve-workflow-smoke-" + [guid]::NewGuid().ToString("N"))
 $logAddr = "127.0.0.1:56051"
 $controlAddr = "127.0.0.1:56052"
 

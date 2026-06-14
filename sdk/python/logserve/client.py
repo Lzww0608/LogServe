@@ -294,7 +294,7 @@ def replay_llm(task_id):
 def _build_workflow_definition(fn, args, kwargs):
     ctx, result = trace_workflow(fn, *args, **kwargs)
     if not isinstance(result, StepRef):
-        raise TypeError("Phase 2 workflows must return the result of a @task call")
+        raise TypeError("workflows must return the result of a @task call")
 
     module_source = _module_source(fn)
     steps = []

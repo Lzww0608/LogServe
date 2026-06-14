@@ -1,9 +1,9 @@
 $ErrorActionPreference = "Stop"
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$dataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("logserve-phase5-bench-" + [guid]::NewGuid().ToString("N"))
+$dataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("logserve-benchmark-" + [guid]::NewGuid().ToString("N"))
 $reportDir = Join-Path $root "benchmarks"
-$reportPath = Join-Path $reportDir "phase5_latest.json"
+$reportPath = Join-Path $reportDir "benchmark_latest.json"
 $cliPath = Join-Path $dataDir "logservectl.exe"
 $logAddr = "127.0.0.1:59051"
 $controlAddr = "127.0.0.1:59052"
@@ -61,9 +61,9 @@ try {
   }
   Start-Sleep -Seconds 4
 
-  $benchmarkOutput = python (Join-Path $root "examples\phase5\benchmark.py")
+  $benchmarkOutput = python (Join-Path $root "examples\evaluation\benchmark.py")
   if ($LASTEXITCODE -ne 0) {
-    throw "phase5 benchmark failed"
+    throw "benchmark failed"
   }
   $benchmarkOutput | Set-Content -LiteralPath $reportPath -Encoding UTF8
   Write-Output $reportPath

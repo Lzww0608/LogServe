@@ -297,7 +297,7 @@ run_step python_compileall "$RUN_DIR/python_compileall.log" python -m compileall
 run_step python_grpc_deps "$RUN_DIR/python_grpc_deps.log" python -c "import grpc; import google.protobuf"
 
 if [ "${LOGSERVE_RUN_LOGSTORE_BENCH:-1}" = "1" ]; then
-  run_step logstore_v1_benchmark "$RUN_DIR/logstore_v1_benchmark.log" env LOGSERVE_LOGBENCH_OUT="$RUN_DIR/logstore_v1_latest.json" bash scripts/logstore_v1_benchmark.sh
+  run_step logstore_benchmark "$RUN_DIR/logstore_benchmark.log" env LOGSERVE_LOGBENCH_OUT="$RUN_DIR/logstore_latest.json" bash scripts/logstore_benchmark.sh
 fi
 
 if [ "${LOGSERVE_RUN_FAULT:-1}" = "1" ]; then
@@ -305,10 +305,10 @@ if [ "${LOGSERVE_RUN_FAULT:-1}" = "1" ]; then
   write_fault_report
 fi
 
-if [ "${LOGSERVE_RUN_PHASE5_BENCH:-1}" = "1" ]; then
+if [ "${LOGSERVE_RUN_BENCHMARK:-1}" = "1" ]; then
   if start_runtime; then
-    run_json_step phase5_benchmark "$RUN_DIR/phase5_benchmark.json" "$RUN_DIR/phase5_benchmark.stderr.log" python examples/phase5/benchmark.py
-    run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" python examples/phase5/checkpoint_cache.py
+    run_json_step benchmark "$RUN_DIR/benchmark.json" "$RUN_DIR/benchmark.stderr.log" python examples/evaluation/benchmark.py
+    run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" python examples/evaluation/checkpoint_cache.py
     run_step checkpoint_cache_artifact "$RUN_DIR/checkpoint_cache_artifact.log" verify_checkpoint_cache_artifact
     run_json_step dashboard_snapshot "$RUN_DIR/dashboard_snapshot.json" "$RUN_DIR/dashboard_snapshot.stderr.log" go run ./cmd/logservectl dashboard-snapshot --control-addr "$CONTROL_ADDR"
   fi

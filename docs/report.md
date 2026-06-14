@@ -1,19 +1,19 @@
-# LogServe Project Report
+# LogServe Report
 
 ## 摘要
 
-LogServe 是一个以 shared log 为核心的 AI runtime 原型系统，覆盖任务执行、workflow DAG、actor 状态恢复、LLM serving、locality-aware scheduling、故障恢复和 benchmark 分析。系统主线是 log-first：控制面先写事件日志，再更新 materialized metadata view；workflow、actor、LLM 状态都可以从日志 replay 重建。
+LogServe 是一个基于 shared log 的 AI runtime。它包含任务执行、workflow DAG、actor 状态恢复、LLM serving、locality-aware scheduling、故障恢复和 benchmark 分析。系统采用 log-first 路径：控制面先写事件日志，再更新 materialized metadata view；workflow、actor、LLM 状态都可以从日志 replay 重建。
 
-当前实现已经从单纯任务队列扩展为一个面向 AI infra 的实验平台：Python SDK 支持 `@task`、`@workflow`、`@actor`；Go 控制面负责调度、幂等、重试、actor mailbox、模型调度；worker 负责本地 executor pool、Python 函数执行、mock/vLLM LLM 调用、checkpoint cache；logd 提供可恢复的 append-only shared log。
+代码现在包括 Python SDK、Go 控制面、worker 和 logd。Python SDK 支持 `@task`、`@workflow`、`@actor`；控制面负责调度、幂等、重试、actor mailbox 和模型调度；worker 负责本地 executor pool、Python 函数执行、mock/vLLM LLM 调用和 checkpoint cache；logd 提供可恢复的 append-only shared log。
 
 ## 系统实现
 
-### 核心组件
+### 组件
 
 - `logd`：分段 append-only shared log，支持 stream 读写、idempotent append、启动恢复和不同 fsync 策略。
 - `control`：任务、workflow、actor、model、backpressure 的控制面；维护 materialized metadata view。
 - `worker`：注册、心跳、poll，将 task/actor/LLM 分发到本地 executor pool，并写回完成事件。
-- Python SDK：提供 `@task`、`@workflow`、`@actor`、LLM API；优先使用 gRPC，缺少依赖时可 fallback 到 CLI。
+- Python SDK：提供 `@task`、`@workflow`、`@actor`、LLM API；优先使用 gRPC，缺少依赖时 fallback 到 CLI。
 - Result store：大结果和 actor snapshot 通过本地/S3-compatible MinIO 边界保存，日志只保留引用。
 - Dashboard API：导出 queue、task、workflow、actor、worker、model cache 的当前视图。
 
@@ -43,7 +43,7 @@ ActorCreated -> ActorOwnershipGranted -> ActorCommandSubmitted -> ActorCommandAp
 
 每个 actor command 分配单调递增 `command_seq`。同一 actor 的请求通过 mailbox 串行化，只有 `command_seq == actor.command_count + 1` 的命令可以被应用。Actor ownership 使用 `owner_worker_id + epoch` 做 fencing，旧 worker 或旧 epoch 的完成会被拒绝。
 
-Snapshot 定期写入 result store；replay 优先从 snapshot 恢复，再回放 snapshot 之后的 command。Actor snapshot 创建后，控制面会调用 logstore 的 logical trim，将 actor stream 中 snapshot 之前的记录标记为 compactable。默认 `ReadLog` 从 trim point 之后读取，因此 actor replay 从 `ActorSnapshotCreated`、snapshot object 和 tail log 开始。当前实现不物理删除 segment，只暴露 compactable records/bytes，便于后续实现物理 compaction。
+Snapshot 定期写入 result store；replay 优先从 snapshot 恢复，再回放 snapshot 之后的 command。Actor snapshot 创建后，控制面会调用 logstore 的 logical trim，将 actor stream 中 snapshot 之前的记录标记为 compactable。默认 `ReadLog` 从 trim point 之后读取，因此 actor replay 从 `ActorSnapshotCreated`、snapshot object 和 tail log 开始。目前没有物理删除 segment；系统会报告 compactable records/bytes，作为 physical compaction 的输入。
 
 ### LLM Serving
 
@@ -85,7 +85,7 @@ Project path: /home/lab2439/Work/lzww/LogServe
 Mode: single node, 3 workers, mock LLM, file-backed checkpoint cache
 ```
 
-实验目标不是证明多机生产性能，而是验证系统机制：log-first、replay、redelivery、actor recovery、snapshot、locality scheduling、checkpoint cache 和 dashboard materialization。
+这组实验不用于说明多机生产性能，重点检查这些机制是否能在单机环境跑通：log-first、replay、redelivery、actor recovery、snapshot、locality scheduling、checkpoint cache 和 dashboard materialization。
 
 ## 验证结果
 
@@ -97,7 +97,7 @@ Mode: single node, 3 workers, mock LLM, file-backed checkpoint cache
 reports/experiment-20260610T013044794327660Z
 ```
 
-所有核心验证命令均通过：
+主要验证命令均通过：
 
 | 验证项 | 结果 |
 |---|---:|
@@ -110,14 +110,14 @@ reports/experiment-20260610T013044794327660Z
 | logstore benchmark | PASS |
 | fault injection tests | PASS |
 | runtime logd/control/workers start | PASS |
-| Phase 5 benchmark | PASS |
+| Benchmark | PASS |
 | checkpoint cache probe | PASS |
 | checkpoint cache artifact check | PASS |
 | dashboard snapshot | PASS |
 
-### Phase 5 Benchmark
+### Benchmark
 
-一次代表性单机实验结果如下：
+本次单机实验结果如下：
 
 | 指标 | 结果 |
 |---|---:|
@@ -166,7 +166,7 @@ runtime/model-cache/worker-1/model-D-v1.checkpoint
 runtime/model-cache/worker-1/model-D-v1.checkpoint.manifest.json
 ```
 
-这证明 file-backed checkpoint cache 已真正落到 worker-local cache，而不是只创建 source checkpoint。由于 checkpoint 文件默认 1 MiB，fetch/load 延迟较小；该组实验主要证明功能正确性。
+这说明 file-backed checkpoint cache 写到了 worker-local cache，而不是只创建 source checkpoint。由于 checkpoint 文件默认 1 MiB，fetch/load 延迟较小；这组数据主要用于确认功能路径。
 
 ### Logstore Benchmark
 
@@ -178,7 +178,7 @@ runtime/model-cache/worker-1/model-D-v1.checkpoint.manifest.json
 | batch | 239,518.24 | 825,535.97 | 80 | 7 |
 | interval | 266,441.10 | 738,468.94 | 63 | 7 |
 
-结果符合预期：`always` 强同步写入最慢；`batch` 和 `interval` 显著提高 append throughput。恢复时间保持在几十毫秒量级。
+结果和写入策略一致：`always` 强同步写入最慢；`batch` 和 `interval` 的 append throughput 明显更高。恢复时间保持在几十毫秒量级。
 
 ### Fault Injection
 
@@ -189,11 +189,11 @@ runtime/model-cache/worker-1/model-D-v1.checkpoint.manifest.json
 | control restart probe | passed |
 | logd restart probe | covered by logstore recovery and process logs |
 
-故障恢复覆盖了 worker 丢失后的 task redelivery、workflow 已完成 step 不重跑、actor recovery、control 从 shared log bootstrap metadata view 等路径。
+故障恢复测试包括 worker 丢失后的 task redelivery、workflow 已完成 step 不重跑、actor recovery、control 从 shared log bootstrap metadata view 等路径。
 
 ### Dashboard Snapshot
 
-代表性 dashboard snapshot 包含：
+Dashboard snapshot 包含：
 
 | 项 | 数量 |
 |---|---:|
@@ -204,11 +204,11 @@ runtime/model-cache/worker-1/model-D-v1.checkpoint.manifest.json
 | models | 2 |
 | compactable log bytes | dashboard snapshot reports |
 
-Dashboard 用于验证 materialized view 是否能展示 workflow DAG、task 状态、actor 状态、worker 和 model cache。
+Dashboard 用来查看 materialized view 中的 workflow DAG、task 状态、actor 状态、worker 和 model cache。
 
 ## 结论
 
-LogServe 已具备一个 AI infra runtime 原型的完整闭环：
+LogServe 现在具备以下能力：
 
 - shared log 是系统状态源，metadata 是可重建视图。
 - Workflow 支持 DAG、retry、timeout、replay 和 exactly-once-ish 结果提交。
@@ -217,4 +217,4 @@ LogServe 已具备一个 AI infra runtime 原型的完整闭环：
 - LLM serving 支持模型注册、mock/vLLM adapter、worker cache 上报、checkpoint cache 和 locality-aware scheduling。
 - Benchmark、fault injection、dashboard 和实验报告脚本已经能在单机 Ubuntu 环境复现实验。
 
-当前结果证明机制正确性和相对收益，不代表生产级多机性能。后续如果继续扩展，优先方向是多节点部署实验、真实 vLLM/GPU 负载、持久化 PostgreSQL/MinIO 端到端压测，以及更大 checkpoint 下的 cold-start 曲线。
+这些结果说明当前机制能在单机实验中稳定跑通，并给出几个对比基线；它们不代表生产级多机性能。下一步可以补多节点部署实验、真实 vLLM/GPU 负载、持久化 PostgreSQL/MinIO 端到端压测，以及更大 checkpoint 下的 cold-start 曲线。

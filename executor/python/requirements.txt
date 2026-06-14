@@ -1,1 +1,1 @@
-# Phase 1 executor intentionally uses only the Python standard library.
+# The Python executor intentionally uses only the standard library.

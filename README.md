@@ -1,11 +1,10 @@
 # LogServe
 
-LogServe is a lightweight shared-log-based runtime for AI workflow
-infrastructure. It is built around a log-first control plane, Python SDK,
-workers, workflow DAG runtime, stateful actors, and LLM serving with
-model-cache-aware scheduling.
+LogServe is a shared-log-based runtime for AI workflows. It includes a
+log-first control plane, Python SDK, workers, workflow DAG runtime, stateful
+actors, and LLM serving with model-cache-aware scheduling.
 
-The project covers:
+Main pieces:
 
 1. Distributed task execution through `@task`, shared-log task events, and
    worker polling.
@@ -15,8 +14,8 @@ The project covers:
    snapshot replay, ownership transfer, and epoch fencing.
 4. LLM serving with model registry, mock/vLLM adapters, worker model-cache
    reporting, file-backed checkpoint cache, and locality-aware scheduling.
-5. Phase 5 hardening with fault injection, benchmark scripts, ablation studies,
-   dashboard snapshots, backpressure, and Kubernetes manifests.
+5. Fault injection, benchmark scripts, ablation studies, dashboard snapshots,
+   backpressure, and Kubernetes manifests.
 
 ## Repository Layout
 
@@ -28,12 +27,12 @@ cmd/
   logserve-dev       Single-process local dev runner
   logservectl        CLI fallback for the Python SDK
 proto/               gRPC contracts
-internal/logstore    Segmented append-only log v1
+internal/logstore    Segmented append-only log
 internal/control     Task API and status materialization
 internal/workflow    Workflow DAG model, argument resolution, replay
 internal/actor       Actor state model and replay reducer
 internal/worker      Worker polling and task execution
-internal/objectstore Local result store v0 for large workflow results
+internal/objectstore Local result store for large workflow results
 sdk/python/logserve  Python SDK
 executor/python      Python function executor
 deployments/         Docker Compose and Kubernetes manifests
@@ -43,10 +42,10 @@ docs/resume.md       Resume-ready project summary
 
 ## Local Demo Without Docker
 
-Docker is optional for the Phase 1 local loop. From the repository root:
+Docker is optional for the local task loop. From the repository root:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase1_smoke.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke_task.ps1
 ```
 
 Or run the services manually:
@@ -62,21 +61,21 @@ $env:PYTHONPATH = "$PWD\sdk\python"
 python .\examples\hello_task\add.py
 ```
 
-Expected output:
+Output:
 
 ```text
 3
 ```
 
-## Phase 2 Workflow Demo
+## Workflow Demo
 
 Run the Python `@workflow` DSL example:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase2_smoke.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke_workflow.ps1
 ```
 
-Expected output:
+Output:
 
 ```text
 answer:hello:doc:vec:hello
@@ -158,7 +157,7 @@ arguments creates a new submission unless the caller explicitly passes
 control plane rejects it as an idempotency conflict instead of silently
 returning the first result.
 
-## Shared Log v1 Benchmark
+## Shared Log Benchmark
 
 The shared log uses rolling segment files, a rebuilt-on-start index, and an
 index-backed `ReadLog` path that reads payloads from segment files instead of
@@ -173,11 +172,11 @@ keeping every record body in memory. `logd` exposes:
 On the Ubuntu single-node experiment machine, run:
 
 ```bash
-bash scripts/logstore_v1_benchmark.sh
+bash scripts/logstore_benchmark.sh
 ```
 
 The script writes a generated JSON report to
-`benchmarks/logstore_v1_latest.json` and compares append, read, recovery time,
+`benchmarks/logstore_latest.json` and compares append, read, recovery time,
 and segment count across `always`, `batch`, and `interval` fsync policies. You
 can tune the workload through environment variables such as
 `LOGSERVE_LOGBENCH_RECORDS`, `LOGSERVE_LOGBENCH_PAYLOAD_BYTES`, and
@@ -206,13 +205,13 @@ will recreate the tables and rebuild the view from shared log streams.
 go test ./...
 ```
 
-Covered Phase 1 checks:
+Covered task and log checks:
 
 - append/read and idempotent append in shared log
 - recovery truncation for partial log tail
 - worker heartbeat, task execution, status query, and task event log chain
 
-Covered Phase 2 checks:
+Covered workflow checks:
 
 - `simple_rag` workflow completion
 - worker stops after `embed`; a restarted worker continues from `search` without re-running `embed`
@@ -224,12 +223,12 @@ Covered Phase 2 checks:
 - ordinary ad-hoc task specs are restored from `TaskSubmitted` after control restart
 - stale task completions are rejected by task lease epoch
 
-## Phase 2 Semantics
+## Workflow Semantics
 
 Workflow source of truth is the shared log. Metadata is a materialized current
 view and can be checked against replay through `ReplayWorkflow`.
 
-LogServe Phase 2 provides exactly-once-ish workflow step results, not strict
+LogServe provides exactly-once-ish workflow step results, not strict
 distributed exactly-once execution. The worker may execute a task at least once.
 The workflow engine deduplicates final step results using:
 
@@ -249,15 +248,15 @@ objects under a filesystem-backed `local://` namespace. Set
 `LOGSERVE_S3_SECRET_KEY` to use the S3-compatible MinIO adapter. The Compose
 environment wires this to its MinIO service.
 
-## Phase 3 Actor Demo
+## Actor Demo
 
 Run the Python `@actor` counter example:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase3_smoke.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke_actor.ps1
 ```
 
-Expected output:
+Output:
 
 ```text
 100
@@ -283,7 +282,7 @@ The SDK creates an actor instance with `create_actor(Counter)`. Calls such as
 `counter.inc()` are submitted to the control plane as actor tasks targeted at
 the current owner worker.
 
-Covered Phase 3 checks:
+Covered actor checks:
 
 - `Counter` actor recovery after the first worker exits at 100 `inc()` calls
 - a second worker takes ownership and `get()` returns `100`
@@ -293,7 +292,7 @@ Covered Phase 3 checks:
   final `get()` returns `1000`
 - stale actor completions are rejected by worker id plus epoch fencing
 
-## Phase 3 Semantics
+## Actor Semantics
 
 Actor source of truth is the shared log stream `actor:<actor_id>`. Metadata is a
 materialized current view. Replay applies:
@@ -302,7 +301,7 @@ materialized current view. Replay applies:
 ActorCreated -> ActorOwnershipGranted -> ActorCommandSubmitted -> ActorCommandApplied -> ActorSnapshotCreated
 ```
 
-LogServe Phase 3 provides exactly-once-ish actor command application, not strict
+LogServe provides exactly-once-ish actor command application, not strict
 distributed exactly-once execution. A worker may execute a method more than once
 after failure or redelivery, but the control plane applies a command to actor
 state through an idempotent log key:
@@ -340,7 +339,7 @@ Snapshots are written through the result-store interface and the actor log keeps
 only `snapshot_ref`. The local development adapter stores snapshot objects under
 `local://actors/<actor_id>/snapshots/...`; the Compose stack includes MinIO, and
 the same result-store boundary is where an S3-compatible MinIO adapter should be
-plugged in for production-style deployments.
+plugged in for deployments that need S3-compatible storage.
 
 When an actor snapshot is created, LogServe records a stream-level logical trim
 point in the shared log. `ReadLog` hides records before that point by default,
@@ -353,12 +352,12 @@ Observability is emitted as structured logs. Workflow runs include end-to-end
 latency and step latency; actor commands include actor id, call id, epoch, and
 command count, with replay exposing full versus snapshot command counts.
 
-## Phase 4 LLM Demo
+## LLM Demo
 
 Run the RAG workflow with a mock LLM and three workers:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase4_smoke.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke_llm.ps1
 ```
 
 The script starts:
@@ -380,7 +379,7 @@ def rag_with_llm(query: str):
     return llm_generate("model-A", prompt, version="v1", adapter="mock")
 ```
 
-Expected output contains:
+Output contains:
 
 ```text
 mock:model-A:v1
@@ -416,7 +415,7 @@ The mock checkpoint source supports these layouts:
 <source>/<model>-<version>.bin
 ```
 
-## Phase 4 Semantics
+## LLM Semantics
 
 The model registry records model name, version, size, path, and adapter. Workers
 report local model cache entries during registration and heartbeat. The mock
@@ -467,7 +466,7 @@ ModelLoadStarted -> ModelLoaded -> LLMCompleted
 fetch time, cache bytes used/capacity, eviction count, model load time,
 first-token latency, total latency, and the raw event sequence from that stream.
 
-Covered Phase 4 checks:
+Covered LLM checks:
 
 - resource-only assigns a model-A request to the first idle worker
 - locality-aware waits for the worker that already caches model-A
@@ -480,9 +479,9 @@ Covered Phase 4 checks:
   request, and reports persisted cache entries after worker restart
 - a RAG workflow can use `llm_generate()` as a real workflow step
 
-## Phase 5 Analysis And Hardening
+## Analysis And Hardening
 
-Phase 5 adds operational analysis assets and runtime hardening:
+Operational analysis assets and runtime hardening include:
 
 - running and poll-before-start task redelivery after worker loss
 - queue high-watermark and log-append-latency backpressure
@@ -497,9 +496,9 @@ Phase 5 adds operational analysis assets and runtime hardening:
 Useful commands:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_benchmark.ps1
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_fault_injection.ps1
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\phase5_dashboard.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\benchmark.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\fault_injection.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\dashboard_snapshot.ps1
 ```
 
 On the Ubuntu single-node experiment machine, use the Linux experiment runner:
@@ -514,10 +513,10 @@ when you intentionally want fixed ports.
 
 The runner creates `reports/experiment-<utc timestamp>/` and writes:
 
-- `environment.txt`: kernel, Go/Python versions, git state
+- `environment.txt`: kernel, toolchain, git state
 - `command_status.jsonl`: exit code and duration for each verification step
-- `logstore_v1_latest.json`: shared-log fsync policy benchmark
-- `phase5_benchmark.json`: workflow latency, task throughput, actor snapshot
+- `logstore_latest.json`: shared-log fsync policy benchmark
+- `benchmark.json`: workflow latency, task throughput, actor snapshot
   ablation, LLM cold/warm cache, locality scheduler comparison
 - `checkpoint_cache_probe.json`: file-backed mock checkpoint cache cold/warm
   fetch metrics
@@ -553,22 +552,22 @@ For a quick smoke run, disable the heavier parts:
 LOGSERVE_RUN_RACE=0 LOGSERVE_RUN_LOGSTORE_BENCH=0 bash scripts/run_experiment.sh
 ```
 
-### Latest Single-Node Experiment Snapshot
+### Single-Node Experiment Snapshot
 
-The latest validated Ubuntu single-node run used 3 workers, mock LLM serving,
-and file-backed checkpoint cache:
+The latest Ubuntu single-node run used 3 workers, mock LLM serving, and a
+file-backed checkpoint cache:
 
 ```text
 reports/experiment-20260610T013044794327660Z
 Linux lab2439 6.8.0-111-generic x86_64 GNU/Linux
 ```
 
-All verification steps passed: Go tests, `go vet`, race tests for control and
-worker packages, Python unittest/compile checks, gRPC dependency check,
-logstore benchmark, fault-injection tests, Phase 5 benchmark, checkpoint cache
-probe, checkpoint artifact check, and dashboard snapshot.
+The run passed Go tests, `go vet`, race tests for control and worker packages,
+Python unittest/compile checks, gRPC dependency check, logstore benchmark,
+fault-injection tests, benchmark, checkpoint cache probe, checkpoint artifact
+check, and dashboard snapshot.
 
-Representative results:
+Selected results:
 
 | Metric | Result |
 |---|---:|
