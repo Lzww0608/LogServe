@@ -18,3 +18,12 @@
 - `05_segment_index_compaction_retention_lsm.md`：segment、index、compaction、retention、LSM tree、SSTable、tombstone。
 - `06_idempotency_retry_timeout_dedup_exactly_once.md`：幂等、重试、超时、去重、idempotency key、backoff、jitter、exactly-once 语义。
 - `07_sequence_number_lease_epoch_fencing_logical_time.md`：sequence number、lease、epoch、fencing、Lamport clock、vector clock、HLC、逻辑时间。
+- `08_mutex_rwmutex_spinlock_futex_lock_implementation.md`：Mutex、RWMutex、spinlock、futex、锁粒度、公平性、可重入性、锁实现原理。
+- `09_atomic_cas_memory_model_lock_free_data_structures.md`：atomic operation、CAS、内存模型、memory ordering、ABA、lock-free、wait-free。
+- `10_go_concurrency_runtime_channel_context_race.md`：goroutine、G/M/P、work stealing、goroutine leak、channel、context、race detector。
+- `11_worker_pool_local_queue_scheduling_backpressure.md`：worker pool、本地队列、调度、backpressure、rate limiting、load shedding、head-of-line blocking。
+- `12_actor_model_mailbox_state_machine_snapshot.md`：Actor model、mailbox、状态机、消息顺序、backpressure、actor crash recovery、snapshot replay。
+- `13_dag_workflow_engine_topological_sort_scheduling_semantics.md`：DAG、workflow engine、拓扑排序、ready node、step 依赖、结果引用、取消和超时传播。
+- `14_serialization_json_protobuf_canonicalization_fingerprint.md`：序列化、JSON、protobuf、Avro、Thrift、canonical JSON、fingerprint、bytes/string、base64。
+- `15_grpc_http2_rpc_reliability.md`：gRPC、HTTP/2、RPC 语义、deadline、status code、重试、flow control。
+- `16_python_executor_subprocess_ipc_gil_sandbox_boundary.md`：Python executor、subprocess、IPC、stdout/stderr、进程池、GIL、线程与多进程。
