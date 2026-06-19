@@ -27,3 +27,8 @@
 - `14_serialization_json_protobuf_canonicalization_fingerprint.md`：序列化、JSON、protobuf、Avro、Thrift、canonical JSON、fingerprint、bytes/string、base64。
 - `15_grpc_http2_rpc_reliability.md`：gRPC、HTTP/2、RPC 语义、deadline、status code、重试、flow control。
 - `16_python_executor_subprocess_ipc_gil_sandbox_boundary.md`：Python executor、subprocess、IPC、stdout/stderr、进程池、GIL、线程与多进程。
+- `17_cache_locality_eviction_policy_consistency.md`：缓存局部性、淘汰策略、cache hit、cache consistency、checkpoint cache。
+- `18_llm_serving_model_cache_kv_cache_batching_gpu_scheduling.md`：LLM serving、模型缓存、KV cache、batching、GPU 调度。
+- `19_object_storage_s3_result_reference_data_lifecycle.md`：对象存储、S3 语义、大对象 result reference、数据生命周期。
+- `20_metadata_store_materialized_view_cqrs_event_sourcing.md`：metadata store、materialized view、CQRS、event sourcing。
+- `21_database_transactions_isolation_indexes_postgresql_migrations.md`：数据库事务、隔离级别、索引、PostgreSQL、迁移。

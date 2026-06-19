@@ -10,3 +10,5 @@ benchmarks/phase5_latest.json
 benchmarks/logstore_v1_latest.json
 reports/*.json
 reports/experiment-*/
+*.md
+*.word
