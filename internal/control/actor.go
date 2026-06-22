@@ -63,6 +63,11 @@ func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRe
 		return nil, err
 	}
 	created, duplicate := s.meta.CreateActor(state, req.GetIdempotencyKey())
+	if !duplicate {
+		if err := s.metadataPersisted(); err != nil {
+			return nil, err
+		}
+	}
 	if duplicate {
 		if err := ensureIdempotencyFingerprint("actor", req.GetIdempotencyKey(), created.IdempotencyFingerprint, fingerprint); err != nil {
 			return nil, err
@@ -477,15 +482,10 @@ func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) er
 }
 
 func (s *Service) replayActor(ctx context.Context, actorID string) (actor.ReplayResult, error) {
-	resp, err := s.log.ReadLog(ctx, &logservepb.ReadLogRequest{
-		StreamId: actorStream(actorID),
-		FromSeq:  1,
-		Limit:    100_000,
-	})
-	if err != nil {
-		return actor.ReplayResult{}, err
-	}
-	return actor.Replay(actorID, resp.GetRecords(), s)
+	streamID := actorStream(actorID)
+	return actor.ReplayEach(actorID, func(emit func(*logservepb.LogRecord) error) error {
+		return s.forEachLogRecord(ctx, streamID, emit)
+	}, s)
 }
 
 func (s *Service) specForTask(taskID string) *logservepb.TaskSpec {

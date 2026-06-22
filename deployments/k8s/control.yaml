@@ -13,13 +13,54 @@ spec:
       labels:
         app: logserve-control
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: control
           image: logserve:local
           imagePullPolicy: IfNotPresent
           args: ["logserve-control", "--addr", "0.0.0.0:50052", "--log-addr", "logserve-logd:50051"]
+          env:
+            - name: LOGSERVE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: logserve-secrets
+                  key: api-token
           ports:
             - containerPort: 50052
+          readinessProbe:
+            tcpSocket:
+              port: 50052
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 50052
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -27,6 +68,7 @@ metadata:
   name: logserve-control
   namespace: logserve
 spec:
+  type: ClusterIP
   selector:
     app: logserve-control
   ports:

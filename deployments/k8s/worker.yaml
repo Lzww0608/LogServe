@@ -12,7 +12,15 @@ spec:
     metadata:
       labels:
         app: logserve-worker-a
+        role: logserve-worker
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: worker
           image: logserve:local
@@ -29,6 +37,30 @@ spec:
             - /app/executor/python/server.py
             - --models
             - model-A:v1
+          env:
+            - name: LOGSERVE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: logserve-secrets
+                  key: api-token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -44,7 +76,15 @@ spec:
     metadata:
       labels:
         app: logserve-worker-b
+        role: logserve-worker
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: worker
           image: logserve:local
@@ -61,3 +101,27 @@ spec:
             - /app/executor/python/server.py
             - --models
             - model-B:v1
+          env:
+            - name: LOGSERVE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: logserve-secrets
+                  key: api-token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

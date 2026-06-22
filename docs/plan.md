@@ -1,9 +1,5 @@
 # LogServe 优化空间与执行计划：数据结构与基础架构方向
 
-版本：2026-06-15  
-范围：基于当前 GitHub 仓库核心代码路径的架构审查，重点关注 `internal/logstore`、`internal/control`、`internal/metadata`、`internal/worker`、`internal/objectstore`、`internal/workflow`、`internal/actor`、`proto`、`sdk/python`、`executor/python` 和实验报告。  
-目标：找出能带来真实收益的优化空间，优先考虑数据结构、基础架构、I/O 路径、并发控制、恢复路径和调度路径。本文不追求“炫技式优化”，也不会建议在当前规模下收益很低的技术。
-
 ---
 
 ## 1. 总体判断

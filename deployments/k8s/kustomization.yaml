@@ -3,3 +3,4 @@ resources:
   - logd.yaml
   - control.yaml
   - worker.yaml
+  - network-policy.yaml

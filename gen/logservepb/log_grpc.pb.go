@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion8
 const (
 	LogService_AppendLog_FullMethodName      = "/logserve.v1.LogService/AppendLog"
 	LogService_ReadLog_FullMethodName        = "/logserve.v1.LogService/ReadLog"
+	LogService_ReadLogStream_FullMethodName  = "/logserve.v1.LogService/ReadLogStream"
 	LogService_ListStreams_FullMethodName    = "/logserve.v1.LogService/ListStreams"
 	LogService_TrimStream_FullMethodName     = "/logserve.v1.LogService/TrimStream"
 	LogService_GetStreamStats_FullMethodName = "/logserve.v1.LogService/GetStreamStats"
@@ -32,6 +33,7 @@ const (
 type LogServiceClient interface {
 	AppendLog(ctx context.Context, in *AppendLogRequest, opts ...grpc.CallOption) (*AppendLogResponse, error)
 	ReadLog(ctx context.Context, in *ReadLogRequest, opts ...grpc.CallOption) (*ReadLogResponse, error)
+	ReadLogStream(ctx context.Context, in *ReadLogRequest, opts ...grpc.CallOption) (LogService_ReadLogStreamClient, error)
 	ListStreams(ctx context.Context, in *ListStreamsRequest, opts ...grpc.CallOption) (*ListStreamsResponse, error)
 	TrimStream(ctx context.Context, in *TrimStreamRequest, opts ...grpc.CallOption) (*TrimStreamResponse, error)
 	GetStreamStats(ctx context.Context, in *GetStreamStatsRequest, opts ...grpc.CallOption) (*GetStreamStatsResponse, error)
@@ -63,6 +65,39 @@ func (c *logServiceClient) ReadLog(ctx context.Context, in *ReadLogRequest, opts
 		return nil, err
 	}
 	return out, nil
+}
+
+func (c *logServiceClient) ReadLogStream(ctx context.Context, in *ReadLogRequest, opts ...grpc.CallOption) (LogService_ReadLogStreamClient, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LogService_ServiceDesc.Streams[0], LogService_ReadLogStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &logServiceReadLogStreamClient{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type LogService_ReadLogStreamClient interface {
+	Recv() (*LogRecord, error)
+	grpc.ClientStream
+}
+
+type logServiceReadLogStreamClient struct {
+	grpc.ClientStream
+}
+
+func (x *logServiceReadLogStreamClient) Recv() (*LogRecord, error) {
+	m := new(LogRecord)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func (c *logServiceClient) ListStreams(ctx context.Context, in *ListStreamsRequest, opts ...grpc.CallOption) (*ListStreamsResponse, error) {
@@ -101,6 +136,7 @@ func (c *logServiceClient) GetStreamStats(ctx context.Context, in *GetStreamStat
 type LogServiceServer interface {
 	AppendLog(context.Context, *AppendLogRequest) (*AppendLogResponse, error)
 	ReadLog(context.Context, *ReadLogRequest) (*ReadLogResponse, error)
+	ReadLogStream(*ReadLogRequest, LogService_ReadLogStreamServer) error
 	ListStreams(context.Context, *ListStreamsRequest) (*ListStreamsResponse, error)
 	TrimStream(context.Context, *TrimStreamRequest) (*TrimStreamResponse, error)
 	GetStreamStats(context.Context, *GetStreamStatsRequest) (*GetStreamStatsResponse, error)
@@ -116,6 +152,9 @@ func (UnimplementedLogServiceServer) AppendLog(context.Context, *AppendLogReques
 }
 func (UnimplementedLogServiceServer) ReadLog(context.Context, *ReadLogRequest) (*ReadLogResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReadLog not implemented")
+}
+func (UnimplementedLogServiceServer) ReadLogStream(*ReadLogRequest, LogService_ReadLogStreamServer) error {
+	return status.Errorf(codes.Unimplemented, "method ReadLogStream not implemented")
 }
 func (UnimplementedLogServiceServer) ListStreams(context.Context, *ListStreamsRequest) (*ListStreamsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListStreams not implemented")
@@ -173,6 +212,27 @@ func _LogService_ReadLog_Handler(srv interface{}, ctx context.Context, dec func(
 		return srv.(LogServiceServer).ReadLog(ctx, req.(*ReadLogRequest))
 	}
 	return interceptor(ctx, in, info, handler)
+}
+
+func _LogService_ReadLogStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ReadLogRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LogServiceServer).ReadLogStream(m, &logServiceReadLogStreamServer{ServerStream: stream})
+}
+
+type LogService_ReadLogStreamServer interface {
+	Send(*LogRecord) error
+	grpc.ServerStream
+}
+
+type logServiceReadLogStreamServer struct {
+	grpc.ServerStream
+}
+
+func (x *logServiceReadLogStreamServer) Send(m *LogRecord) error {
+	return x.ServerStream.SendMsg(m)
 }
 
 func _LogService_ListStreams_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -257,6 +317,12 @@ var LogService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LogService_GetStreamStats_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ReadLogStream",
+			Handler:       _LogService_ReadLogStream_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "proto/log.proto",
 }

@@ -3671,6 +3671,645 @@ fdatasync 在单机上是文件数据层面的本地持久化边界；在分布�
 
 所以 fdatasync 的单机语义可以回答“这个副本是否尽力把数据落到本地稳定存储”；分布式语义还要回答“足够多副本是否按协议保存，并且新的 leader 会不会保留它”。后者不是 fdatasync 单独能给出的答案。
 
+## Q074. write 返回成功后数据经过了哪些层？
+
+**回答：**
+
+`write()` 返回成功，只能说明这次系统调用按当前文件描述符的语义被内核接受了。普通 buffered I/O 下，它通常还没有把数据真正写到稳定介质。面试里要把这条路径拆开讲，否则很容易把“写入可见”说成“写入持久”。
+
+一条典型路径是：
+
+```text
+user buffer
+  -> libc / syscall
+  -> VFS
+  -> 具体文件系统 ext4 / XFS / btrfs / NFS client ...
+  -> page cache / address_space
+  -> dirty page 标记
+  -> writeback 线程或 fsync 触发写回
+  -> block layer / I/O scheduler
+  -> device driver
+  -> 控制器或磁盘内部 write cache
+  -> NAND / platter / 远端副本等稳定介质
+```
+
+每一层都可能改变“成功”的含义。
+
+在用户态，`write(fd, buf, n)` 只接收一段内存和一个 fd。进入内核后，VFS 先根据 fd 找到 open file description、inode 和文件系统操作表。普通文件一般走文件系统自己的 write path，最后把用户 buffer 拷贝到 page cache。此时页被标记为 dirty，文件大小、mtime、extent 分配等元数据也可能变 dirty。系统调用返回时，应用拿到的是“内核已经接收了这些字节”的信号。
+
+接下来是后台写回。内核会因为脏页比例、内存压力、定时 writeback、`fsync()`、`fdatasync()`、`sync()` 等条件，把 dirty pages 下发到块层。块层再把请求交给驱动和设备。设备收到写请求后，也可能只是放进自己的 volatile cache。只有配合 cache flush、FUA 或等价机制，才能让文件系统相信设备已经把数据推进到非易失位置。
+
+如果文件在网络文件系统或云盘上，这条链还会继续延伸：客户端内核、网络协议、服务端缓存、远端文件系统、复制层、后端磁盘。此时本地 `write()` 返回成功更不能直接解释成远端已经 durable。
+
+回答这个问题时我会补三个边界：
+
+1. `write()` 可能 partial write。返回值小于请求长度时，调用方要继续写剩余部分。
+2. 写回错误可能延迟暴露。比如 ENOSPC、EDQUOT、EIO 可能在后续 `write()`、`fsync()` 或 `close()` 才出现。
+3. 后续 `read()` 能读到新内容，只能说明 page cache 里的新数据可见，不说明断电后还能读到。
+
+所以一句话总结：`write()` 成功只是写入协议的起点。它把数据交给了内核写入路径；要把它变成崩溃恢复边界，还需要同步、顺序、错误处理和恢复扫描一起成立。
+
+## Q075. page cache 为什么会让写入看起来很快？
+
+**回答：**
+
+page cache 让写入快，核心原因是它把应用线程和慢速存储设备解耦了。应用写入时，内核先把数据放到内存里的文件缓存页，然后尽快返回；真正慢的磁盘 I/O 可以稍后合并、排序、批量写出。
+
+普通 buffered write 的快主要来自几件事。
+
+第一，内存拷贝比设备持久化快得多。一次 `write()` 如果只需要拷贝到 page cache，延迟通常是内存访问、页分配、锁、元数据处理的成本，而不是一次完整设备 flush 的成本。对小日志、小配置文件、小索引更新来说，这个差别非常明显。
+
+第二，page cache 可以合并小写。应用连续写很多小 record，内核不一定每次都发一个小 I/O。多个相邻 dirty pages 可以被合并成更大的顺序写。设备更喜欢这种模式，吞吐也更高。
+
+第三，写回可以重排。只要不破坏文件系统需要的顺序约束，内核和块层可以按更适合设备的方式组织请求。HDD 上这能减少寻道，SSD/NVMe 上也能减少小 I/O 和队列开销。
+
+第四，它把写延迟从前台搬到后台。应用看到 `write()` 很快返回，但后台 writeback、`fsync()`、内存回收或 dirty throttling 迟早要把账结掉。很多线上问题正出在这里：平均写入延迟很好看，p99 却被一次集中回写打穿。
+
+page cache 不是免费性能。它带来的副作用包括：
+
+- 脏页太多时，应用会被内核限速，`write()` 自己也可能变慢。
+- `fsync()` 会替前面一批 buffered write 等待设备完成，所以延迟可能突然升高。
+- 大文件顺序写会挤掉热点读缓存，造成 cache pollution。
+- 崩溃时还没写回的 dirty pages 会丢失。
+
+面试里我会这样收束：page cache 的价值是吞吐和批处理，不是持久性。它让写入“看起来快”，是因为把同步持久化推迟了。系统设计时必须明确哪个点才算 durable commit，不能把 `write()` 返回当成提交成功。
+
+## Q076. fsync 到底同步了什么？
+
+**回答：**
+
+`fsync(fd)` 同步的是这个 fd 所引用文件的 in-core state，也就是内核里已经修改但还没有持久化的文件数据，以及和这个文件相关、恢复后必须保留下来的元数据。它的目标不是“把系统里所有脏页都写一遍”，而是为一个具体文件建立持久化边界。
+
+对普通文件来说，`fsync()` 至少要考虑这些内容：
+
+1. 文件数据页。也就是 page cache 里属于该文件、已经 dirty 的内容。
+2. 文件大小。如果 append 或 truncate 改变了 `st_size`，这个元数据必须同步，否则恢复后可能读不到新写的数据，或者读到错误长度。
+3. block mapping 或 extent 信息。新分配的数据块如果没有对应的元数据，恢复后文件内容就不可达。
+4. 相关 inode 元数据。哪些元数据必须同步，取决于 `fsync()` 和 `fdatasync()` 的差别，也取决于文件系统实现。
+5. 文件系统 journal 中和这个文件相关的事务。journaling 文件系统常常要先提交 journal，再让主文件系统状态可恢复。
+6. 设备缓存。文件系统可能需要通过 flush 或 FUA 确认底层 volatile cache 不会在断电时丢掉已经确认的写入。
+
+`fdatasync()` 的范围更窄。它关注“之后能正确读回文件数据所必需的内容”。mtime、atime 这类不影响读数据的 metadata，理论上可以不刷；但文件大小和新分配块的映射不能省。
+
+`fsync()` 不保证几件事，这些边界要说清楚：
+
+- 它不一定同步父目录项。新建文件、rename、unlink 改的是目录，普通文件 fd 上的 `fsync()` 不能替目录承诺。
+- 它不保证其他文件已经同步，哪怕这些文件在业务事务里和它有关。
+- 它不负责校验应用层 record 是否完整。没有 length、checksum、commit marker，`fsync()` 也不知道你的 record 边界。
+- 它不等于分布式提交。单机 durable 不等于多数派 durable。
+
+还要检查返回值。`fsync()` 返回错误时，不能假装提交成功。尤其是 EIO、ENOSPC、EDQUOT 这类错误，可能代表之前的某些写入并没有真正进入可靠状态。
+
+所以我会把 `fsync()` 解释成一个文件级同步栅栏：调用方要求内核把这个文件到某个时间点为止的关键状态推进到稳定存储，并等待结果。它很强，但它不是事务系统，也不是目录发布协议。
+
+## Q077. 为什么只 fsync 文件不一定保证目录项持久化？
+
+**回答：**
+
+因为文件内容和文件名不是同一个对象。文件内容属于 inode 和它的数据块；文件名属于目录，目录本质上也是一种文件，里面保存“名字到 inode”的映射。`fsync(file_fd)` 处理的是文件自身，不能自动覆盖父目录的目录项修改。
+
+一个典型例子是写配置文件：
+
+```text
+open("config.tmp")
+write(new_content)
+fsync(config.tmp)
+rename("config.tmp", "config")
+```
+
+这段代码保证了 `config.tmp` 的内容比较可靠，也保证了运行时路径切换是原子的。但如果没有对父目录调用 `fsync()`，崩溃恢复后目录项可能还停留在旧状态。结果可能是 `config` 仍指向旧 inode，也可能是新文件名没有被恢复出来，具体取决于文件系统、journal 提交时机和崩溃点。
+
+正确的思路是把发布协议拆成两步：
+
+```text
+write temp file
+fsync temp file
+rename temp -> final
+fsync parent directory
+```
+
+第一步同步内容。第二步用 `rename()` 做运行时原子切换。第三步同步目录，把“final 这个名字现在指向新 inode”这件事落到稳定状态里。
+
+如果是跨目录 rename，还要更谨慎。源目录删除旧名字，目标目录增加新名字，两个目录都参与了命名空间变化。稳妥做法是把临时文件放在目标目录里，避免跨目录发布。
+
+面试里可以用一句话说清楚：`fsync(file)` 保护字节，`fsync(dir)` 保护名字。数据库的 WAL 通常追加到已有文件，所以目录 fsync 不一定在每次提交路径上；但 manifest、checkpoint 文件、SSTable 文件、配置文件发布，往往绕不开目录 fsync。
+
+## Q078. rename 原子性和持久性有什么区别？
+
+**回答：**
+
+`rename()` 的原子性说的是运行时可见性，持久性说的是崩溃恢复后状态是否还在。两者经常被混在一起，但它们解决的不是同一个问题。
+
+运行时原子性指的是：在同一个文件系统内，把 `oldpath` 改成 `newpath` 时，观察者不会看到半个名字、半个文件、先删除再创建的中间状态。如果 `newpath` 原来存在，成功的 `rename(old, new)` 通常表现为原子替换。已经打开旧文件的 fd 仍然指向旧 inode；新打开路径的人看到新 inode。这是命名空间视角的原子切换。
+
+持久性问的是另一件事：机器突然断电后，恢复出来的目录项是否还是这次 rename 之后的状态。`rename()` 返回成功不等于父目录的目录项已经写到稳定存储。要得到更可靠的发布语义，通常还要对父目录 `fsync()`。
+
+举个例子：
+
+```text
+write new.tmp
+fsync new.tmp
+rename new.tmp -> current
+```
+
+在进程还活着、系统没崩溃时，其他进程看 `current` 要么是旧版本，要么是新版本，不会看到半个版本。可如果 rename 后立刻断电，而父目录没有同步，恢复后目录项可能回退。这不违反 rename 的运行时原子性，因为崩溃恢复是另一个语义层。
+
+这个区别对系统设计很重要。很多人说“我用了 rename，所以不会坏”，这句话只说对了一半。rename 可以避免读者看到部分写入的文件；它不能单独保证新版本已经发布到崩溃后的文件系统命名空间。
+
+面试中可以这样答：rename 是发布动作，fsync 是持久化动作。可靠协议通常两者都要有：先把新内容 fsync 到文件，再 rename 切换名字，最后 fsync 目录确认发布结果。
+
+## Q079. 文件系统 journal 保护 metadata 还是 data？
+
+**回答：**
+
+要看文件系统和挂载模式。journal 的最低目标通常是保护文件系统结构一致性，也就是 metadata；是否保护文件内容，要看 data journaling 是否开启，以及 ordered/writeback 这类模式如何处理数据块和元数据提交顺序。
+
+以常见 journaling 文件系统为例，可以分三类讲。
+
+第一类是 metadata journaling。journal 记录 inode、目录项、bitmap、extent、文件大小等元数据变化。崩溃后，文件系统可以 replay journal，让结构回到一致状态。它能避免目录树损坏、块重复分配、inode 状态乱掉，但不保证文件内容就是应用最后写入的内容。
+
+第二类是 ordered 模式。它仍然主要 journal metadata，但会要求与 metadata 相关的数据块在 metadata 提交前写到主文件系统位置。这样可以避免恢复后 metadata 指向一堆还没写过的新块。它比纯 writeback 更安全，但仍不是完整应用事务。应用层 record 可能半写，多个文件之间也不保证业务原子性。
+
+第三类是 data journal 模式。数据和元数据都先写 journal，再写最终位置。崩溃恢复后，journal 可以恢复更完整的数据状态。代价是写放大明显，尤其是大文件写入时，数据可能先写 journal、再写主位置。
+
+还要补一个常见误解：journal 保护的是文件系统一致性，不等于保护数据库一致性。文件系统可以保证“树结构没坏”，但它不知道 WAL record 的长度、checksum、LSN，也不知道 data 文件和 index 文件之间的业务依赖。数据库仍然需要自己的 WAL、redo、commit marker、checkpoint 和恢复逻辑。
+
+如果面试官追问“metadata journaling 下写文件安全吗”，我会回答：文件系统结构比较安全，应用数据不一定安全。要看 `fsync()`、写入顺序、文件格式校验和恢复协议。把 journal 当成应用层事务，是很危险的简化。
+
+## Q080. 磁盘 write cache 和控制器缓存会如何影响持久性？
+
+**回答：**
+
+磁盘和控制器缓存会把“设备报告写完成”和“数据已经进入非易失介质”分开。操作系统把写请求交给设备后，设备可能先放进 volatile write cache，然后就返回完成。这样性能更好，但如果没有后续 flush、FUA、掉电保护或电池保护，断电时缓存里的数据可能丢失。
+
+这会直接影响 `fsync()` 的真实含义。一个严肃的 `fsync()` 路径不能只等内核把 page cache 写到块设备队列；它还要让底层设备把自己的易失缓存处理掉。Linux 块层提供的 flush/FUA 机制，就是为了让文件系统表达这种顺序和持久化要求。
+
+缓存大致有几类：
+
+1. **磁盘或 SSD 内部 volatile cache**
+
+   提升写入吞吐，合并小写，隐藏介质延迟。风险是掉电丢失。企业级设备可能有 power-loss protection，把缓存中的数据在断电时刷入非易失介质；消费级设备未必有。
+
+2. **RAID / HBA / 存储控制器缓存**
+
+   如果有 BBU、超级电容或非易失缓存，write-back cache 可以比较安全。没有保护时，控制器提前 ack 会让文件系统误以为数据已持久。
+
+3. **虚拟化或云盘缓存**
+
+   客户机看到的是虚拟块设备。`fsync()` 最终是否意味着远端副本、服务端缓存和后端介质都达到某个持久状态，要看云厂商或存储系统的实现承诺。
+
+4. **操作系统 page cache**
+
+   这是主机内存里的缓存。它和设备 write cache 是两层东西。`write()` 返回时数据可能还在 page cache；`fsync()` 之后还要处理设备 cache。
+
+工程上不能只问“有没有调用 fsync”，还要问：设备是否正确实现 flush，是否开启 write cache，是否有断电保护，虚拟化层是否透传 flush，RAID 控制器是否安全，云盘 SLA 具体承诺什么。
+
+面试中比较稳妥的表达是：`fsync()` 是应用请求持久化的接口，但最终保证依赖整条存储栈守约。任何一层提前确认、丢弃 flush 或错误处理不当，都会削弱持久性。
+
+## Q081. barrier 和 flush 为什么对 crash consistency 重要？
+
+**回答：**
+
+crash consistency 不只要求“这些块最后都写了”，还要求“这些块按正确顺序变得持久”。barrier、flush、FUA 这类机制就是用来约束顺序和设备缓存的。没有它们，底层为了性能重排写入，恢复时可能看到一个违反协议的不可能状态。
+
+先看一个 journal commit 的简化顺序：
+
+```text
+write data blocks
+write journal descriptor / metadata
+write journal commit block
+```
+
+文件系统希望恢复时看到的状态只有两类：commit block 不存在，这个事务没提交；commit block 存在，事务内容完整可 replay。问题是设备和控制器可能重排写入。如果 commit block 比前面的 journal 内容先持久化，崩溃后恢复逻辑看到 commit，以为事务完整，实际前面的块还没有落稳，就会出问题。
+
+flush 的作用是要求设备把之前已经收到的写入从 volatile cache 推到稳定位置。FUA 的作用是要求某个写本身完成时就已经进入非易失位置。barrier 更偏顺序语义：屏障前的写必须在屏障后的写之前到达持久顺序。现代 Linux 里具体实现通常通过 flush/FUA 组合表达。
+
+对应用来说，这些细节通常藏在 `fsync()` 后面。文件系统负责把“我要提交这个事务”翻译成合适的块层请求。但应用需要知道这个事实：如果设备或虚拟化层不正确处理 flush/FUA，`fsync()` 的持久性会被架空。
+
+还有一个性能影响。flush 通常很贵，因为它迫使设备停止攒批，把缓存里的内容写稳。频繁 `fsync()` 会制造大量 flush；group commit 的收益，很大一部分就是把多次提交合并到一次 flush 或 journal commit 里。
+
+面试里可以这样说：barrier 和 flush 是把逻辑顺序变成物理持久顺序的工具。没有顺序，journal、WAL、rename 发布协议都会出现“标记先落盘，内容后落盘”的风险。
+
+## Q082. group commit 为什么能显著提高吞吐？
+
+**回答：**
+
+group commit 的收益来自摊薄固定成本。一次 durable commit 往往要付 journal commit、块层提交、设备 flush、锁切换、线程唤醒等成本。这些成本和提交的字节数不完全成正比。把多笔事务合在一次同步里，就能让多个人共同支付这笔固定开销。
+
+最简单的 WAL 提交路径是：
+
+```text
+transaction A writes WAL
+fsync WAL
+ack A
+transaction B writes WAL
+fsync WAL
+ack B
+transaction C writes WAL
+fsync WAL
+ack C
+```
+
+如果每笔事务都单独 `fsync()`，设备会看到很多小同步请求。吞吐低，p99 也容易被 flush 队列拖高。
+
+group commit 改成：
+
+```text
+A writes WAL and waits
+B writes WAL and waits
+C writes WAL and waits
+one WAL writer fsyncs up to LSN_C
+ack A/B/C
+```
+
+关键点是 durable LSN。WAL writer 不需要为每个事务刷一次，只要一次同步覆盖到了某个 LSN，就可以唤醒所有 `commit_lsn <= durable_lsn` 的等待者。这样一次 flush 可以提交一批事务。
+
+它提高吞吐的原因包括：
+
+- 减少 flush 次数。
+- 顺序写 WAL，I/O 更容易合并。
+- 避免多个业务线程同时冲进 `fsync()`，减少 fsync storm。
+- 把锁和条件变量集中到一个 writer 或少量 writer，减少无序竞争。
+- 让设备队列更饱满，尤其是 NVMe 和云盘这类需要一定并发深度才能跑满的存储。
+
+代价也很直接：一部分请求要等批次形成。低负载时，为了攒批引入的等待可能不值得；高负载时，批次自然形成，group commit 几乎是白捡吞吐。
+
+面试中我会补一句工程边界：group commit 不降低单次 flush 的物理成本，它降低的是每条 record 平均承担的同步成本。可靠实现必须维护提交顺序、durable LSN、错误广播和超时策略。`fsync()` 失败时，不能只让当前 leader 请求失败，而要让所有被这次同步覆盖或依赖这次同步的等待者进入错误处理。
+
+## Q083. always fsync、batch fsync、interval fsync 如何体现 durability-latency trade-off？
+
+**回答：**
+
+这三个策略的区别，本质上是 ack 时机和可丢失窗口不同。
+
+`always fsync` 是最强的本地策略。每次写入或每个提交点都等 `fsync()` 成功后再返回成功。优点是调用方收到 ack 时，本机崩溃后大概率能恢复这条记录。缺点是延迟高、吞吐低，尤其小记录写入会被设备 flush 成本压住。
+
+`batch fsync` 是攒到一定数量或一定字节数后同步。比如每 64 条 record 或每 1MB 做一次 `fsync()`。优点是吞吐高很多，因为一次同步覆盖多条记录。缺点是批次内已写入 page cache、但还没 `fsync()` 的记录，如果进程或机器崩溃，可能丢失。对调用方来说，关键是 ack 发生在批前还是批后：
+
+- 如果批后 ack，客户端等待时间变长，但 ack 后的持久性强。
+- 如果批前 ack，延迟低，但最近一批 ack 过的记录也可能丢。
+
+`interval fsync` 是按时间刷，比如每 10ms、100ms 或 1s 同步一次。它通常适合“允许丢最近一小段时间数据”的场景，比如指标、临时事件、可重放队列。它的风险窗口更容易解释：最坏可能丢最近一个 interval 内已经写入但未同步的数据，再加上调度抖动和同步失败处理。
+
+这三者可以放在一张语义表里：
+
+| 策略 | ack 前是否等待同步 | 吞吐 | 单请求延迟 | 崩溃可能丢失 |
+| --- | --- | --- | --- | --- |
+| always fsync | 是 | 低 | 高 | 通常最小 |
+| batch fsync | 看实现 | 中到高 | 中等或抖动 | 一个批次内 |
+| interval fsync | 通常不逐条等 | 高 | 低 | 一个时间窗口内 |
+
+面试里我会主动说边界：性能优化不能偷换承诺。如果产品文档说“写成功后不丢”，那就不能先 ack 再 interval fsync。可以提供配置，让用户在 `always`、`batch`、`interval` 之间选择，但每个模式要明确 ack 语义、最大丢失窗口、fsync 错误怎么暴露，以及恢复时如何截断坏尾巴。
+
+## Q084. 如果系统突然断电，哪些写入可能丢失？
+
+**回答：**
+
+突然断电时，所有还没有进入稳定存储的状态都可能丢。要按层次看，而不是只看应用是否调用过 `write()`。
+
+可能丢失的包括：
+
+1. **用户态还没写出去的数据**
+
+   还在应用 buffer、语言运行时 buffer、stdio buffer 里的内容，内核根本没见过。比如只调用了 `fprintf()`，没 `fflush()`，更没 `write()`。
+
+2. **已经 `write()` 但还在 page cache 的数据**
+
+   这是最常见的误区。`write()` 成功后，数据可能只是 dirty page。断电时内存消失，这部分就没了。
+
+3. **已经下发到设备但还在 volatile write cache 的数据**
+
+   内核可能把块写给了设备，设备也返回了完成，但设备内部缓存没有断电保护。没有 flush/FUA 或断电保护时，这部分仍然可能丢。
+
+4. **已写数据块但元数据没持久的数据**
+
+   数据块可能在盘上，但文件大小、extent、目录项没有持久。恢复后应用读不到它，或者文件名不见了。
+
+5. **目录项变化**
+
+   新建文件、rename、unlink、link 这类命名空间变化，如果没有同步目录，崩溃后可能回退。
+
+6. **业务多文件事务中的一部分**
+
+   比如 data 文件写了，index 文件没写；manifest 指向新 segment，但 segment 本身没完整；WAL commit marker 写了，record body 没完整。这类不是文件系统单独能解决的。
+
+7. **远端或副本尚未确认的写入**
+
+   在云盘、NFS、分布式存储或数据库复制中，本地看到成功不代表所有副本都持久。leader 断电或 failover 时，未达到协议提交边界的写入可能丢。
+
+哪些不应该丢？如果一个普通本地文件的内容已经成功 `fsync()`，并且目录发布协议也同步了相关目录，底层设备又正确实现 flush，那么这部分数据应当能在本机崩溃后恢复。这里用了“应当”，不是因为语义含糊，而是因为硬件、文件系统、驱动、虚拟化层都必须守约。
+
+面试回答可以落到一句话：断电不是随机删除文件，而是把所有尚未跨过持久化边界的状态丢掉。可靠系统要定义这个边界，并让恢复逻辑只相信边界之前的数据。
+
+## Q085. 如何通过 crash test 验证写入协议？
+
+**回答：**
+
+crash test 要验证的是协议，不是验证某一次 happy path。目标是在很多崩溃点上反复打断系统，然后检查恢复后的状态是否满足不变量。
+
+一个可执行的测试框架通常包含四部分。
+
+第一，定义文件格式和不变量。比如 append log 可以要求：
+
+```text
+record = magic + length + lsn + payload + crc
+valid prefix: 所有 record 连续、checksum 正确、LSN 单调
+bad tail: 最多只允许出现在文件尾部
+index: 可由 valid prefix 重建，不允许指向不存在 record
+manifest: 只能指向已经 fsync 并发布的 segment
+```
+
+如果不变量没写清楚，crash test 只会变成“看起来没坏”。
+
+第二，枚举写入步骤和崩溃点。比如：
+
+```text
+write record header
+write record body
+write crc
+fdatasync WAL
+update index
+write manifest.tmp
+fsync manifest.tmp
+rename manifest.tmp -> manifest
+fsync directory
+ack client
+```
+
+每一步前后都可以杀进程，必要时还要模拟机器崩溃。进程 kill 只能覆盖用户态突然退出，不能等价于断电；真正的断电测试要让 page cache 和设备 cache 都丢掉，通常需要虚拟机快照、测试块设备、故障注入框架或专门的 crash testing 工具。
+
+第三，恢复后做判定。判定不应该只看程序能不能启动，还要检查：
+
+- 已 ack 的记录是否都能恢复，取决于你承诺的 ack 语义。
+- 未 ack 的记录可以丢，但不能造成结构损坏。
+- 最后一条半写 record 是否被正确截断。
+- index 是否能从 log 重建，是否存在越界 offset。
+- manifest 是否只发布完整对象。
+- `fsync()` 失败、ENOSPC、EIO 是否会阻止 ack。
+
+第四，做矩阵测试。不同文件系统、挂载参数、`always/batch/interval` 策略、文件预分配、segment rollover、目录 fsync、direct I/O、mmap、云盘都可能改变结果。只在开发机 ext4 上跑一次，不足以说明协议健壮。
+
+我会特别强调两点：
+
+- crash test 要测试“任意前缀都能恢复”，不能只测最终完整写完的状态。
+- 测试要把“进程崩溃”和“机器断电”分开。前者不会丢 page cache，后者会。
+
+面试里可以把结论说得直接一点：如果一个写入协议没有 crash test，只靠代码审查很难证明它可靠。最容易错的地方通常不是 `write()` 本身，而是 fsync 对象、目录同步、错误延迟、manifest 发布和恢复截断。
+
+## Q086. 为什么数据库通常把 WAL fsync 和数据页 flush 解耦？
+
+**回答：**
+
+因为数据库需要先保证可恢复，再追求数据页落盘。WAL 的作用就是把随机、复杂的数据页修改，变成顺序、可重放的日志。事务提交时只要 WAL 到达持久化边界，崩溃后就能用 WAL redo 把数据页补回来；不需要每次提交都把所有相关 data page 立即刷盘。
+
+如果不解耦，每个事务提交都要把被修改的数据页全部写稳。问题很多：
+
+- 数据页是随机写，位置分散，I/O 成本高。
+- 一个事务可能改多个 page，甚至多个表和索引。
+- 多个事务可能反复修改同一页，逐次 flush 会浪费。
+- 持有锁等待数据页落盘，会把提交延迟拖得很大。
+- 很难做 group commit。
+
+WAL 把路径改成：
+
+```text
+modify page in buffer pool
+append WAL record
+fsync WAL up to commit LSN
+ack commit
+later flush dirty data pages
+checkpoint records progress
+```
+
+这里的核心规则是 write-ahead：数据页落盘前，描述这次修改的 WAL 必须已经持久化。这样即使数据页只写了一半，恢复时也能从 checkpoint 开始 replay WAL，把页面修到一致状态。数据库还会用 page LSN 判断某个页面已经包含哪些 WAL 修改，避免重复或遗漏。
+
+解耦还有性能收益。WAL 是顺序追加，适合 group commit；数据页可以后台批量 flush，按 checkpoint、脏页比例、替换压力慢慢写。多个事务改同一页时，只需要最终写一次较新的页面版本。
+
+当然，解耦不是不要 flush 数据页。数据页一直不刷，WAL 会无限增长，恢复时间会变长，buffer pool 也会被脏页挤满。所以数据库需要 checkpoint、background writer、dirty page eviction 等机制来控制恢复成本和 I/O 峰值。
+
+面试里可以这样回答：WAL fsync 是提交路径上的正确性边界，数据页 flush 是后台收敛机制。把它们解耦，数据库才能同时得到可恢复性、较低提交延迟和可控恢复时间。
+
+## Q087. checkpoint 如何缩短恢复时间但引入 I/O 峰值？
+
+**回答：**
+
+checkpoint 的作用是把“恢复时要从很久以前开始重放 WAL”变成“从最近某个安全点开始重放”。它通过把一批脏数据页刷到磁盘，并记录一个 checkpoint record，告诉恢复流程：这个点之前的修改已经体现在数据文件里了，崩溃后从这里附近开始 redo 就够了。
+
+恢复时间为什么会缩短？因为数据库不需要从最早的 WAL 一直重放。checkpoint 越近，需要扫描和重放的 WAL 越少，启动恢复越快，旧 WAL segment 也更容易回收。
+
+代价是 checkpoint 要写很多脏页。平时事务提交只刷 WAL，脏数据页可以留在 buffer pool。到了 checkpoint，这些欠账要集中处理。如果控制不好，就会出现：
+
+- 磁盘写带宽被 checkpoint 占满。
+- 前台查询或提交的 fsync 被排队拖慢。
+- page cache 里积累大量写回，最后在 checkpoint 末尾统一 fsync 时卡住。
+- SSD 被后台写放大和 compaction 叠加影响，p99 抖动。
+- checkpoint 太频繁，还会增加 WAL 量，因为某些数据库需要在 checkpoint 后第一次修改页面时记录 full-page image。
+
+所以成熟数据库会做 checkpoint smoothing。不是等最后一秒把所有 dirty page 一次性写出去，而是在 checkpoint 周期内按目标速率逐步写。PostgreSQL 里的 checkpoint completion target 就是类似思路：尽量把 checkpoint I/O 摊开，减少瞬时尖峰。
+
+但摊开也有边界。checkpoint 拖得太长，恢复时可能保留更多 WAL，下一次 checkpoint 也可能追不上。checkpoint 太短，恢复快了，运行期 I/O 反而更重。
+
+面试回答可以落在这个 trade-off：checkpoint 是恢复时间和运行期 I/O 的交换。更频繁的 checkpoint 缩短恢复路径，但增加脏页写回和 WAL 额外开销；更稀疏的 checkpoint 平时轻一些，但崩溃恢复要重放更多日志。
+
+## Q088. direct I/O 为什么不一定更快？
+
+**回答：**
+
+Direct I/O 绕过 page cache，但绕过缓存不等于更快。它减少了一层内核缓存和一些内存拷贝，却把更多责任交给应用：对齐、I/O 大小、并发深度、缓存策略、读放大、写合并都要自己处理。做不好时，它比 buffered I/O 更慢。
+
+它适合的场景通常是数据库、日志系统、备份工具这类自己管理缓存和 I/O 调度的程序。数据库已经有 buffer pool，再让 OS page cache 缓一次，可能造成 double caching。Direct I/O 可以减少缓存污染，让数据库自己决定哪些 page 热、哪些 page 该淘汰。
+
+但它有几个常见成本。
+
+第一，对齐要求麻烦。buffer 地址、长度、文件 offset 往往都要满足设备和文件系统的对齐约束。不满足时可能失败，或者退化到别的路径。
+
+第二，小 I/O 很吃亏。page cache 能把小写合并成大写；direct I/O 往往更直接地下发请求。没有好的 batching 和队列深度，设备性能跑不出来。
+
+第三，失去 page cache 的读复用。对热点文件反复读，如果应用没有自己的缓存，direct I/O 会让每次读都更接近真实设备访问。
+
+第四，direct I/O 本身不提供 `O_SYNC` 的完整持久化保证。很多人以为“直接写盘”就等于断电安全，这是错的。没有同步标志、`fsync()` 或等价机制，仍然要考虑设备缓存和元数据。
+
+第五，和 buffered I/O 混用很容易复杂。缓存一致性、失效、顺序、性能都更难推理。某些文件系统会处理，但应用最好不要轻率混用。
+
+面试里我会这样说：direct I/O 是控制权交换，不是免费加速。它把 OS page cache 的优化拿掉，让应用自己承担缓存和批处理。如果应用没有能力管理这些细节，buffered I/O 往往更稳，甚至更快。
+
+## Q089. mmap 写入的故障语义为什么更难推理？
+
+**回答：**
+
+`mmap` 难推理，是因为它把“写文件”变成了“写内存”。应用修改的是映射地址，不再显式调用 `write()`。脏页什么时候产生、什么时候写回、错误什么时候暴露、哪些范围已经同步，都比普通 write path 更隐蔽。
+
+普通 `write()` 至少有清楚的调用边界：传入 buffer，返回写了多少字节，失败返回 errno。`mmap` 写入则是一次普通内存 store。你写 `p[10] = 'x'` 时，不会立刻得到 I/O 成功或失败的返回值。真正的写回可能发生在 `msync()`、`fsync()`、内存回收、进程退出或后台 writeback 中。
+
+难点主要有这些：
+
+1. **错误报告不直观**
+
+   磁盘满、I/O 错误、映射页写回失败，不一定能在写内存那一刻返回给你。某些错误可能通过 `msync()`、`fsync()`、信号或后续操作暴露。应用如果没有专门处理，很容易误以为内存写成功就是文件写成功。
+
+2. **范围边界容易错**
+
+   `msync(addr, len, MS_SYNC)` 同步的是映射范围。文件大小变化、目录项发布、其他 fd 上的元数据同步，不一定被这个范围覆盖。映射范围和文件语义不是完全同一层。
+
+3. **MAP_SHARED 和 MAP_PRIVATE 语义不同**
+
+   `MAP_SHARED` 的修改可以回写到底层文件；`MAP_PRIVATE` 是 copy-on-write，修改通常不会写回文件。面试中很多人只说 mmap 快，却忘了映射类型决定写回语义。
+
+4. **多进程可见性和持久性分离**
+
+   另一个进程可能通过同一个共享映射看到你的修改，但这仍然只是内存可见，不是持久化。
+
+5. **部分写和 torn state 更隐蔽**
+
+   结构体字段逐个 store，崩溃可能落在任意中间点。没有 WAL、版本号、checksum、双缓冲或 copy-on-write 发布协议，很难知道恢复后读到的是旧结构、新结构，还是混合结构。
+
+6. **和文件截断、扩展交互危险**
+
+   一个进程 mmap 后，另一个进程 truncate 文件，访问映射区域可能触发 SIGBUS。这类故障在普通 read/write 模型下更容易被返回值表达。
+
+所以 mmap 写持久数据时，不能只说“我调用了 msync”。还要设计 record 格式、提交标记、页对齐、错误处理、文件大小同步和目录发布。数据库和存储引擎用 mmap 通常会很谨慎，或者只把它用于读路径、缓存路径、受控的内存映射区域。
+
+一句话总结：mmap 把 I/O 变成内存访问，代码看起来简单，但提交边界、错误边界和崩溃边界都变模糊了。
+
+## Q090. 云盘和本地 NVMe 的 fsync 语义和延迟可能有什么不同？
+
+**回答：**
+
+语义上，应用看到的都是块设备或文件系统上的 `fsync()`；但实际路径差别很大。本地 NVMe 通常是本机 PCIe 设备，I/O 路径短，延迟主要来自内核、文件系统、设备队列、控制器和介质。云盘常常是网络块存储，`fsync()` 背后可能经过虚拟化层、宿主机、网络、存储服务、复制协议和后端介质。
+
+这带来两个差异：保证边界要看实现，延迟分布也不同。
+
+本地 NVMe 的优点是路径短、队列深、吞吐高、延迟低。缺点是故障域通常在本机或本盘，除非上层有复制，否则机器或盘损坏会影响数据可用性。它的 `fsync()` 如果硬件和驱动守约，通常更容易按本地稳定存储来推理。
+
+云盘的优点是托管、可迁移，很多产品在服务端做了复制和故障隔离。缺点是 `fsync()` 延迟会受网络、邻居负载、存储服务限流、突发额度、后端复制、虚拟化 flush 传递影响。平均值可能还可以，p99/p999 往往更难看。
+
+语义上最重要的是不要自行脑补。不同云盘对“写入成功”“flush 成功”“多副本持久”“可用区故障后仍可用”的承诺不同。有的语义是单卷多副本，有的是本地临时盘，有的是网络文件系统，有的是对象存储挂载。应用要看具体文档，并用 fio、数据库压测和 crash/failover test 验证。
+
+工程上我会关注这些问题：
+
+- `fsync()` 是否真正传到远端稳定存储。
+- 云盘是否有 IOPS/吞吐/突发额度限制。
+- p99 是否随队列深度、后台 snapshot、复制、迁移发生抖动。
+- 本地 NVMe 是否是 instance store，实例释放后是否丢失。
+- 是否需要数据库层复制，而不是只依赖单块云盘。
+- benchmark 是否区分 average、p95、p99、max，而不是只看吞吐。
+
+面试里可以这样答：本地 NVMe 更像一个低延迟本地持久化设备；云盘更像远端复制存储服务暴露出来的块设备。`fsync()` 的接口一样，但故障域、延迟尾部和服务承诺不同，不能用一组本地盘经验直接套云盘。
+
+## Q091. 为什么 p99 延迟常常受后台 flush 或 compaction 影响？
+
+**回答：**
+
+p99 看的是少数最慢请求，而后台 flush、checkpoint、compaction 正好会制造短时间资源竞争。平均值可能没变，尾部请求却刚好撞上了后台 I/O 峰值、锁竞争或设备队列拥塞。
+
+后台 flush 的影响比较直接。平时 buffered write 把数据留在 page cache，等 dirty pages 到阈值、到时间、遇到内存压力或遇到 `fsync()` 时再写回。如果前台请求刚好要 `fsync()`，它可能需要等待一批脏页和相关 journal 提交完成。请求本身只写了几 KB，但它替前面很多异步写入付了账。
+
+checkpoint 也类似。数据库为了缩短恢复时间，会周期性刷 dirty data pages。刷页期间，磁盘带宽、设备队列、文件系统锁、page cache writeback 都被占用。前台提交的 WAL fsync 可能排在后面，读请求也可能被写 I/O 干扰。
+
+compaction 对 LSM 或日志结构系统影响更明显。它会读旧 segment/SSTable，合并，写新文件，更新 manifest，删除旧文件。这个过程消耗 CPU、内存带宽、磁盘读写带宽，还可能污染 page cache。更麻烦的是，compaction 经常会生成大块顺序 I/O，看起来效率高，但会把设备队列占满，前台小 I/O 的尾延迟就上来了。
+
+还有几个常见放大器：
+
+- 写放大：前台写 1KB，后台整理可能写出多倍数据。
+- 锁放大：后台线程持有 manifest、版本集合、segment 列表或 inode 相关锁。
+- 缓存污染：compaction 读大量冷数据，把热点读缓存挤掉。
+- flush 聚集：很多文件同时 fsync 或 fdatasync，设备 cache 被频繁 flush。
+- cgroup 或云盘限流：后台任务吃掉额度，前台请求被限速。
+
+优化不能只说“把后台线程优先级调低”。更有效的是给后台任务做速率限制、I/O 隔离、compaction debt 控制、checkpoint smoothing、WAL 和 data file 分离、请求路径避免持全局锁等待 fsync，并且把 p99/p999 作为指标，而不是只看平均吞吐。
+
+面试里可以总结成：后台 flush 和 compaction 是把过去积累的写入债务还掉。p99 坏，往往不是当前请求很复杂，而是它被迫和后台还债共用同一套 I/O、锁和缓存资源。
+
+## Q092. 如何监控 fsync latency 和 dirty page writeback？
+
+**回答：**
+
+监控要分应用层、内核层和设备层。只看一个 `fsync` 平均值不够，必须把延迟分布、脏页状态、块设备队列和错误一起看。
+
+应用层先做最基本的埋点：
+
+- `fsync` / `fdatasync` 调用次数。
+- latency histogram：p50、p95、p99、p999、max。
+- 每次同步覆盖的 bytes、record 数、LSN 范围。
+- group commit batch size。
+- `fsync` 错误计数：EIO、ENOSPC、EDQUOT、EINTR。
+- 提交等待队列长度和等待时间。
+- ack 前后语义：有多少请求在 durable 前等待，有多少是异步 ack。
+
+内核层看 dirty writeback：
+
+```text
+/proc/meminfo: Dirty, Writeback
+/proc/vmstat: nr_dirty, nr_writeback, nr_dirtied, nr_written
+```
+
+Dirty 长期很高，说明 page cache 里欠账多。Writeback 长期不降，说明后台写回跟不上。`nr_dirtied` 和 `nr_written` 的差距扩大，也说明写入速度超过回写速度。再结合 `vm.dirty_ratio`、`vm.dirty_background_ratio`、`dirty_bytes`、`dirty_writeback_centisecs` 等参数，才能判断是不是 dirty throttling 或集中回写导致延迟。
+
+设备层看：
+
+- `iostat -x`：await、r_await、w_await、aqu-sz、util。
+- `pidstat -d`：进程级 I/O。
+- `blktrace` 或 eBPF/bpftrace：块层请求、flush、FUA、队列等待。
+- `perf` / ftrace：内核 writeback、journal commit、ext4_sync_file、xfs_file_fsync 等路径。
+- 云盘监控：IOPS、吞吐、队列深度、burst balance、throttle、volume latency。
+
+数据库或存储引擎还要看自己的后台任务：checkpoint 时长、checkpoint write bytes、WAL sync time、compaction pending bytes、compaction duration、flush queue length、manifest write latency。
+
+一个实用排查顺序是：
+
+```text
+fsync p99 升高
+  -> 看应用 batch size 和等待队列
+  -> 看 Dirty/Writeback 是否堆积
+  -> 看 iostat await/aqu-sz/util
+  -> 看是否有 checkpoint/compaction/backup/snapshot
+  -> 看是否有 ENOSPC/EIO 或云盘限流
+  -> 用 tracing 定位卡在 journal、block queue 还是设备 flush
+```
+
+面试里我会强调：监控 fsync latency 必须看 histogram。fsync 的平均值很容易骗人，真正影响用户体验的是尾部延迟，以及尾部是否和后台写回、checkpoint、compaction、云盘限流同一时间出现。
+
+## Q093. 如何向面试官解释性能优化和持久性保证之间的边界？
+
+**回答：**
+
+我会先把承诺说清楚，再谈优化。持久性不是一个可以事后补上的形容词，它取决于 ack 发生在什么位置。性能优化可以减少同步次数、合并写入、降低尾延迟，但不能偷偷把 durable ack 改成 best-effort ack。
+
+可以按三层回答。
+
+第一层是语义边界。要问清楚：客户端收到成功时，系统承诺了什么？
+
+- 只承诺进入内存队列？
+- 承诺写入本机 page cache？
+- 承诺本机 WAL 已 fsync？
+- 承诺目录项也发布成功？
+- 承诺多数副本已经持久？
+- 承诺远端对象存储已经可读？
+
+这些承诺不能混用。`write()` 成功、`fsync()` 成功、rename 成功、quorum commit 成功是不同级别。
+
+第二层是优化手段。可以优化，但要在语义边界内优化：
+
+- 用 group commit 合并多笔 WAL fsync。
+- 用 batch 或 interval 模式给可丢失数据降延迟，但配置和文档要写明可能丢失窗口。
+- 用 fdatasync 减少无关 metadata，同步范围不能窄到影响恢复读取。
+- 预分配 segment，减少提交路径上的 block allocation。
+- 把 WAL 顺序写和 data page flush 解耦。
+- checkpoint smoothing，避免后台 I/O 峰值打穿 p99。
+- 对后台 compaction、flush、backup 限速，保护前台提交。
+
+第三层是验证。任何关于持久性的说法，都要用 crash test、满盘测试、I/O 错误注入和恢复扫描验证。性能数字要同时报告吞吐和 p99，还要标明 fsync 策略、文件系统、存储设备、是否云盘、是否目录 fsync、是否预分配。
+
+如果面试官问“能不能为了性能少 fsync”，我会直接回答：可以，但必须改变对外承诺。比如日志型系统可以提供三档：
+
+| 模式 | ack 语义 | 适用场景 |
+| --- | --- | --- |
+| durable | WAL fsync 后 ack | 账务、元数据、不可重放任务 |
+| batch durable | 批量 fsync 后 ack 或批内等待 | 高吞吐但仍要明确 durable LSN |
+| async | write/page cache 后 ack，后台同步 | 指标、缓存、可重放事件 |
+
+边界说清楚后，优化才是工程选择；边界没说清楚，优化就是降级可靠性。这个回答也能自然连接到 LogServe 这类 append-only shared log：如果项目展示的是机制验证，可以同时实现 always、batch、interval 三种策略，但报告里必须把吞吐提升和可丢失窗口分开写，不能用高吞吐数字暗示同等持久性。
+
 ## 参考和校验点
 
 - [Linux man-pages: write(2)](https://man7.org/linux/man-pages/man2/write.2.html) 说明 `write()` 成功不保证数据已提交到磁盘，错误可能延迟到后续 `write()`、`fsync()` 或 `close()`。

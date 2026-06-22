@@ -5888,6 +5888,719 @@ I/O 指标上可以看 checkpoint write time、sync time、I/O await、device ut
 
 一句话：checkpoint 的瓶颈大多不是计算，而是“把大量已经发生的修改安全地推到稳定存储”。I/O 是主战场，锁和内存决定它会不会把前台请求一起拖下水。
 
+## Q082. append-only 为什么适合高吞吐顺序写？
+
+**回答：**
+
+append-only 适合高吞吐，原因不是“追加”这个词听起来简单，而是它把存储设备最讨厌的随机覆盖，变成了更容易批处理的顺序追加。对 WAL、Kafka partition、LSM 的 memtable flush、对象 manifest 这类系统来说，这一点很实用。
+
+普通随机更新会遇到几个问题：先定位旧位置，再读改写，可能还要更新索引和元数据；如果写入很小，设备和文件系统还要为很多细碎 I/O 付账。append-only 反过来处理：新记录只往文件尾部写，旧记录不原地覆盖。这样写入路径可以长得很短：
+
+```text
+encode record
+append to current segment
+update in-memory tail offset / LSN
+按策略 fsync 或 group commit
+```
+
+它快在几个地方。
+
+第一，顺序写更适合设备。HDD 上顺序写减少寻道；SSD 和 NVMe 虽然没有机械寻道，但也更喜欢较大、连续、可合并的写入。很多小写被攒成一批，提交成本就摊薄了。
+
+第二，page cache 和文件系统更容易帮忙。buffered write 可以把尾部追加先吸收到 page cache，再由 writeback 合并写出。文件系统分配 extent 时，也更容易拿到连续空间。
+
+第三，锁模型更简单。一个 WAL writer 或 partition leader 控制尾部 offset，不需要对大量旧位置做细粒度覆盖锁。并发请求可以先进入队列，最终按 log 顺序落下去。
+
+第四，恢复路径清楚。扫描日志时，只要从头或从 checkpoint 后开始读 record，读到第一条不完整或校验失败的尾巴就停。相比“到处都有原地覆盖”的文件格式，append-only 更容易定义有效前缀。
+
+但 append-only 不等于没有成本。它把更新成本推迟到了后面：旧版本会占空间，索引要指向最新 record，删除通常要写 tombstone，后台还要 retention、compaction 或 snapshot。也就是说，它是把前台写入路径做短，把清理和重写放到后台。
+
+面试里我会这样总结：append-only 的吞吐优势来自顺序写、批量提交、少随机覆盖、易恢复。它不是免费午餐，代价是空间膨胀和后台 compaction；系统设计要证明后台能追上前台写入。
+
+## Q083. WAL 为什么是很多存储系统的恢复基础？
+
+**回答：**
+
+WAL 能成为恢复基础，是因为它把“系统做过哪些修改”按确定顺序保存下来。崩溃后，内存没了，page cache 没了，后台 flush 可能只完成了一半；此时磁盘上的数据文件不一定完整，但 WAL 给恢复程序一个可以信任的顺序来源。
+
+数据库的核心规则是 write-ahead：数据页持久化之前，描述这次修改的 WAL record 必须先持久化。这样崩溃后有两种情况都能处理：
+
+```text
+WAL 已落盘，数据页没落盘 -> redo
+WAL 已落盘，数据页也落盘 -> 根据 pageLSN 跳过或确认
+```
+
+如果没有 WAL，系统要么每次提交都强制把所有数据页刷盘，要么崩溃后不知道哪些修改完成、哪些只完成一半。前者太慢，后者不可靠。
+
+WAL 还有几个工程上的好处。
+
+第一，它把提交路径压缩成“顺序写日志并同步”。数据页可以稍后刷，checkpoint 可以慢慢推进。前台事务不必等待所有随机 data page 写完。
+
+第二，它给恢复提供了边界。checkpoint 记录“到哪里为止数据文件已经可靠”，WAL 从这个位置之后继续 replay。没有这个边界，恢复可能要扫很久，甚至不知道从哪里开始。
+
+第三，它可以支撑复制和备份。很多数据库把 WAL 发给 standby，或者把 WAL 归档起来做 point-in-time recovery。只要 base backup 加连续 WAL 可用，就能恢复到某个目标时间点或 LSN 附近。
+
+第四，它把错误处理具体化。partial record、CRC 失败、LSN 跳跃、commit record 缺失，都能变成恢复程序可以判定的状态，而不是靠猜。
+
+不过 WAL 不是完整系统一致性的全部。它不替代事务隔离，不替代分布式共识，不替代业务幂等，也不替代 checksum。WAL 解决的是：本地持久化顺序和崩溃恢复依据。上层还要定义哪些事务算提交、哪些副本算提交、哪些外部副作用可以重放。
+
+一句话回答：WAL 是恢复基础，因为它把易丢的内存修改，变成了稳定存储上的有序、可校验、可重放记录。恢复程序不需要相信崩溃时的数据文件状态，只需要相信 WAL 的有效前缀。
+
+## Q084. redo log 和 event log 的语义有什么差异？
+
+**回答：**
+
+redo log 和 event log 都是日志，但服务对象不同。redo log 面向存储恢复，event log 面向业务事实。这个差异会影响格式、保留时间、可读性、兼容性和 replay 方式。
+
+redo log 记录的是“为了让存储状态恢复一致，需要怎样重做一次修改”。它可以很底层，比如 page id、offset、旧值、新值、slot 修改、B-tree 分裂，也可以是 physiological logging：逻辑上定位某个页，物理上描述页内变化。redo log 通常不追求业务可读性，它追求恢复准确、快速、幂等。
+
+event log 记录的是业务已经发生的事实，比如：
+
+```text
+OrderCreated
+PaymentCaptured
+InventoryReserved
+ActorCommandApplied
+WorkflowStepSucceeded
+```
+
+这些事件应该能被业务投影、审计、异步消费者理解。它们不只是为了修复磁盘页，而是系统对外语义的一部分。
+
+几个差异很关键：
+
+1. **抽象层级不同**
+
+   redo log 可以记录“page 42 offset 128 写入 8 个字节”。event log 应该记录“订单已支付”。前者依赖存储布局，后者依赖领域模型。
+
+2. **保留策略不同**
+
+   redo log 在 checkpoint、安全归档、复制确认后可以删除或回收。event log 往往要保留更久，因为它可能是审计、回放、重建投影和外部订阅的事实来源。
+
+3. **兼容要求不同**
+
+   redo log 只要数据库内核能读懂即可；event log 可能被多个服务、多个版本、多个语言消费，schema evolution 更难。
+
+4. **重放目标不同**
+
+   redo replay 目标是把存储页恢复到一致状态。event replay 目标是重建业务状态或投影，不能重新触发邮件、扣款、发货这类外部副作用。
+
+5. **可压缩性不同**
+
+   redo log 可以在恢复边界之后删除。event log 如果承担审计语义，就不能随便丢历史；如果只用于当前状态投影，才可以结合 snapshot 或 compaction 缩短重放。
+
+面试中我会提醒一个常见坑：不要把 event sourcing 的事件写成数据库 redo log。事件如果只描述“把余额字段从 100 改成 80”，业务含义就丢了；反过来，也不要拿业务事件直接当页级恢复日志，因为它未必包含足够的物理恢复信息。
+
+## Q085. WAL record 是物理变更还是逻辑事件会影响什么？
+
+**回答：**
+
+WAL record 的抽象层级，会直接影响恢复速度、格式兼容、跨版本升级、复制方式和调试难度。
+
+物理日志记录更接近磁盘布局。比如：
+
+```text
+page_id=7, offset=128, len=16, bytes=...
+```
+
+它的好处是恢复直接，redo 时找到页和偏移，把字节写回去即可。对崩溃恢复来说，这很可靠，也容易做 pageLSN 判断。缺点是它强依赖页面格式和存储布局。页面结构变了、压缩格式变了、索引组织变了，历史 WAL 的解释就会变复杂。
+
+逻辑日志记录的是操作意图或领域事件。比如：
+
+```text
+insert key K value V
+delete key K
+transfer account A -> B amount 20
+```
+
+它更可读，也更容易跨物理布局变化传播。逻辑复制、CDC、event sourcing 更偏这种形式。缺点是 replay 时必须重新执行逻辑，可能依赖当前索引、约束、并发状态和业务代码。若执行环境和当时不一致，结果可能不一致。
+
+很多数据库采用中间形态，也就是 physiological logging。它逻辑上定位到一个 page 或 record，物理上描述页内变化。ARIES 系统里常见这种设计：既避免完全物理日志过大，又避免完全逻辑日志 replay 太不确定。
+
+这个选择会影响：
+
+- **恢复确定性**：物理日志更确定，逻辑日志更依赖执行环境。
+- **日志大小**：物理 full-page image 可能很大，逻辑事件可能更小，但不总是。
+- **schema evolution**：逻辑事件要长期兼容；物理日志通常要求内核版本能读旧格式。
+- **复制**：物理复制更像复制存储状态，逻辑复制更像复制业务变更。
+- **审计**：逻辑事件适合审计，物理页改动很难给业务解释。
+- **幂等方式**：物理日志常用 pageLSN 跳过重复应用；逻辑事件常用 event id、版本号、去重表或条件更新。
+
+面试里可以这样答：WAL record 的层级越低，恢复越确定但越绑定存储实现；层级越高，语义越清楚但 replay 越依赖业务环境。工程上要先问“这个日志是给 crash recovery 用，还是给复制、审计、event sourcing 用”，再决定格式。
+
+## Q086. LSN 如何串联写入顺序、恢复顺序和 checkpoint？
+
+**回答：**
+
+LSN 可以理解成 WAL 中的全局位置。它既是写入顺序的编号，也是恢复顺序的坐标，还是 checkpoint 判断“从哪里开始恢复”的依据。
+
+在写入时，系统给每条 WAL record 分配一个递增 LSN。LSN 通常对应 WAL 文件中的字节位置或逻辑位置。事务提交时，commit record 也有自己的 LSN。系统维护几个重要水位：
+
+```text
+insert_lsn   已经分配/写入 WAL buffer 的位置
+write_lsn    已经写到内核或文件的位置
+flush_lsn    已经 fsync 到稳定存储的位置
+durable_lsn  对外可以承诺持久的最高位置
+replay_lsn   恢复或副本已经重放到的位置
+```
+
+不同系统名字不一样，但思想类似。
+
+恢复时，LSN 决定顺序。WAL replay 必须按 LSN 从小到大处理，因为后面的 record 可能依赖前面的 record。一个数据页上通常也会保存 pageLSN，表示这个页已经包含到哪个 WAL 修改。恢复时如果看到：
+
+```text
+page.pageLSN >= record.LSN
+```
+
+这条 redo 很可能已经应用过，可以跳过。这样 replay 就能幂等。
+
+checkpoint 也依赖 LSN。checkpoint 会记录一个 redo 起点，意思是：在这个 LSN 之前，相关数据页已经刷到一个可恢复边界；崩溃后不必从创世日志开始扫，而是从 checkpoint 指定的位置附近开始。数据库还会用 dirty page table 的 recLSN 找到最早仍可能需要 redo 的修改。
+
+LSN 还把复制和归档串起来。standby 可以报告 replay_lsn，归档系统可以确认哪些 segment 已经安全保存，主库可以根据最小需要位置决定哪些 WAL 能回收。如果某个 replication slot 或归档任务落后，老 WAL 就不能删。
+
+容易混淆的是：LSN 的“已写入”“已持久”“已提交”“已应用”不是一回事。record 分配了 LSN，不代表 fsync 了；WAL fsync 了，不代表事务一定 commit；commit record 持久了，也不代表数据页已经刷盘；副本收到 LSN，也不代表已经 replay。
+
+面试里我会用一句话收束：LSN 是恢复协议的尺子。写入按它排序，数据页用它判断是否已应用，checkpoint 用它缩短恢复范围，复制和归档用它管理保留边界。
+
+## Q087. partial record 如何通过 length、magic、CRC 检测？
+
+**回答：**
+
+partial record 是 WAL 最常见的崩溃边界之一。系统写一条 record 时，可能只写了 header，或者 body 写了一半，或者数据到了 page cache 但没到稳定存储。恢复程序必须能识别“有效前缀到哪里结束”，不能把坏尾巴当成真记录。
+
+常见 record 格式会包含这些字段：
+
+```text
+magic
+version
+header_length
+record_length
+LSN / sequence
+record_type
+payload
+CRC
+```
+
+`magic` 用来确认当前位置像一条 record 的起点。它不能单独证明 record 正确，但可以快速排除明显错位的数据。如果扫描到的位置 magic 不对，恢复程序通常认为有效日志到这里结束，或者在某些格式中尝试有限 resync。
+
+`length` 用来判断 record 是否完整。比如 header 说 payload 是 4KB，但当前 segment 剩余只有 2KB，或者读取到 EOF，说明这是尾部 partial record。对 append-only WAL 来说，尾部 partial 通常可以截断；中间出现 partial 就严重得多，可能说明文件损坏或写入协议错误。
+
+`CRC` 用来判断内容是否被写完整、是否 torn write、是否被误读。只检查 length 不够，因为 length 字段本身也可能是坏的。CRC 通常要覆盖 header 的关键字段和 payload，至少要覆盖 record type、length、LSN、payload，避免把错位内容误判为有效记录。
+
+更稳妥的恢复逻辑一般是：
+
+```text
+read header
+check magic/version/header length
+check record_length 合理，不超过最大值
+read full payload
+check CRC
+check LSN 连续或符合 segment 边界
+record valid -> apply or enqueue replay
+record invalid at tail -> stop and truncate tail
+record invalid in middle -> fail recovery or进入人工修复
+```
+
+为什么 tail 可以截断？因为 append-only log 的恢复不变量通常是“有效前缀”。崩溃发生在最后一条或最后几条还没提交的 record 上，这些 record 没有跨过持久化边界，丢掉可以接受。中间坏掉不一样：如果前后都有有效记录，中间缺一段，顺序历史断了，继续 replay 会制造假状态。
+
+还要注意 commit marker。某条数据 record CRC 正确，不代表事务已经提交。恢复时要看 commit record、durable LSN 或 group commit 边界。否则会把未提交修改也恢复出来。
+
+面试里可以说：length 判断“够不够长”，magic 判断“像不像起点”，CRC 判断“内容有没有坏”。三者一起，才能把崩溃尾巴和真实记录区分开。
+
+## Q088. 为什么 index 通常可以从 WAL 重建？
+
+**回答：**
+
+因为 WAL 或 append-only log 才是事实来源，index 只是为了快速查询而维护的派生结构。只要日志里保存了足够的信息，恢复时从头或从 checkpoint 后扫描 WAL，就能重新生成 index。
+
+一个简单 KV log 的 record 可能长这样：
+
+```text
+Put(key, value, seq)
+Delete(key, seq)
+```
+
+内存 index 可以是：
+
+```text
+key -> segment_id + offset + length + seq + deleted
+```
+
+如果进程崩溃，index 文件丢了，并不一定致命。恢复程序扫描 WAL：遇到 Put 就把 key 指向最新 offset；遇到 Delete 就标记 tombstone；遇到 seq 更旧的 record 就跳过。扫描结束后，内存 index 就回来了。
+
+这也是很多存储系统把 index 当成 materialized view 的原因。index 很重要，但它不是源数据。源数据是 WAL 中按顺序排列的 record。只要 record 有 key、operation、sequence、length、CRC，index 就可重建。
+
+当然，“可以重建”有前提：
+
+- WAL record 必须包含构建 index 所需的字段。
+- replay 顺序必须确定，通常按 LSN 或 seq。
+- 删除要有 tombstone，否则恢复后无法区分“没出现过”和“出现后被删”。
+- partial record 要能检测并截断。
+- compacted segment 发布要有安全协议，不能让 index 指向还没持久化的新 segment。
+- 如果 index 持久化到磁盘，它也要有版本和校验，不能盲目信任。
+
+为什么还要保存 index 文件？因为全量扫描 WAL 成本高。生产系统通常会保存 checkpoint、snapshot、SSTable index、segment sparse index 等结构，加快启动。但这些结构坏了，应该有从日志或数据文件重建的路径。
+
+面试里我会这样答：index 是加速结构，不应该比 WAL 更可信。恢复时优先相信 WAL 的有效前缀，用 WAL 重建 index；如果持久化 index 和 WAL 冲突，通常要以 WAL 和更高层的 manifest/commit marker 为准。
+
+## Q089. WAL replay 为什么要幂等？
+
+**回答：**
+
+WAL replay 必须幂等，因为恢复过程本身也可能崩溃，而且数据页可能已经包含了一部分修改。恢复程序不能假设“每条日志从未应用过”。它要能安全地重复执行，重复执行后状态仍然正确。
+
+最典型的场景是：
+
+```text
+record LSN=100 已经应用到 page P
+page P 刷盘成功
+系统崩溃
+恢复时又从 checkpoint 扫到 LSN=100
+```
+
+如果 redo 操作不是幂等的，比如“余额减 20”被执行两次，状态就坏了。正确做法是让数据页带 pageLSN：如果 pageLSN 已经大于等于 record LSN，说明这个修改已经体现在页上，replay 跳过。
+
+幂等也可以通过业务序列号实现。比如 actor command 有 `command_seq`，KV record 有 `seq`，event 有 `event_id`。replay 时先判断当前状态是否已经处理过这个序号，再决定是否应用。
+
+WAL replay 不幂等会暴露在很多地方：
+
+- 恢复到一半又崩溃，下次重复 replay。
+- checkpoint 记录保守，导致从更早 LSN 开始 replay。
+- data page 已经刷了，但 checkpoint 没更新。
+- 主从复制中 follower 收到重复日志。
+- 用户重试导致相同 idempotency key 的写入再次出现。
+
+不过要分清内部状态和外部副作用。修改内存表、数据页、materialized view 可以设计成幂等；发邮件、扣款、调用外部 HTTP 不能在 replay 时直接重做。外部副作用要用 outbox、effect log、幂等键和投递状态隔离。
+
+面试里可以说：WAL replay 的目标不是“刚好执行一次”，而是“执行一次或多次都到同一个结果”。存储恢复靠 pageLSN、LSN、sequence 和 checksum 保证这一点；业务事件 replay 还要避免重复触发外部动作。
+
+## Q090. snapshot 和 checkpoint 如何减少 replay 成本？
+
+**回答：**
+
+snapshot 和 checkpoint 都是在告诉系统：不用从最早的日志开始重放了。区别是 checkpoint 更偏恢复边界，snapshot 更偏状态物化。两者经常一起出现。
+
+checkpoint 的含义通常是：某个 LSN 之前的数据页或状态已经持久到一个可恢复位置。崩溃后，从 checkpoint 记录的 redo 起点之后开始扫描 WAL 就可以。它减少的是数据库恢复时需要检查和 redo 的日志范围。
+
+snapshot 的含义是：把某个对象或整个状态机在某个 LSN/offset/index 的状态直接保存下来。恢复时先加载 snapshot，再 replay snapshot 之后的日志。比如 actor 系统里，前 10000 条命令已经折叠成一个 actor snapshot，重启时不必从第一条命令开始跑。
+
+一个安全 snapshot 至少要带这些信息：
+
+```text
+snapshot_id
+covered_stream / partition / actor_id
+last_included_lsn 或 last_included_index
+term / epoch / schema_version
+checksum
+生成时间和格式版本
+```
+
+没有 last_included_lsn，恢复程序不知道从哪里接着 replay；没有 checksum，不能判断 snapshot 是否写完整；没有格式版本，升级后很难读历史 snapshot。
+
+发布顺序也重要。典型流程是：
+
+```text
+write snapshot.tmp
+fsync snapshot.tmp
+rename snapshot.tmp -> snapshot
+fsync parent directory
+write checkpoint/manifest 指向 snapshot
+fsync checkpoint/manifest
+```
+
+如果先发布 manifest，再写完 snapshot，崩溃后 manifest 会指向一个不存在或半写的快照。
+
+checkpoint 和 snapshot 的成本也不能忽略。它们减少 replay，却引入后台 I/O、CPU 序列化、锁竞争和存储占用。snapshot 太频繁，前台被拖慢；snapshot 太少，恢复很慢。好的系统会按日志长度、状态大小、恢复 SLO、后台 I/O 负载动态调整。
+
+面试里可以这样答：checkpoint 缩短“从哪里开始恢复”，snapshot 缩短“恢复时要重建多少状态”。二者都必须带明确的日志位置，并通过原子发布协议保证不会指向半成品。
+
+## Q091. log compaction 和 snapshot 的关系是什么？
+
+**回答：**
+
+log compaction 和 snapshot 都是在减少历史日志成本，但手段不同。compaction 重写日志，保留仍然有用的记录；snapshot 把状态直接物化，然后允许删除被覆盖的日志前缀。
+
+以 KV 存储为例，日志里可能有：
+
+```text
+Put A=1
+Put B=2
+Put A=3
+Delete B
+Put C=4
+```
+
+如果系统只关心当前状态，compaction 后可以保留：
+
+```text
+Put A=3
+Delete B   或在 tombstone 安全期后删除
+Put C=4
+```
+
+它还是日志，只是去掉了被后续记录覆盖的旧版本。
+
+snapshot 则会生成一个状态文件：
+
+```text
+snapshot at LSN=500: {A=3, C=4}
+```
+
+恢复时加载 snapshot，再 replay LSN 500 之后的新日志。旧日志可以在确认没有备份、复制、审计、PITR、慢消费者依赖之后回收。
+
+二者的关系可以这样理解：
+
+- compaction 适合保留“每个 key 的最新事实”或“仍需 replay 的最小日志集”。
+- snapshot 适合保留“某一时刻完整状态”。
+- compaction 后仍然可能需要 replay 一段日志。
+- snapshot 后也可能继续对后续日志做 compaction。
+- 两者都要保护安全删除边界，不能删除仍被恢复、复制、消费者或审计需要的历史。
+
+Kafka 的 log compaction 是按 key 保留较新的值，适合 changelog topic 或状态表恢复；Raft 的 snapshot 是把状态机应用到某个 index 后的状态保存下来，并用 last included index/term 替代旧日志前缀；数据库 checkpoint 更像恢复边界，不一定保存完整业务状态。
+
+面试中要避免一句“compaction 就是 snapshot”。不是。compaction 仍在日志层工作，snapshot 直接在状态层工作。它们都减少 replay 成本，但对审计、PITR、慢消费者和格式兼容的影响不同。
+
+## Q092. Kafka log 的 offset 和数据库 WAL 的 LSN 有什么相似点？
+
+**回答：**
+
+Kafka offset 和数据库 WAL LSN 都是日志位置。它们把一串追加记录变成可以定位、恢复、重放和确认进度的序列。没有这个位置概念，系统就很难回答“我读到哪里了”“我恢复到哪里了”“哪些日志可以删除”。
+
+相似点主要有这些：
+
+1. **都是单调推进的位置**
+
+   Kafka partition 内 offset 单调增加。数据库 WAL 中 LSN 也随日志写入向前推进。它们都能表达顺序。
+
+2. **都能作为 replay 起点**
+
+   Kafka consumer 从某个 offset 开始拉取；数据库恢复从 checkpoint 指定的 LSN 附近开始 redo。
+
+3. **都能作为 checkpoint 进度**
+
+   Kafka consumer 提交 offset，表示这个消费组处理到了哪里。数据库记录 checkpoint LSN、flush LSN、replay LSN，表示恢复和持久化进度。
+
+4. **都影响 retention**
+
+   Kafka 要考虑 retention、compaction、消费者滞后；数据库 WAL 要考虑 checkpoint、归档、replication slot、standby replay 进度。最慢的一方会拖住日志删除。
+
+5. **都能帮助定位问题**
+
+   出现重复消费、恢复卡住、复制延迟、日志膨胀时，offset/LSN 是排查坐标。
+
+差异也要讲清楚。
+
+Kafka offset 是 partition 内的公开消费位置。它主要服务消息读取、消费者进度和 broker 存储布局。不同 partition 的 offset 不能直接比较全局先后。
+
+数据库 LSN 通常是数据库内部 WAL 的全局或实例级位置。它和事务提交、pageLSN、checkpoint、flush、redo、归档、复制都有关系。LSN 不只是“读到哪里”，还表示哪些数据页修改受哪些 WAL record 保护。
+
+Kafka offset 提交通常是消费者语义：业务处理完再提交，或者批量提交。数据库 flush LSN 是持久化语义：WAL 到这个位置已经落到稳定存储。把这两者混在一起会出错。
+
+一句话：Kafka offset 和 WAL LSN 都是日志坐标；Kafka offset 更偏消息消费进度，WAL LSN 更偏存储恢复和持久化顺序。
+
+## Q093. Raft log 的 term/index 和 WAL 的 sequence 有什么差异？
+
+**回答：**
+
+WAL sequence 或 LSN 主要解决单机顺序和恢复；Raft 的 term/index 解决复制日志的一致性。它们都在给日志编号，但语义层级不一样。
+
+单机 WAL 里，LSN 通常表示“这条记录在本机日志中的位置”。只要本机按顺序写、按顺序恢复，就能用 LSN 串联 pageLSN、checkpoint、flush_lsn、replay_lsn。它不需要处理多个 leader，也不需要证明多数节点都同意这个位置的内容。
+
+Raft log 里，index 表示日志槽位，term 表示产生该条日志时的 leader 任期。两者一起用于解决这些问题：
+
+- 某个 index 上的记录是不是同一个 leader 任期产生的。
+- follower 的日志是否和 leader 匹配。
+- 旧 leader 的未提交日志能否被新 leader 覆盖。
+- 候选人的日志是否足够新，能不能赢得选举。
+- 某条日志是否已经被多数派复制并 committed。
+
+Raft 的 term 很关键。只有 index 不够，因为不同 leader 可能在同一个 index 上写过不同内容。term 让系统知道“这个位置的历史属于哪个领导任期”。Raft 的 log matching property 也依赖 index + term：如果两份日志在同一 index 上 term 相同，那么该 index 之前的日志也应该一致。
+
+WAL sequence 一般不处理这种冲突。单机 WAL 没有多个 leader 同时写同一条日志的场景。如果系统做主从复制但没有共识，LSN 也只能说明某个主库的本地顺序，不能天然说明多数派承认。
+
+所以面试里可以这样答：WAL LSN 是本地恢复坐标；Raft term/index 是分布式一致性坐标。Raft 关心“集群是否同意这个位置的命令”，WAL 关心“本机崩溃后能否按这个顺序恢复”。两者可以组合，但不能互相替代。
+
+## Q094. Raft log 解决复制一致性，单机 WAL 解决崩溃恢复，这两者如何组合？
+
+**回答：**
+
+实际系统里常常两者都要。Raft 保证多个节点对同一串命令达成一致；本地 WAL 保证每个节点重启后不丢掉自己已经承诺过的日志和状态。一个负责跨节点一致性，一个负责单节点崩溃恢复。
+
+一个简化写入路径是：
+
+```text
+client -> leader
+leader append Raft entry to local stable log
+leader send AppendEntries to followers
+followers append to local stable log and reply
+leader sees majority replicated -> mark committed
+leader apply to state machine
+leader reply client
+```
+
+这里的“append to stable log”在实现上就需要本地 WAL 或等价机制。否则 follower 回复成功后自己宕机，重启却找不到那条日志，Raft 的承诺就不稳。
+
+组合时要分清几个位置：
+
+- local append LSN：节点本地把 Raft entry 写到哪里。
+- local fsync/durable：节点是否把这条 entry 持久化。
+- replicated index：leader 已经发给哪些 follower。
+- commit index：是否被多数派承认。
+- applied index：状态机是否已经应用到这条命令。
+- snapshot index：旧日志前缀是否被快照替代。
+
+单机 WAL 只回答“这个节点重启后能不能找回本地日志”。Raft commit 回答“多数派是否保存了这条命令，并且未来 leader 必须包含它”。如果 leader 本地 fsync 成功但没有多数派，客户端通常不能认为提交；如果多数派内存接收但没有本地持久化，节点同时掉电后也可能丢。这取决于系统具体的持久化策略，但高可靠设计通常会要求参与确认的副本先持久化再 ack。
+
+状态机也需要恢复。节点重启后，先读取本地 Raft log/WAL，恢复 currentTerm、votedFor、log entries、commit index 相关状态，再根据 committed entries 重新 apply 或加载 snapshot 后继续 apply。apply 也要幂等，避免 crash 后重复执行状态机修改。
+
+面试里我会这样说：Raft 不是 fsync 的替代品，WAL 也不是 quorum 的替代品。Raft 把“哪条日志算集群提交”说清楚；WAL 把“每个副本重启后还记不记得自己说过的话”说清楚。可靠复制系统需要两层语义一起成立。
+
+## Q095. event sourcing 为什么要求事件表示事实而不是命令？
+
+**回答：**
+
+因为 replay 时事件会被当作已经发生的历史来重建状态。如果事件记录的是命令，也就是“请做某件事”，重放时系统就会重新做决策，结果可能和当时不同。事件应该记录“已经发生了什么”，不是“希望发生什么”。
+
+命令是意图：
+
+```text
+PlaceOrder
+ReserveInventory
+ChargeCreditCard
+CancelWorkflow
+```
+
+它可能成功，也可能失败。处理命令时要检查余额、库存、权限、幂等键、当前状态，还可能调用外部系统。
+
+事件是事实：
+
+```text
+OrderPlaced
+InventoryReserved
+PaymentCaptured
+WorkflowCancelled
+```
+
+它表示系统当时已经接受了这个结果。replay 时不应该再次判断库存够不够，也不应该再次扣款；只需要把事实应用到状态上。
+
+如果把命令当事件存，问题很快出现：
+
+- 当时库存够，现在库存不够，replay 结果变了。
+- 当时风控通过，现在规则变了，replay 失败。
+- 当时外部支付成功，replay 又发起一次扣款。
+- 当时命令被拒绝，但日志里只有命令，看不出业务事实。
+- 投影无法区分“收到请求”和“请求已生效”。
+
+事件还应该用过去式命名，带上决定后的结果和必要上下文。例如 `PaymentCaptured(amount=100, provider_txn_id=...)` 比 `CapturePayment(amount=100)` 更适合做事件。前者是事实，后者是动作请求。
+
+面试里可以这样答：event sourcing 的日志是系统事实账本。命令可以被拒绝，事件不能被重新裁决。把事件写成事实，replay 才是重建历史；把事件写成命令，replay 就变成重新跑业务流程，结果不可控。
+
+## Q096. event sourcing replay 如何避免重放外部副作用？
+
+**回答：**
+
+核心原则很简单：replay 只能重建内部状态，不能重新执行外部动作。发邮件、扣款、发货、调用第三方 API、推送消息，这些都不能因为重放历史事件而再来一次。
+
+常见做法是把状态变化和外部副作用拆开。
+
+事件处理器可以分成两类：
+
+```text
+pure projector: event -> internal state / read model
+effect dispatcher: event -> outbox -> external system
+```
+
+replay 时只运行 pure projector。它更新本地状态、物化视图、缓存、索引，不访问外部系统。effect dispatcher 在正常在线处理时工作，并且要记录投递状态。
+
+更稳妥的模式是 outbox：业务事务写入 event，同时写入 outbox record。后台 dispatcher 读取 outbox，给外部系统发送请求。每个请求带 idempotency key，比如 event_id 或 business_id。发送成功后记录 delivered 状态。replay event log 时，不重新生成未受控的外部请求；如果需要重建 outbox，也要根据 delivered 状态和目标系统幂等能力处理。
+
+还有几条工程规则：
+
+- event handler 默认应是纯函数，输入事件，输出状态变化。
+- 外部调用必须有幂等键，目标端也要支持去重或幂等覆盖。
+- replay 进程要有明确模式，比如 `replay=true`，禁止副作用 handler 注册。
+- 已发出的 effect 要有独立日志，不能只靠内存标记。
+- 如果事件中包含外部结果，比如 payment provider transaction id，replay 只使用这个结果，不重新请求支付。
+- 投影失败可以重建；外部副作用失败要走补偿、重试或人工处理，不能靠无限 replay 硬打。
+
+面试里我会说：event sourcing 的 replay 是“再计算”，不是“再执行世界”。内部状态可以重复计算，外部世界不能随便重复操作。把 outbox、幂等键、投递日志和 replay 模式分开，是避免事故的基本做法。
+
+## Q097. WAL 归档如何支持 point-in-time recovery？
+
+**回答：**
+
+Point-in-time recovery 依赖两样东西：一个可用的 base backup，以及从这个 backup 之后连续可读的 WAL。base backup 给你一个历史时刻附近的物理数据目录，WAL 让你把它向前重放到目标时间、目标 LSN 或目标事务附近。
+
+流程可以简化成：
+
+```text
+定期做 base backup
+持续归档 WAL segment
+恢复时还原某个 base backup
+配置 restore_command 拉取归档 WAL
+replay WAL 到目标时间点 / LSN / transaction
+停止恢复并打开数据库
+```
+
+为什么只靠 base backup 不够？因为 base backup 可能持续一段时间，备份过程中数据文件不断变化，内部状态并不是一个完美瞬时快照。WAL 可以把这段时间以及之后的修改补齐，让恢复结果一致。
+
+WAL 归档的关键要求是连续。只要中间缺一个 segment，恢复就可能断在那。系统要监控：
+
+- archive_command 是否成功。
+- 归档目录是否有完整 segment。
+- 归档延迟是否超过 RPO。
+- old WAL 是否在归档前被回收。
+- restore_command 找不到文件时是正常结束还是异常缺失。
+- timeline history 是否保存，避免 failover 后恢复到错误时间线。
+
+PITR 的目标点也要小心。恢复到“某个时间”不是业务上的绝对精确，取决于 WAL 记录的时间戳、事务提交顺序和恢复目标设置。更严格时会用 LSN、restore point 或事务 ID。
+
+面试里可以这样答：WAL 归档把数据库从“只能恢复到最近备份”提升到“可以从备份继续向前重放”。base backup 是起点，连续 WAL 是时间轴；缺任意一段 WAL，这条时间轴就断了。
+
+## Q098. WAL 格式变更如何影响历史可恢复性？
+
+**回答：**
+
+WAL 格式变更会直接影响历史日志还能不能被读取。崩溃恢复、PITR、复制、备份校验都依赖“当前恢复程序能解释历史 WAL”。如果新版本不再认识旧 record，或者同一个 record type 的含义变了，历史可恢复性就会出问题。
+
+安全的 WAL 格式通常会带这些字段：
+
+```text
+magic
+format_version
+record_type
+record_length
+feature_flags
+schema_version 或 payload_version
+CRC
+```
+
+版本字段不是摆设。恢复程序读到旧版本 record 时，要么知道如何解析，要么明确拒绝并给出升级边界。最危险的是静默误读：字段位置变了，CRC 又没有覆盖足够内容，恢复程序把旧 payload 当成新 payload 应用，数据就会坏得很隐蔽。
+
+格式升级要考虑几个场景。
+
+第一，进程升级后立即崩溃，磁盘上可能同时有旧格式和新格式 WAL。恢复程序必须能处理这个混合区间，或者升级时先创建明确的 checkpoint/upgrade record，保证边界清楚。
+
+第二，PITR 可能要恢复几个月前的 base backup。新版本数据库能不能用旧 WAL 恢复？如果不能，文档和运维工具要要求使用匹配版本恢复，再做升级。
+
+第三，复制链路中可能有旧 standby。主库写了新 WAL record，旧 standby 读不懂，就会断复制。需要版本协商或禁止不兼容拓扑。
+
+第四，event log 的兼容更久。业务事件可能被审计、投影、外部消费者长期读取。这里不能只保留一个内核 decoder，通常要做 schema evolution、默认值、向前/向后兼容和迁移工具。
+
+比较稳妥的策略是：
+
+- 新增 record type，不随意改变旧 type 语义。
+- payload 自描述或带版本。
+- CRC 覆盖版本、类型、长度和 payload。
+- 在 checkpoint 或 snapshot 里记录生成版本。
+- 升级前确保旧 WAL 已 checkpoint 或归档策略明确。
+- 保留旧 decoder，至少保留到所有可能恢复窗口结束。
+- 对未知 record 默认 fail fast，除非它被明确标记为可跳过。
+
+面试里可以说：WAL 是恢复协议的一部分，不是普通文件格式。格式变更如果没有版本和兼容策略，就是在赌历史永远不会被重放。可靠系统不能这样赌。
+
+## Q099. append-only 带来的存储膨胀如何通过 retention 和 compaction 控制？
+
+**回答：**
+
+append-only 不覆盖旧数据，所以写得越久，历史版本、删除标记、过期事件、旧 segment 都会堆起来。控制空间通常靠两类手段：retention 决定“哪些日志可以删”，compaction 决定“哪些历史可以折叠”。
+
+retention 是保留策略。常见维度有：
+
+- 按时间保留，比如保留 7 天。
+- 按大小保留，比如每个 topic 或 WAL 最多保留 1TB。
+- 按 checkpoint 保留，checkpoint 之前且不再需要恢复的 WAL 可以回收。
+- 按消费者进度保留，慢消费者没读到的位置之前不能删。
+- 按复制进度保留，standby 或 follower 没追上的日志不能删。
+- 按归档状态保留，PITR 需要的 WAL 未归档前不能删。
+- 按合规保留，审计日志即使没技术需要也不能提前删。
+
+compaction 是重写策略。对 KV/changelog 来说，旧的 `Put(key)` 可以被新的 `Put(key)` 覆盖，`Delete(key)` 可以用 tombstone 表示，等所有消费者都越过安全点后再清理 tombstone。对 LSM 来说，compaction 会把多个 SSTable 合并，丢掉被覆盖版本和过期 tombstone。对 Raft 来说，snapshot 可以替代已提交并已应用的日志前缀。
+
+两者必须受安全边界约束。不能因为磁盘快满就删掉还没归档的 WAL，也不能因为消费者慢就无限保留直到打爆磁盘。系统要有 backpressure、告警和降级策略。
+
+一个比较稳的清理判断是：
+
+```text
+可删除位置 = min(
+  checkpoint_safe_lsn,
+  archived_lsn,
+  all_required_replica_lsn,
+  all_required_consumer_offset,
+  legal_retention_boundary,
+  snapshot_last_included_lsn
+)
+```
+
+实际系统不一定所有项都有，但思想是取最保守的那个边界。
+
+面试里可以这样答：append-only 把写入变简单，把空间治理变复杂。retention 负责删不再需要的历史，compaction 负责把仍需保留的状态压缩成更小形式；两者都必须尊重恢复、复制、消费和审计边界。
+
+## Q100. 日志系统为什么需要 backpressure？
+
+**回答：**
+
+日志系统看起来只是不断 append，但它不是无限黑洞。只要生产速度长期超过 fsync、复制、归档、消费、compaction 或 snapshot 的处理速度，积压就会变成磁盘占满、恢复时间暴涨、p99 抖动，最后整个系统不可用。backpressure 的作用就是在还没崩之前把压力传回上游。
+
+积压可能出现在很多地方：
+
+- WAL fsync 变慢，commit 等待队列变长。
+- follower 或 standby 复制落后，主库不能回收旧 WAL。
+- archive_command 失败，归档目录缺 segment，`pg_wal` 越积越大。
+- Kafka consumer 落后，broker 要保留更多 segment。
+- compaction 跟不上写入，旧版本和 tombstone 堆积。
+- snapshot 太慢，actor 或 Raft log replay 成本不断上升。
+- 磁盘接近满，任何一次 segment rollover 都可能失败。
+
+没有 backpressure，系统通常会先表现为延迟升高，然后是日志膨胀，再到写入失败。更糟的是，磁盘满常常会破坏恢复路径：新 WAL 写不进去，checkpoint 写不完，manifest 发布失败，归档也没空间。
+
+backpressure 可以有很多层：
+
+```text
+限制 producer 写入速率
+限制每租户 bytes/s 或 records/s
+当 follower lag 超阈值时降低 leader 接收速度
+当 archive lag 超阈值时阻塞高风险写入
+当 compaction debt 过高时暂停低优先级写
+当磁盘水位过高时拒绝新写入或切只读
+让客户端收到明确的 retryable error
+```
+
+关键是不要只在最后一刻 ENOSPC。太晚了。更好的做法是分水位：warning、throttle、reject、read-only。每一档都有明确指标和恢复条件。
+
+面试里我会说：日志系统的可靠性不只在写入成功那一刻，也在系统能否长期排掉写入债务。backpressure 是保护持久化路径的机制，不是单纯的性能限速。
+
+## Q101. 如何在面试中把 WAL 从一个文件写入问题讲成系统一致性问题？
+
+**回答：**
+
+我会先承认 WAL 从表面看就是文件追加，但马上把问题拉到三个边界：提交边界、恢复边界、复制边界。只讲 `write()`、`fsync()`，最多是文件 I/O；讲清楚这三个边界，才是在讲系统一致性。
+
+第一步，说明提交边界。客户端什么时候能收到成功？
+
+```text
+write 到 page cache 后？
+WAL fsync 后？
+commit record 持久后？
+多数副本持久后？
+外部副作用完成后？
+```
+
+不同答案对应不同一致性承诺。WAL 的价值是把本地 durable commit 收敛到“日志已持久到某个 LSN”。如果系统为了性能先 ack 再 fsync，就必须承认可丢失窗口。
+
+第二步，说明恢复边界。崩溃后系统相信谁？成熟回答不是“重启后读文件”，而是：扫描 WAL 有效前缀，校验 length/magic/CRC，找到 checkpoint，按 LSN replay，利用 pageLSN 或 sequence 保证幂等，截断坏尾巴，重建 index 或 materialized view。
+
+第三步，说明复制边界。单机 WAL 只能保证本机恢复；分布式系统还要回答多数派、leader epoch、Raft term/index、replication slot、consumer offset。Kafka offset、数据库 LSN、Raft index 都是日志位置，但它们分别服务消费进度、本地恢复和集群共识。
+
+第四步，说明历史治理。append-only 让前台写快，但会带来 retention、compaction、snapshot、归档、PITR、schema evolution、backpressure。一个只会写日志、不知道何时删日志的系统，迟早会被日志拖垮。
+
+可以用这段口述收尾：
+
+```text
+WAL 不是单纯把 bytes 追加到文件。它定义了系统从“请求进入内存”到“崩溃后仍可证明”的路径。LSN 给出顺序，fsync 给出本地持久化边界，checkpoint 和 snapshot 控制恢复成本，CRC 和长度处理坏尾巴，复制协议把本地日志提升成集群提交。性能优化可以做 group commit、batch、compaction，但不能偷换 ack 语义。
+```
+
+如果结合 LogServe 这类项目，我会说得更谨慎：它可以用 shared log 展示 log-first 控制面、replay、actor/workflow/LLM 状态恢复和不同 fsync 策略的 trade-off；但单机机制验证不等于生产级分布式数据库。这样答既能把技术链路讲完整，也不会夸大项目边界。
+
 ## 参考和校验点
 
 - [PostgreSQL Documentation: Write-Ahead Logging](https://www.postgresql.org/docs/current/wal-intro.html) 说明 WAL 的核心规则：数据文件修改必须在对应 WAL record flush 到永久存储之后才能写入，并说明 WAL 如何支持 redo 和减少提交写入成本。

@@ -21,7 +21,7 @@ import (
 var migrationsFS embed.FS
 
 type PostgresStore struct {
-	memory *MemoryStore
+	memory Store
 	db     *sql.DB
 	mu     sync.Mutex
 	last   error
@@ -94,14 +94,10 @@ func (s *PostgresStore) LastError() error {
 }
 
 func (s *PostgresStore) remember(err error) {
-	if err == nil {
-		return
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.last = err
 }
-
 func (s *PostgresStore) CreateTask(task Task, idempotencyKey string) (Task, bool) {
 	created, duplicate := s.memory.CreateTask(task, idempotencyKey)
 	if !duplicate {
@@ -124,12 +120,16 @@ func (s *PostgresStore) ListTasks() []Task {
 
 func (s *PostgresStore) LeaseTask(taskID, workerID string) (Task, error) {
 	task, err := s.memory.LeaseTask(taskID, workerID)
-	if err == nil {
-		s.remember(s.persistTask(context.Background(), task))
+	if err != nil {
+		return task, err
 	}
-	return task, err
+	if persistErr := s.persistTask(context.Background(), task); persistErr != nil {
+		s.remember(persistErr)
+		return task, persistErr
+	}
+	s.remember(nil)
+	return task, nil
 }
-
 func (s *PostgresStore) ValidateTaskLease(taskID, workerID string, leaseEpoch uint64) (Task, error) {
 	return s.memory.ValidateTaskLease(taskID, workerID, leaseEpoch)
 }
@@ -142,14 +142,26 @@ func (s *PostgresStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task 
 	return tasks
 }
 
-func (s *PostgresStore) CompleteTask(taskID, workerID string, leaseEpoch uint64, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (Task, error) {
-	task, err := s.memory.CompleteTask(taskID, workerID, leaseEpoch, status, resultJSON, taskErr)
-	if err == nil {
+func (s *PostgresStore) RequeueTaskIfLeaseExpired(taskID string, leaseEpoch uint64, maxAge time.Duration) (Task, bool) {
+	task, requeued := s.memory.RequeueTaskIfLeaseExpired(taskID, leaseEpoch, maxAge)
+	if requeued {
 		s.remember(s.persistTask(context.Background(), task))
 	}
-	return task, err
+	return task, requeued
 }
 
+func (s *PostgresStore) CompleteTask(taskID, workerID string, leaseEpoch uint64, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (Task, error) {
+	task, err := s.memory.CompleteTask(taskID, workerID, leaseEpoch, status, resultJSON, taskErr)
+	if err != nil {
+		return task, err
+	}
+	if persistErr := s.persistTask(context.Background(), task); persistErr != nil {
+		s.remember(persistErr)
+		return task, persistErr
+	}
+	s.remember(nil)
+	return task, nil
+}
 func (s *PostgresStore) RegisterModel(model *logservepb.ModelInfo) *logservepb.ModelInfo {
 	registered := s.memory.RegisterModel(model)
 	s.remember(s.persistModel(context.Background(), registered))
@@ -186,12 +198,16 @@ func (s *PostgresStore) ListWorkflows() []workflow.State {
 
 func (s *PostgresStore) UpdateWorkflow(workflowID string, fn func(*workflow.State) error) (workflow.State, error) {
 	state, err := s.memory.UpdateWorkflow(workflowID, fn)
-	if err == nil {
-		s.remember(s.persistWorkflow(context.Background(), state))
+	if err != nil {
+		return state, err
 	}
-	return state, err
+	if persistErr := s.persistWorkflow(context.Background(), state); persistErr != nil {
+		s.remember(persistErr)
+		return state, persistErr
+	}
+	s.remember(nil)
+	return state, nil
 }
-
 func (s *PostgresStore) UpsertWorkflow(state workflow.State) {
 	s.memory.UpsertWorkflow(state)
 	s.remember(s.persistWorkflow(context.Background(), state))
@@ -257,12 +273,16 @@ func (s *PostgresStore) ListActors() []actor.State {
 
 func (s *PostgresStore) UpdateActor(actorID string, fn func(*actor.State) error) (actor.State, error) {
 	state, err := s.memory.UpdateActor(actorID, fn)
-	if err == nil {
-		s.remember(s.persistActor(context.Background(), state))
+	if err != nil {
+		return state, err
 	}
-	return state, err
+	if persistErr := s.persistActor(context.Background(), state); persistErr != nil {
+		s.remember(persistErr)
+		return state, persistErr
+	}
+	s.remember(nil)
+	return state, nil
 }
-
 func (s *PostgresStore) UpsertActor(state actor.State) {
 	s.memory.UpsertActor(state)
 	s.remember(s.persistActor(context.Background(), state))

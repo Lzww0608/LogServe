@@ -1,5 +1,10 @@
+import ast
+import builtins
 import json
+import os
 import sys
+import tempfile
+import time
 import types
 import traceback
 
@@ -46,6 +51,130 @@ def _install_fake_logserve():
     sys.modules["logserve"] = fake_logserve
 
 
+
+_ALLOWED_IMPORTS = {"logserve", "os", "time"}
+
+_SAFE_TIME_MODULE = types.ModuleType("time")
+_SAFE_TIME_MODULE.sleep = time.sleep
+_SAFE_TIME_MODULE.time = time.time
+_SAFE_TIME_MODULE.perf_counter = time.perf_counter
+
+_SAFE_OS_PATH_MODULE = types.ModuleType("posixpath")
+_SAFE_OS_PATH_MODULE.exists = os.path.exists
+_SAFE_OS_MODULE = types.ModuleType("os")
+_SAFE_OS_MODULE.path = _SAFE_OS_PATH_MODULE
+
+_SAFE_IMPORT_MODULES = {
+    "os": _SAFE_OS_MODULE,
+    "time": _SAFE_TIME_MODULE,
+}
+_FORBIDDEN_NAMES = {
+    "breakpoint",
+    "compile",
+    "delattr",
+    "dir",
+    "eval",
+    "exec",
+    "getattr",
+    "globals",
+    "input",
+    "locals",
+    "setattr",
+    "type",
+    "vars",
+    "__import__",
+}
+
+
+def _limited_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if level != 0 or name not in _ALLOWED_IMPORTS:
+        raise ImportError(f"imports are disabled in the LogServe executor: {name}")
+    if name == "logserve":
+        return sys.modules[name]
+    return _SAFE_IMPORT_MODULES[name]
+
+
+
+_ALLOWED_FILE_ROOTS = tuple(
+    os.path.abspath(root)
+    for root in {tempfile.gettempdir(), os.getenv("TMP", ""), os.getenv("TEMP", "")}
+    if root
+)
+
+
+def _safe_open(path, mode="r", *args, **kwargs):
+    if any(flag in mode for flag in ("+", "b")):
+        raise PermissionError("executor open only allows one-way text file access")
+    target = os.path.abspath(os.fspath(path))
+    if not any(os.path.commonpath([root, target]) == root for root in _ALLOWED_FILE_ROOTS):
+        raise PermissionError("executor open is restricted to the system temp directory")
+    return builtins.open(target, mode, *args, **kwargs)
+_SAFE_BUILTINS = {
+    "__build_class__": builtins.__build_class__,
+    "__import__": _limited_import,
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "Exception": Exception,
+    "filter": filter,
+    "float": float,
+    "int": int,
+    "len": len,
+    "list": list,
+    "map": map,
+    "max": max,
+    "min": min,
+    "open": _safe_open,
+    "print": print,
+    "range": range,
+    "RuntimeError": RuntimeError,
+    "set": set,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "TypeError": TypeError,
+    "ValueError": ValueError,
+    "zip": zip,
+}
+
+
+def _compile_user_source(source, filename):
+    tree = ast.parse(source, filename=filename, mode="exec")
+    _validate_user_ast(tree)
+    return compile(tree, filename, "exec")
+
+
+def _validate_user_ast(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in _ALLOWED_IMPORTS:
+                    raise ValueError(f"import is not allowed in executor source: {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level != 0 or node.module not in _ALLOWED_IMPORTS:
+                raise ValueError(f"import is not allowed in executor source: {node.module or ''}")
+        elif isinstance(node, ast.Name):
+            if node.id in _FORBIDDEN_NAMES:
+                raise ValueError(f"name is not allowed in executor source: {node.id}")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                raise ValueError(f"dunder attribute access is not allowed in executor source: {node.attr}")
+
+
+def _sandbox_namespace(name):
+    return {
+        "__builtins__": _SAFE_BUILTINS,
+        "__name__": name,
+        "task": _identity_decorator,
+        "workflow": _identity_decorator,
+        "actor": _identity_decorator,
+        "logserve": _LogServeModule,
+    }
+
 def handle_request(request):
     try:
         if request.get("mode") == "actor":
@@ -63,14 +192,8 @@ def handle_task(request):
     kwargs = args_payload.get("kwargs", {})
 
     _install_fake_logserve()
-    namespace = {
-        "__name__": "logserve_task",
-        "task": _identity_decorator,
-        "workflow": _identity_decorator,
-        "actor": _identity_decorator,
-        "logserve": _LogServeModule,
-    }
-    exec(compile(source, "<logserve-task>", "exec"), namespace, namespace)
+    namespace = _sandbox_namespace("logserve_task")
+    exec(_compile_user_source(source, "<logserve-task>"), namespace, namespace)
     fn = namespace[function_name]
     result = fn(*args, **kwargs)
     return {"ok": True, "result": result}
@@ -90,14 +213,8 @@ def handle_actor(request):
     init_kwargs = init_payload.get("kwargs", {})
 
     _install_fake_logserve()
-    namespace = {
-        "__name__": "logserve_actor",
-        "task": _identity_decorator,
-        "workflow": _identity_decorator,
-        "actor": _identity_decorator,
-        "logserve": _LogServeModule,
-    }
-    exec(compile(class_source, "<logserve-actor>", "exec"), namespace, namespace)
+    namespace = _sandbox_namespace("logserve_actor")
+    exec(_compile_user_source(class_source, "<logserve-actor>"), namespace, namespace)
     cls = namespace[class_name]
     if state:
         obj = cls.__new__(cls)

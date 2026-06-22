@@ -1,0 +1,155 @@
+services:
+  logd:
+    environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
+    volumes:
+      - ${LOGSERVE_EXPERIMENT_LOGSTORE_DIR:?set LOGSERVE_EXPERIMENT_LOGSTORE_DIR}:/var/lib/logserve/logstore
+
+  control:
+    environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
+      LOGSERVE_SCHEDULER_V2: "1"
+      LOGSERVE_METADATA_STORE: postgres
+      LOGSERVE_POSTGRES_DSN: postgres://${LOGSERVE_POSTGRES_USER:-logserve}:${LOGSERVE_POSTGRES_PASSWORD:?set LOGSERVE_POSTGRES_PASSWORD}@postgres:5432/${LOGSERVE_POSTGRES_DB:-logserve}?sslmode=${LOGSERVE_POSTGRES_SSLMODE:-disable}
+      LOGSERVE_RESULT_STORE: minio
+      LOGSERVE_S3_ENDPOINT: http://minio:9000
+      LOGSERVE_S3_BUCKET: ${LOGSERVE_S3_BUCKET:-logserve-results}
+      LOGSERVE_S3_ACCESS_KEY: ${LOGSERVE_S3_ACCESS_KEY:?set LOGSERVE_S3_ACCESS_KEY}
+      LOGSERVE_S3_SECRET_KEY: ${LOGSERVE_S3_SECRET_KEY:?set LOGSERVE_S3_SECRET_KEY}
+      LOGSERVE_S3_REGION: ${LOGSERVE_S3_REGION:-us-east-1}
+
+  worker:
+    profiles: ["disabled-default-worker"]
+
+  worker-a:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command:
+      - logserve-worker
+      - --worker-id
+      - worker-a
+      - --control-addr
+      - control:50052
+      - --log-addr
+      - logd:50051
+      - --executor
+      - /app/executor/python/server.py
+      - --models
+      - model-A:v1
+      - --capacity
+      - ${LOGSERVE_WORKER_CAPACITY:-1}
+      - --task-pool-size
+      - ${LOGSERVE_TASK_POOL_SIZE:-0}
+      - --llm-pool-size
+      - ${LOGSERVE_LLM_POOL_SIZE:-0}
+      - --actor-pool-size
+      - ${LOGSERVE_ACTOR_POOL_SIZE:-0}
+      - --model-source-dir
+      - /var/lib/logserve/checkpoints
+      - --model-cache-dir
+      - /var/lib/logserve/model-cache/worker-a
+      - --model-cache-capacity-bytes
+      - ${LOGSERVE_CHECKPOINT_CACHE_BYTES:-16777216}
+    environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
+    depends_on:
+      - control
+    volumes:
+      - ${LOGSERVE_CHECKPOINT_SOURCE_DIR:?set LOGSERVE_CHECKPOINT_SOURCE_DIR}:/var/lib/logserve/checkpoints:ro
+      - ${LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR:?set LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR}:/var/lib/logserve/model-cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+
+  worker-b:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command:
+      - logserve-worker
+      - --worker-id
+      - worker-b
+      - --control-addr
+      - control:50052
+      - --log-addr
+      - logd:50051
+      - --executor
+      - /app/executor/python/server.py
+      - --models
+      - model-B:v1
+      - --capacity
+      - ${LOGSERVE_WORKER_CAPACITY:-1}
+      - --task-pool-size
+      - ${LOGSERVE_TASK_POOL_SIZE:-0}
+      - --llm-pool-size
+      - ${LOGSERVE_LLM_POOL_SIZE:-0}
+      - --actor-pool-size
+      - ${LOGSERVE_ACTOR_POOL_SIZE:-0}
+      - --model-source-dir
+      - /var/lib/logserve/checkpoints
+      - --model-cache-dir
+      - /var/lib/logserve/model-cache/worker-b
+      - --model-cache-capacity-bytes
+      - ${LOGSERVE_CHECKPOINT_CACHE_BYTES:-16777216}
+    environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
+    depends_on:
+      - control
+    volumes:
+      - ${LOGSERVE_CHECKPOINT_SOURCE_DIR:?set LOGSERVE_CHECKPOINT_SOURCE_DIR}:/var/lib/logserve/checkpoints:ro
+      - ${LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR:?set LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR}:/var/lib/logserve/model-cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+
+  worker-c:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command:
+      - logserve-worker
+      - --worker-id
+      - worker-c
+      - --control-addr
+      - control:50052
+      - --log-addr
+      - logd:50051
+      - --executor
+      - /app/executor/python/server.py
+      - --capacity
+      - ${LOGSERVE_WORKER_CAPACITY:-1}
+      - --task-pool-size
+      - ${LOGSERVE_TASK_POOL_SIZE:-0}
+      - --llm-pool-size
+      - ${LOGSERVE_LLM_POOL_SIZE:-0}
+      - --actor-pool-size
+      - ${LOGSERVE_ACTOR_POOL_SIZE:-0}
+      - --model-source-dir
+      - /var/lib/logserve/checkpoints
+      - --model-cache-dir
+      - /var/lib/logserve/model-cache/worker-c
+      - --model-cache-capacity-bytes
+      - ${LOGSERVE_CHECKPOINT_CACHE_BYTES:-16777216}
+    environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
+    depends_on:
+      - control
+    volumes:
+      - ${LOGSERVE_CHECKPOINT_SOURCE_DIR:?set LOGSERVE_CHECKPOINT_SOURCE_DIR}:/var/lib/logserve/checkpoints:ro
+      - ${LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR:?set LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR}:/var/lib/logserve/model-cache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256

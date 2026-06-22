@@ -6,33 +6,44 @@ RUN_ID="${LOGSERVE_EXPERIMENT_ID:-$(date -u +%Y%m%dT%H%M%S%NZ)}"
 RUN_DIR="${LOGSERVE_EXPERIMENT_DIR:-"$ROOT/reports/experiment-$RUN_ID"}"
 STATUS_FILE="$RUN_DIR/command_status.jsonl"
 DATA_DIR="${LOGSERVE_EXPERIMENT_DATA_DIR:-"$RUN_DIR/runtime"}"
-DEFAULT_ADDRS="$(python - <<'PY'
+EXPERIMENT_MODE="${LOGSERVE_EXPERIMENT_MODE:-compose}"
+PYTHON_BOOTSTRAP="${PYTHON:-python3}"
+PYTHON="$PYTHON_BOOTSTRAP"
+CLI_BIN="$RUN_DIR/bin/logservectl"
+PACKAGE_PATH="$RUN_DIR/experiment-package.tar.gz"
+COMPOSE_ENV="$RUN_DIR/compose.env"
+COMPOSE_PROJECT="logserve-exp-${RUN_ID//[^a-zA-Z0-9]/}"
+
+PORTS="$("$PYTHON_BOOTSTRAP" - <<'PY'
 import socket
 
 sockets = []
 ports = []
-for _ in range(2):
+for _ in range(6):
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     sockets.append(sock)
     ports.append(sock.getsockname()[1])
-print(f"127.0.0.1:{ports[0]} 127.0.0.1:{ports[1]}")
+print(" ".join(str(port) for port in ports))
 for sock in sockets:
     sock.close()
 PY
 )"
-DEFAULT_LOG_ADDR="${DEFAULT_ADDRS%% *}"
-DEFAULT_CONTROL_ADDR="${DEFAULT_ADDRS##* }"
-LOG_ADDR="${LOGSERVE_EXPERIMENT_LOG_ADDR:-$DEFAULT_LOG_ADDR}"
-CONTROL_ADDR="${LOGSERVE_EXPERIMENT_CONTROL_ADDR:-$DEFAULT_CONTROL_ADDR}"
+read -r LOG_PORT CONTROL_PORT POSTGRES_PORT NATS_PORT MINIO_API_PORT MINIO_CONSOLE_PORT <<< "$PORTS"
+LOG_ADDR="${LOGSERVE_EXPERIMENT_LOG_ADDR:-127.0.0.1:$LOG_PORT}"
+CONTROL_ADDR="${LOGSERVE_EXPERIMENT_CONTROL_ADDR:-127.0.0.1:$CONTROL_PORT}"
 CHECKPOINT_SOURCE_DIR="${LOGSERVE_CHECKPOINT_SOURCE_DIR:-"$DATA_DIR/checkpoints"}"
 CHECKPOINT_CACHE_BYTES="${LOGSERVE_CHECKPOINT_CACHE_BYTES:-16777216}"
 WORKER_CAPACITY="${LOGSERVE_WORKER_CAPACITY:-1}"
 TASK_POOL_SIZE="${LOGSERVE_TASK_POOL_SIZE:-0}"
 LLM_POOL_SIZE="${LOGSERVE_LLM_POOL_SIZE:-0}"
 ACTOR_POOL_SIZE="${LOGSERVE_ACTOR_POOL_SIZE:-0}"
+API_TOKEN="${LOGSERVE_API_TOKEN:-"logserve-experiment-$RUN_ID"}"
+POSTGRES_PASSWORD="${LOGSERVE_POSTGRES_PASSWORD:-"logserve-postgres-$RUN_ID"}"
+S3_ACCESS_KEY="${LOGSERVE_S3_ACCESS_KEY:-logserve}"
+S3_SECRET_KEY="${LOGSERVE_S3_SECRET_KEY:-"logserve-minio-$RUN_ID"}"
 
-mkdir -p "$RUN_DIR" "$DATA_DIR"
+mkdir -p "$RUN_DIR" "$DATA_DIR" "$RUN_DIR/bin"
 : > "$STATUS_FILE"
 cd "$ROOT" || exit 1
 
@@ -40,18 +51,35 @@ export GOCACHE="${GOCACHE:-"$ROOT/.gocache"}"
 export PYTHONPATH="${PYTHONPATH:-"$ROOT/sdk/python"}"
 export LOGSERVE_SDK_TRANSPORT="${LOGSERVE_SDK_TRANSPORT:-grpc}"
 export LOGSERVE_CONTROL_ADDR="$CONTROL_ADDR"
+export LOGSERVE_API_TOKEN="$API_TOKEN"
+export LOGSERVE_SCHEDULER_V2="${LOGSERVE_SCHEDULER_V2:-1}"
 
 PIDS=()
 LAST_BG_PID=""
 ANY_FAIL=0
+LAST_STEP_CODE=0
+COMPOSE_STARTED=0
+COMPOSE_AVAILABLE=0
+COMPOSE_CMD=()
+
+json_escape() {
+  "$PYTHON_BOOTSTRAP" - "$1" <<'PY'
+import json
+import sys
+print(json.dumps(sys.argv[1])[1:-1])
+PY
+}
 
 record_status() {
   local name="$1"
   local code="$2"
   local duration="$3"
   local log_name="$4"
+  local escaped_name escaped_log
+  escaped_name="$(json_escape "$name")"
+  escaped_log="$(json_escape "$log_name")"
   printf '{"name":"%s","exit_code":%d,"duration_sec":%d,"log":"%s"}\n' \
-    "$name" "$code" "$duration" "$log_name" >> "$STATUS_FILE"
+    "$escaped_name" "$code" "$duration" "$escaped_log" >> "$STATUS_FILE"
   if [ "$code" -ne 0 ]; then
     ANY_FAIL=1
   fi
@@ -66,6 +94,7 @@ run_step() {
   start="$(date +%s)"
   "$@" > "$log" 2>&1
   code=$?
+  LAST_STEP_CODE="$code"
   end="$(date +%s)"
   record_status "$name" "$code" "$((end - start))" "$(basename "$log")"
   if [ "$code" -ne 0 ]; then
@@ -86,6 +115,7 @@ run_json_step() {
   start="$(date +%s)"
   "$@" > "$json_out" 2> "$log"
   code=$?
+  LAST_STEP_CODE="$code"
   end="$(date +%s)"
   record_status "$name" "$code" "$((end - start))" "$(basename "$log")"
   if [ "$code" -ne 0 ]; then
@@ -114,40 +144,39 @@ ensure_bg_alive() {
     return 0
   fi
   echo "$name process exited unexpectedly"
-  tail -n 40 "$RUN_DIR/$name.log" 2>/dev/null || true
+  tail -n 80 "$RUN_DIR/$name.log" 2>/dev/null || true
   return 1
 }
 
-prepare_checkpoints() {
-  local size_mb="${LOGSERVE_CHECKPOINT_MB:-1}"
-  local model
-  for model in model-A model-B model-C model-D; do
-    local dir="$CHECKPOINT_SOURCE_DIR/${model}-v1"
-    mkdir -p "$dir"
-    if [ ! -f "$dir/checkpoint.bin" ]; then
-      dd if=/dev/zero of="$dir/checkpoint.bin" bs=1M count="$size_mb" status=none
-    fi
-  done
+detect_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker compose)
+    COMPOSE_AVAILABLE=1
+    return 0
+  fi
+  if command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker-compose)
+    COMPOSE_AVAILABLE=1
+    return 0
+  fi
+  COMPOSE_AVAILABLE=0
+  return 1
 }
 
-verify_checkpoint_cache_artifact() {
-  local model="${LOGSERVE_CHECKPOINT_MODEL:-model-D}"
-  local version="${LOGSERVE_CHECKPOINT_VERSION:-v1}"
-  local checkpoint_name="${model}-${version}.checkpoint"
-  local matches
-  matches="$(find "$DATA_DIR/model-cache" -type f -name "$checkpoint_name" 2>/dev/null || true)"
-  if [ -z "$matches" ]; then
-    echo "missing local checkpoint cache artifact: $checkpoint_name under $DATA_DIR/model-cache"
-    echo
-    echo "existing model-cache files:"
-    find "$DATA_DIR/model-cache" -maxdepth 3 -type f -print 2>/dev/null || true
-    return 1
-  fi
-  echo "$matches"
-  return 0
+compose() {
+  "${COMPOSE_CMD[@]}" \
+    --env-file "$COMPOSE_ENV" \
+    -p "$COMPOSE_PROJECT" \
+    -f deployments/docker-compose.yml \
+    -f deployments/docker-compose.experiment.yml \
+    "$@"
 }
 
 cleanup() {
+  if [ "$COMPOSE_STARTED" -eq 1 ] && [ "$COMPOSE_AVAILABLE" -eq 1 ]; then
+    compose logs --no-color > "$RUN_DIR/compose.log" 2>&1 || true
+    compose down --remove-orphans --volumes > "$RUN_DIR/compose_down.log" 2>&1 || true
+  fi
   for pid in "${PIDS[@]:-}"; do
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
@@ -163,7 +192,7 @@ wait_tcp() {
   local host="$1"
   local port="$2"
   local timeout_sec="$3"
-  python - "$host" "$port" "$timeout_sec" <<'PY'
+  "$PYTHON_BOOTSTRAP" - "$host" "$port" "$timeout_sec" <<'PY'
 import socket
 import sys
 import time
@@ -183,13 +212,65 @@ sys.exit(1)
 PY
 }
 
+prepare_checkpoints() {
+  local size_mb="${LOGSERVE_CHECKPOINT_MB:-1}"
+  local model
+  for model in model-A model-B model-C model-D; do
+    local dir="$CHECKPOINT_SOURCE_DIR/${model}-v1"
+    mkdir -p "$dir"
+    if [ ! -f "$dir/checkpoint.bin" ]; then
+      dd if=/dev/zero of="$dir/checkpoint.bin" bs=1M count="$size_mb" status=none
+    fi
+  done
+}
+
+prepare_runtime_dirs() {
+  mkdir -p "$DATA_DIR/logstore" "$DATA_DIR/model-cache" "$CHECKPOINT_SOURCE_DIR"
+  prepare_checkpoints
+  chmod -R a+rwX "$DATA_DIR" 2>/dev/null || true
+}
+
+write_compose_env() {
+  cat > "$COMPOSE_ENV" <<EOF
+LOGSERVE_API_TOKEN=$API_TOKEN
+LOGSERVE_SCHEDULER_V2=1
+LOGSERVE_POSTGRES_USER=logserve
+LOGSERVE_POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+LOGSERVE_POSTGRES_DB=logserve
+LOGSERVE_POSTGRES_PORT=$POSTGRES_PORT
+LOGSERVE_NATS_PORT=$NATS_PORT
+LOGSERVE_MINIO_API_PORT=$MINIO_API_PORT
+LOGSERVE_MINIO_CONSOLE_PORT=$MINIO_CONSOLE_PORT
+LOGSERVE_LOGD_PORT=${LOG_ADDR##*:}
+LOGSERVE_CONTROL_PORT=${CONTROL_ADDR##*:}
+LOGSERVE_S3_ACCESS_KEY=$S3_ACCESS_KEY
+LOGSERVE_S3_SECRET_KEY=$S3_SECRET_KEY
+LOGSERVE_S3_BUCKET=logserve-results
+LOGSERVE_S3_REGION=us-east-1
+LOGSERVE_WORKER_CAPACITY=$WORKER_CAPACITY
+LOGSERVE_TASK_POOL_SIZE=$TASK_POOL_SIZE
+LOGSERVE_LLM_POOL_SIZE=$LLM_POOL_SIZE
+LOGSERVE_ACTOR_POOL_SIZE=$ACTOR_POOL_SIZE
+LOGSERVE_CHECKPOINT_CACHE_BYTES=$CHECKPOINT_CACHE_BYTES
+LOGSERVE_CHECKPOINT_SOURCE_DIR=$CHECKPOINT_SOURCE_DIR
+LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR=$DATA_DIR/model-cache
+LOGSERVE_EXPERIMENT_LOGSTORE_DIR=$DATA_DIR/logstore
+EOF
+}
+
 write_environment() {
   {
     echo "run_id=$RUN_ID"
+    echo "mode=$EXPERIMENT_MODE"
     echo "root=$ROOT"
     echo "run_dir=$RUN_DIR"
+    echo "data_dir=$DATA_DIR"
     echo "log_addr=$LOG_ADDR"
     echo "control_addr=$CONTROL_ADDR"
+    echo "postgres_port=$POSTGRES_PORT"
+    echo "nats_port=$NATS_PORT"
+    echo "minio_api_port=$MINIO_API_PORT"
+    echo "minio_console_port=$MINIO_CONSOLE_PORT"
     echo "checkpoint_source_dir=$CHECKPOINT_SOURCE_DIR"
     echo "checkpoint_cache_bytes=$CHECKPOINT_CACHE_BYTES"
     echo "worker_capacity=$WORKER_CAPACITY"
@@ -200,59 +281,160 @@ write_environment() {
     echo
     uname -a || true
     go version || true
-    python --version || true
+    "$PYTHON_BOOTSTRAP" --version || true
+    docker --version 2>/dev/null || true
+    if detect_compose; then "${COMPOSE_CMD[@]}" version || true; fi
     git rev-parse --short HEAD 2>/dev/null || true
     git status --short 2>/dev/null || true
   } > "$RUN_DIR/environment.txt"
 }
 
-start_runtime() {
-  mkdir -p "$DATA_DIR/logstore"
-  prepare_checkpoints
-  start_bg logd go run ./cmd/logserve-logd --addr "$LOG_ADDR" --data-dir "$DATA_DIR/logstore" --segment-size-bytes 67108864 --fsync-policy always
-  local logd_pid="$LAST_BG_PID"
-  if ! wait_tcp 127.0.0.1 "${LOG_ADDR##*:}" 30; then
-    record_status runtime_logd_start 1 30 logd.log
+verify_checkpoint_cache_artifact() {
+  local model="${LOGSERVE_CHECKPOINT_MODEL:-model-D}"
+  local version="${LOGSERVE_CHECKPOINT_VERSION:-v1}"
+  local checkpoint_name="${model}-${version}.checkpoint"
+  local matches
+  matches="$(find "$DATA_DIR/model-cache" -type f -name "$checkpoint_name" 2>/dev/null || true)"
+  if [ -z "$matches" ]; then
+    echo "missing local checkpoint cache artifact: $checkpoint_name under $DATA_DIR/model-cache"
+    echo
+    echo "existing model-cache files:"
+    find "$DATA_DIR/model-cache" -maxdepth 4 -type f -print 2>/dev/null || true
     return 1
   fi
-  if ! ensure_bg_alive logd "$logd_pid"; then
-    record_status runtime_logd_start 1 0 logd.log
+  echo "$matches"
+  return 0
+}
+
+wait_dashboard_workers() {
+  local want="${1:-3}"
+  local timeout_sec="${2:-90}"
+  local deadline now tmp count
+  tmp="$RUN_DIR/dashboard_wait.json"
+  deadline=$(( $(date +%s) + timeout_sec ))
+  while true; do
+    "$CLI_BIN" dashboard-snapshot --control-addr "$CONTROL_ADDR" > "$tmp" 2> "$RUN_DIR/dashboard_wait.stderr.log"
+    if [ "$?" -eq 0 ]; then
+      count="$("$PYTHON_BOOTSTRAP" - "$tmp" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig"))
+except Exception:
+    print(0)
+else:
+    print(len(data.get("workers") or []))
+PY
+)"
+      if [ "$count" -ge "$want" ]; then
+        return 0
+      fi
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      echo "dashboard worker count did not reach $want"
+      cat "$tmp" 2>/dev/null || true
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+start_native_runtime() {
+  prepare_runtime_dirs
+  start_bg logd go run ./cmd/logserve-logd --addr "$LOG_ADDR" --data-dir "$DATA_DIR/logstore" --segment-size-bytes 67108864 --fsync-policy always
+  local logd_pid="$LAST_BG_PID"
+  if ! wait_tcp 127.0.0.1 "${LOG_ADDR##*:}" 30 || ! ensure_bg_alive logd "$logd_pid"; then
+    record_status runtime_logd_start 1 30 logd.log
     return 1
   fi
   record_status runtime_logd_start 0 0 logd.log
 
   start_bg control go run ./cmd/logserve-control --addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR"
   local control_pid="$LAST_BG_PID"
-  if ! wait_tcp 127.0.0.1 "${CONTROL_ADDR##*:}" 30; then
+  if ! wait_tcp 127.0.0.1 "${CONTROL_ADDR##*:}" 30 || ! ensure_bg_alive control "$control_pid"; then
     record_status runtime_control_start 1 30 control.log
-    return 1
-  fi
-  if ! ensure_bg_alive control "$control_pid"; then
-    record_status runtime_control_start 1 0 control.log
     return 1
   fi
   record_status runtime_control_start 0 0 control.log
 
-  start_bg worker_1 go run ./cmd/logserve-worker --worker-id bench-worker-1 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-1" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
-  local worker_1_pid="$LAST_BG_PID"
-  start_bg worker_2 go run ./cmd/logserve-worker --worker-id bench-worker-2 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-2" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
-  local worker_2_pid="$LAST_BG_PID"
-  start_bg worker_3 go run ./cmd/logserve-worker --worker-id bench-worker-3 --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-3" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
-  local worker_3_pid="$LAST_BG_PID"
+  start_bg worker_a go run ./cmd/logserve-worker --worker-id worker-a --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-a" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  local worker_a_pid="$LAST_BG_PID"
+  start_bg worker_b go run ./cmd/logserve-worker --worker-id worker-b --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-b" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  local worker_b_pid="$LAST_BG_PID"
+  start_bg worker_c go run ./cmd/logserve-worker --worker-id worker-c --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-c" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  local worker_c_pid="$LAST_BG_PID"
   sleep 4
   local worker_start_code=0
-  ensure_bg_alive worker_1 "$worker_1_pid" || worker_start_code=1
-  ensure_bg_alive worker_2 "$worker_2_pid" || worker_start_code=1
-  ensure_bg_alive worker_3 "$worker_3_pid" || worker_start_code=1
-  record_status runtime_workers_start "$worker_start_code" 4 worker_1.log
-  if [ "$worker_start_code" -ne 0 ]; then
+  ensure_bg_alive worker_a "$worker_a_pid" || worker_start_code=1
+  ensure_bg_alive worker_b "$worker_b_pid" || worker_start_code=1
+  ensure_bg_alive worker_c "$worker_c_pid" || worker_start_code=1
+  record_status runtime_workers_start "$worker_start_code" 4 worker_a.log
+  return "$worker_start_code"
+}
+
+start_compose_runtime() {
+  prepare_runtime_dirs
+  write_compose_env
+  if ! detect_compose; then
+    echo "docker compose is required for LOGSERVE_EXPERIMENT_MODE=compose"
+    record_status runtime_compose_start 1 0 compose.log
     return 1
   fi
-  return 0
+  run_step compose_build "$RUN_DIR/compose_build.log" compose build
+  if [ "$LAST_STEP_CODE" -ne 0 ]; then
+    return 1
+  fi
+  echo "==> start compose runtime"
+  local start end code
+  start="$(date +%s)"
+  compose up -d postgres nats minio logd control worker-a worker-b worker-c > "$RUN_DIR/compose_up.log" 2>&1
+  code=$?
+  LAST_STEP_CODE="$code"
+  end="$(date +%s)"
+  COMPOSE_STARTED=1
+  record_status runtime_compose_start "$code" "$((end - start))" compose_up.log
+  if [ "$code" -ne 0 ]; then
+    return 1
+  fi
+  if ! wait_tcp 127.0.0.1 "${LOG_ADDR##*:}" 60; then
+    record_status runtime_logd_ready 1 60 compose.log
+    return 1
+  fi
+  record_status runtime_logd_ready 0 0 compose.log
+  if ! wait_tcp 127.0.0.1 "${CONTROL_ADDR##*:}" 90; then
+    record_status runtime_control_ready 1 90 compose.log
+    return 1
+  fi
+  record_status runtime_control_ready 0 0 compose.log
+  if wait_dashboard_workers 3 120 > "$RUN_DIR/runtime_workers_ready.log" 2>&1; then
+    record_status runtime_workers_ready 0 0 runtime_workers_ready.log
+    return 0
+  fi
+  record_status runtime_workers_ready 1 120 runtime_workers_ready.log
+  return 1
+}
+
+start_runtime() {
+  case "$EXPERIMENT_MODE" in
+    compose)
+      start_compose_runtime
+      ;;
+    native)
+      start_native_runtime
+      ;;
+    *)
+      echo "unsupported LOGSERVE_EXPERIMENT_MODE=$EXPERIMENT_MODE; use compose or native"
+      record_status runtime_mode 1 0 environment.txt
+      return 1
+      ;;
+  esac
 }
 
 write_fault_report() {
-  python - "$RUN_DIR" <<'PY'
+  "$PYTHON_BOOTSTRAP" - "$RUN_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -280,8 +462,35 @@ report = {
 PY
 }
 
+setup_python() {
+  if [ "${LOGSERVE_USE_VENV:-1}" != "1" ]; then
+    PYTHON="$PYTHON_BOOTSTRAP"
+    return 0
+  fi
+  run_step python_venv_create "$RUN_DIR/python_venv_create.log" "$PYTHON_BOOTSTRAP" -m venv "$RUN_DIR/venv"
+  PYTHON="$RUN_DIR/venv/bin/python"
+  if [ ! -x "$PYTHON" ]; then
+    PYTHON="$PYTHON_BOOTSTRAP"
+    return 1
+  fi
+  run_step python_pip_install "$RUN_DIR/python_pip_install.log" "$PYTHON" -m pip install -r sdk/python/requirements.txt
+  return 0
+}
+
+package_results() {
+  local tar_excludes=(--exclude ./experiment-package.tar.gz --exclude ./venv)
+  if [ "${LOGSERVE_EXPERIMENT_KEEP_RUNTIME:-0}" != "1" ]; then
+    tar_excludes+=(--exclude ./runtime)
+  fi
+  tar "${tar_excludes[@]}" -czf "$PACKAGE_PATH" -C "$RUN_DIR" . > "$RUN_DIR/package.log" 2>&1
+  local code=$?
+  record_status package_results "$code" 0 package.log
+  return "$code"
+}
+
 write_environment
 : > "$STATUS_FILE"
+setup_python
 
 if [ "${LOGSERVE_RUN_FULL_TESTS:-1}" = "1" ]; then
   run_step go_test_all "$RUN_DIR/go_test_all.log" go test -count=1 ./...
@@ -289,12 +498,19 @@ if [ "${LOGSERVE_RUN_FULL_TESTS:-1}" = "1" ]; then
 fi
 
 if [ "${LOGSERVE_RUN_RACE:-1}" = "1" ]; then
-  run_step go_race_control_worker "$RUN_DIR/go_race_control_worker.log" go test -race -count=1 ./internal/control ./internal/worker
+  run_step go_race_control_metadata_worker "$RUN_DIR/go_race_control_metadata_worker.log" go test -race -count=1 ./internal/control ./internal/metadata ./internal/worker
 fi
 
-run_step python_unittest "$RUN_DIR/python_unittest.log" python -m unittest discover sdk/python/tests
-run_step python_compileall "$RUN_DIR/python_compileall.log" python -m compileall -q sdk/python/logserve
-run_step python_grpc_deps "$RUN_DIR/python_grpc_deps.log" python -c "import grpc; import google.protobuf"
+run_step python_unittest "$RUN_DIR/python_unittest.log" "$PYTHON" -m unittest discover sdk/python/tests
+run_step python_compileall "$RUN_DIR/python_compileall.log" "$PYTHON" -m compileall -q sdk/python/logserve
+run_step python_grpc_deps "$RUN_DIR/python_grpc_deps.log" "$PYTHON" -c "import grpc; import google.protobuf"
+
+run_step build_logservectl "$RUN_DIR/build_logservectl.log" go build -o "$CLI_BIN" ./cmd/logservectl
+
+if [ "${LOGSERVE_RUN_GO_BENCH:-1}" = "1" ]; then
+  run_step scheduler_benchmark "$RUN_DIR/scheduler_benchmark.log" go test ./internal/control -run '^$' -bench BenchmarkSchedulerAssignMixedBacklog -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}"
+  run_step metadata_benchmark "$RUN_DIR/metadata_benchmark.log" go test ./internal/metadata -run '^$' -bench BenchmarkMemoryStore -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}" -memprofile "$RUN_DIR/metadata_heap.pprof" -mutexprofile "$RUN_DIR/metadata_mutex.pprof"
+fi
 
 if [ "${LOGSERVE_RUN_LOGSTORE_BENCH:-1}" = "1" ]; then
   run_step logstore_benchmark "$RUN_DIR/logstore_benchmark.log" env LOGSERVE_LOGBENCH_OUT="$RUN_DIR/logstore_latest.json" bash scripts/logstore_benchmark.sh
@@ -307,17 +523,19 @@ fi
 
 if [ "${LOGSERVE_RUN_BENCHMARK:-1}" = "1" ]; then
   if start_runtime; then
-    run_json_step benchmark "$RUN_DIR/benchmark.json" "$RUN_DIR/benchmark.stderr.log" python examples/evaluation/benchmark.py
-    run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" python examples/evaluation/checkpoint_cache.py
+    run_json_step benchmark "$RUN_DIR/benchmark.json" "$RUN_DIR/benchmark.stderr.log" "$PYTHON" examples/evaluation/benchmark.py
+    run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" "$PYTHON" examples/evaluation/checkpoint_cache.py
     run_step checkpoint_cache_artifact "$RUN_DIR/checkpoint_cache_artifact.log" verify_checkpoint_cache_artifact
-    run_json_step dashboard_snapshot "$RUN_DIR/dashboard_snapshot.json" "$RUN_DIR/dashboard_snapshot.stderr.log" go run ./cmd/logservectl dashboard-snapshot --control-addr "$CONTROL_ADDR"
+    run_json_step dashboard_snapshot "$RUN_DIR/dashboard_snapshot.json" "$RUN_DIR/dashboard_snapshot.stderr.log" "$CLI_BIN" dashboard-snapshot --control-addr "$CONTROL_ADDR"
   fi
 fi
 
-run_step summarize_experiment "$RUN_DIR/summarize_experiment.log" python scripts/summarize_experiment.py "$RUN_DIR"
-python scripts/summarize_experiment.py "$RUN_DIR" >> "$RUN_DIR/summarize_experiment.log" 2>&1 || true
+run_step summarize_experiment "$RUN_DIR/summarize_experiment.log" "$PYTHON_BOOTSTRAP" scripts/summarize_experiment.py "$RUN_DIR"
+package_results
+"$PYTHON_BOOTSTRAP" scripts/summarize_experiment.py "$RUN_DIR" >> "$RUN_DIR/summarize_experiment.log" 2>&1 || true
 
 echo
 echo "Experiment directory: $RUN_DIR"
 echo "Summary: $RUN_DIR/summary.md"
+echo "Package: $PACKAGE_PATH"
 exit "$ANY_FAIL"

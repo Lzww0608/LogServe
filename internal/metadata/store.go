@@ -16,6 +16,7 @@ type Store interface {
 	LeaseTask(taskID, workerID string) (Task, error)
 	ValidateTaskLease(taskID, workerID string, leaseEpoch uint64) (Task, error)
 	RequeueExpiredRunningTasks(maxAge time.Duration) []Task
+	RequeueTaskIfLeaseExpired(taskID string, leaseEpoch uint64, maxAge time.Duration) (Task, bool)
 	CompleteTask(taskID, workerID string, leaseEpoch uint64, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (Task, error)
 
 	RegisterModel(model *logservepb.ModelInfo) *logservepb.ModelInfo
@@ -46,3 +47,4 @@ type Store interface {
 }
 
 var _ Store = (*MemoryStore)(nil)
+var _ Store = (*MemoryStoreV2)(nil)

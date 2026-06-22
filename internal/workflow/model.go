@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 
 	"github.com/logserve/logserve/gen/logservepb"
 )
@@ -83,9 +85,72 @@ func ParseDefinition(data []byte) (Definition, error) {
 			def.Steps[i].TimeoutMs = def.TimeoutMs
 		}
 	}
+	if def.ResultStepID == "" && len(def.Steps) > 0 {
+		def.ResultStepID = def.Steps[len(def.Steps)-1].StepID
+	}
+	if err := ValidateDefinition(def); err != nil {
+		return Definition{}, err
+	}
 	return def, nil
 }
 
+func ValidateDefinition(def Definition) error {
+	if len(def.Steps) == 0 {
+		return errors.New("workflow must contain at least one step")
+	}
+	steps := make(map[string]StepDefinition, len(def.Steps))
+	for i, step := range def.Steps {
+		if step.StepID == "" {
+			return fmt.Errorf("workflow step %d has empty step_id", i)
+		}
+		if _, exists := steps[step.StepID]; exists {
+			return fmt.Errorf("duplicate workflow step_id %q", step.StepID)
+		}
+		steps[step.StepID] = step
+	}
+	if def.ResultStepID == "" {
+		return errors.New("result_step_id is required")
+	}
+	if _, ok := steps[def.ResultStepID]; !ok {
+		return fmt.Errorf("result_step_id %q does not match any step", def.ResultStepID)
+	}
+	for _, step := range def.Steps {
+		for _, dep := range step.DependsOn {
+			if dep == "" {
+				return fmt.Errorf("step %q has empty dependency", step.StepID)
+			}
+			if _, ok := steps[dep]; !ok {
+				return fmt.Errorf("step %q depends on unknown step %q", step.StepID, dep)
+			}
+		}
+	}
+	visiting := map[string]bool{}
+	visited := map[string]bool{}
+	var visit func(string) error
+	visit = func(stepID string) error {
+		if visiting[stepID] {
+			return fmt.Errorf("workflow dependency cycle includes step %q", stepID)
+		}
+		if visited[stepID] {
+			return nil
+		}
+		visiting[stepID] = true
+		for _, dep := range steps[stepID].DependsOn {
+			if err := visit(dep); err != nil {
+				return err
+			}
+		}
+		visiting[stepID] = false
+		visited[stepID] = true
+		return nil
+	}
+	for _, step := range def.Steps {
+		if err := visit(step.StepID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func NewState(workflowID string, def Definition, nowMs int64) State {
 	steps := make(map[string]StepState, len(def.Steps))
 	order := make([]string, 0, len(def.Steps))

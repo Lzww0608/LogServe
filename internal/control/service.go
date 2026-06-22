@@ -40,9 +40,11 @@ type taskLifecyclePayload struct {
 type Service struct {
 	logservepb.UnimplementedControlServiceServer
 	meta                  metadata.Store
-	log                   logservepb.LogServiceClient
+	log                   logClient
 	queueMu               sync.Mutex
 	queue                 []string
+	scheduler             *Scheduler
+	schedulerV2           bool
 	specMu                sync.RWMutex
 	specs                 map[string]*logservepb.TaskSpec
 	llmStatsMu            sync.RWMutex
@@ -60,12 +62,12 @@ type Service struct {
 	lastLogAppendMs       atomic.Int64
 }
 
-func NewService(meta metadata.Store, logClient logservepb.LogServiceClient) *Service {
+func NewService(meta metadata.Store, logClient logClient) *Service {
 	store, _ := objectstore.OpenLocal(filepath.Join(os.TempDir(), "logserve-objectstore"))
 	return NewServiceWithResultStore(meta, logClient, store, defaultResultInlineThreshold)
 }
 
-func NewServiceWithResultStore(meta metadata.Store, logClient logservepb.LogServiceClient, store objectstore.Store, threshold int) *Service {
+func NewServiceWithResultStore(meta metadata.Store, logClient logClient, store objectstore.Store, threshold int) *Service {
 	if threshold <= 0 {
 		threshold = defaultResultInlineThreshold
 	}
@@ -73,6 +75,8 @@ func NewServiceWithResultStore(meta metadata.Store, logClient logservepb.LogServ
 		meta:                  meta,
 		log:                   logClient,
 		queue:                 make([]string, 0, 1024),
+		scheduler:             newScheduler(),
+		schedulerV2:           os.Getenv("LOGSERVE_SCHEDULER_V2") == "1",
 		specs:                 make(map[string]*logservepb.TaskSpec),
 		llmStats:              make(map[llmStatsKey]llmWorkerStats),
 		actorLocks:            make(map[string]*sync.Mutex),
@@ -95,6 +99,16 @@ func (s *Service) appendLog(ctx context.Context, req *logservepb.AppendLogReques
 	return resp, err
 }
 
+func (s *Service) metadataPersisted() error {
+	reporter, ok := s.meta.(interface{ LastError() error })
+	if !ok {
+		return nil
+	}
+	if err := reporter.LastError(); err != nil {
+		return fmt.Errorf("metadata persistence failed: %w", err)
+	}
+	return nil
+}
 func (s *Service) getBackpressureConfig() (uint32, time.Duration, time.Duration) {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
@@ -105,6 +119,76 @@ func (s *Service) getSchedulingPolicy() logservepb.SchedulingPolicy {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
 	return s.schedulingPolicy
+}
+
+func (s *Service) useSchedulerV2() bool {
+	return s != nil && s.schedulerV2 && s.scheduler != nil
+}
+
+func (s *Service) syncSchedulerWorkers() {
+	if !s.useSchedulerV2() {
+		return
+	}
+	for _, worker := range s.meta.ListWorkers() {
+		s.scheduler.UpsertWorker(worker)
+	}
+}
+
+func (s *Service) updateSchedulerWorker(workerID string) {
+	if !s.useSchedulerV2() || workerID == "" {
+		return
+	}
+	if worker, ok := s.meta.GetWorker(workerID); ok {
+		s.scheduler.UpsertWorker(worker)
+	}
+}
+
+func (s *Service) completeSchedulerRunning(taskID string) {
+	if s != nil && s.scheduler != nil {
+		s.scheduler.CompleteRunning(taskID)
+	}
+}
+
+func (s *Service) schedulerSnapshot(workerID string) workerSnapshot {
+	snapshot := workerSnapshot{
+		WorkerID:         workerID,
+		ActorNextSeq:     make(map[string]uint64),
+		CachedModels:     make(map[modelKey]struct{}),
+		SchedulingPolicy: s.getSchedulingPolicy(),
+	}
+	if worker, ok := s.meta.GetWorker(workerID); ok {
+		snapshot.CachedModels = modelKeySet(worker.CachedModels)
+	}
+	for _, actorState := range s.meta.ListActors() {
+		if actorState.OwnerWorkerID != workerID {
+			continue
+		}
+		snapshot.ActorIDs = append(snapshot.ActorIDs, actorState.ActorID)
+		snapshot.ActorNextSeq[actorState.ActorID] = actorState.CommandCount + 1
+	}
+	sort.Strings(snapshot.ActorIDs)
+	return snapshot
+}
+
+func (s *Service) schedulerMetaFromTask(task metadata.Task) SchedMeta {
+	return SchedMeta{
+		TaskID:        task.TaskID,
+		TargetWorker:  task.TargetWorkerID,
+		ActorID:       task.ActorID,
+		CommandSeq:    task.ActorCommandSeq,
+		ModelName:     task.LLMModelName,
+		ModelVersion:  task.LLMModelVersion,
+		CreatedAtMs:   task.CreatedAtMs,
+		LeaseEpoch:    task.TaskLeaseEpoch,
+		RunningWorker: task.WorkerID,
+	}
+}
+
+func schedulerLeaseDeadlineMs(task metadata.Task, timeout time.Duration) int64 {
+	if timeout <= 0 || task.UpdatedAtMs == 0 {
+		return 0
+	}
+	return task.UpdatedAtMs + timeout.Milliseconds()
 }
 
 func (s *Service) SubmitTask(ctx context.Context, req *logservepb.SubmitTaskRequest) (*logservepb.SubmitTaskResponse, error) {
@@ -201,6 +285,11 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 		return nil, err
 	}
 	created, duplicate := s.meta.CreateWorkflow(state, req.GetIdempotencyKey())
+	if !duplicate {
+		if err := s.metadataPersisted(); err != nil {
+			return nil, err
+		}
+	}
 	if duplicate {
 		if err := ensureIdempotencyFingerprint("workflow", req.GetIdempotencyKey(), created.IdempotencyFingerprint, fingerprint); err != nil {
 			return nil, err
@@ -222,15 +311,10 @@ func (s *Service) GetWorkflowStatus(ctx context.Context, req *logservepb.GetWork
 }
 
 func (s *Service) ReplayWorkflow(ctx context.Context, req *logservepb.ReplayWorkflowRequest) (*logservepb.ReplayWorkflowResponse, error) {
-	resp, err := s.log.ReadLog(ctx, &logservepb.ReadLogRequest{
-		StreamId: workflowStream(req.GetWorkflowId()),
-		FromSeq:  1,
-		Limit:    10_000,
+	streamID := workflowStream(req.GetWorkflowId())
+	replayed, err := workflow.ReplayEach(req.GetWorkflowId(), func(emit func(*logservepb.LogRecord) error) error {
+		return s.forEachLogRecord(ctx, streamID, emit)
 	})
-	if err != nil {
-		return nil, err
-	}
-	replayed, err := workflow.Replay(req.GetWorkflowId(), resp.GetRecords())
 	if err != nil {
 		return nil, err
 	}
@@ -268,6 +352,10 @@ func (s *Service) RegisterWorker(ctx context.Context, req *logservepb.RegisterWo
 		CachedModels: modelCacheFromProto(req.GetCachedModels()),
 		Capacity:     req.GetCapacity(),
 	})
+	s.updateSchedulerWorker(req.GetWorkerId())
+	if err := s.metadataPersisted(); err != nil {
+		return nil, err
+	}
 	return &logservepb.RegisterWorkerResponse{Accepted: true}, nil
 }
 
@@ -276,6 +364,10 @@ func (s *Service) Heartbeat(ctx context.Context, req *logservepb.HeartbeatReques
 		return nil, errors.New("worker_id is required")
 	}
 	s.meta.Heartbeat(req.GetWorkerId(), modelCacheFromProto(req.GetCachedModels()))
+	s.updateSchedulerWorker(req.GetWorkerId())
+	if err := s.metadataPersisted(); err != nil {
+		return nil, err
+	}
 	return &logservepb.HeartbeatResponse{ServerTimeMs: time.Now().UnixMilli()}, nil
 }
 
@@ -283,6 +375,13 @@ func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest)
 	if req.GetWorkerId() == "" {
 		return nil, errors.New("worker_id is required")
 	}
+	if s.useSchedulerV2() {
+		return s.pollTaskIndexed(ctx, req)
+	}
+	return s.pollTaskLegacy(ctx, req)
+}
+
+func (s *Service) pollTaskLegacy(ctx context.Context, req *logservepb.PollTaskRequest) (*logservepb.PollTaskResponse, error) {
 	if err := s.redeliverExpiredTasks(ctx); err != nil {
 		return nil, err
 	}
@@ -321,6 +420,63 @@ func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest)
 	return &logservepb.PollTaskResponse{HasTask: false}, nil
 }
 
+func (s *Service) pollTaskIndexed(ctx context.Context, req *logservepb.PollTaskRequest) (*logservepb.PollTaskResponse, error) {
+	if err := s.redeliverExpiredTasks(ctx); err != nil {
+		return nil, err
+	}
+	workerID := req.GetWorkerId()
+	s.syncSchedulerWorkers()
+	snapshot := s.schedulerSnapshot(workerID)
+	check := func(meta SchedMeta) schedulerDecision {
+		spec := s.specForTask(meta.TaskID)
+		if spec == nil {
+			return schedulerDrop
+		}
+		task, ok := s.meta.GetTask(meta.TaskID)
+		if !ok || isTerminalTaskStatus(task.Status) {
+			return schedulerDrop
+		}
+		if task.Status != logservepb.TaskStatus_TASK_STATUS_QUEUED {
+			return schedulerDrop
+		}
+		if !s.actorMailboxReady(task, workerID) {
+			return schedulerSkip
+		}
+		if !s.canAssignTaskToWorker(meta.TaskID, spec, workerID) {
+			return schedulerSkip
+		}
+		return schedulerAssign
+	}
+	for {
+		meta, ok := s.scheduler.Assign(snapshot, time.Now().UnixMilli(), check)
+		if !ok {
+			return &logservepb.PollTaskResponse{HasTask: false}, nil
+		}
+		spec := s.specForTask(meta.TaskID)
+		if spec == nil {
+			s.scheduler.Forget(meta.TaskID)
+			continue
+		}
+		before, ok := s.meta.GetTask(meta.TaskID)
+		if !ok || before.Status != logservepb.TaskStatus_TASK_STATUS_QUEUED {
+			s.scheduler.Forget(meta.TaskID)
+			continue
+		}
+		leased, err := s.meta.LeaseTask(meta.TaskID, workerID)
+		if err != nil {
+			return nil, err
+		}
+		if before.Status == logservepb.TaskStatus_TASK_STATUS_QUEUED {
+			s.meta.IncrementWorkerLoad(workerID)
+			s.updateSchedulerWorker(workerID)
+		}
+		_, redeliveryTimeout, _ := s.getBackpressureConfig()
+		s.scheduler.TrackRunning(leased.TaskID, schedulerLeaseDeadlineMs(leased, redeliveryTimeout), leased.TaskLeaseEpoch)
+		leasedSpec := s.leasedTaskSpec(spec, leased)
+		return &logservepb.PollTaskResponse{HasTask: true, Task: leasedSpec}, nil
+	}
+}
+
 func (s *Service) actorMailboxReady(task metadata.Task, workerID string) bool {
 	if task.ActorID == "" {
 		return true
@@ -357,6 +513,12 @@ func (s *Service) StartTask(ctx context.Context, req *logservepb.StartTaskReques
 	if err != nil {
 		return nil, err
 	}
+	if isTerminalTaskStatus(task.Status) {
+		return &logservepb.StartTaskResponse{Accepted: true}, nil
+	}
+	if err := s.appendTaskStarted(ctx, task, req.GetWorkerId()); err != nil {
+		return nil, err
+	}
 	if task.ActorID != "" {
 		return &logservepb.StartTaskResponse{Accepted: true}, nil
 	}
@@ -367,29 +529,38 @@ func (s *Service) StartTask(ctx context.Context, req *logservepb.StartTaskReques
 	}
 	return &logservepb.StartTaskResponse{Accepted: true}, nil
 }
-
 func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTaskRequest) (*logservepb.CompleteTaskResponse, error) {
 	if req.GetStatus() != logservepb.TaskStatus_TASK_STATUS_SUCCEEDED && req.GetStatus() != logservepb.TaskStatus_TASK_STATUS_FAILED {
 		return nil, errors.New("complete status must be SUCCEEDED or FAILED")
 	}
 	existing, ok := s.meta.GetTask(req.GetTaskId())
-	if ok && existing.ActorID != "" {
-		if isTerminalTaskStatus(existing.Status) {
-			return &logservepb.CompleteTaskResponse{Accepted: true}, nil
-		}
-		if _, err := s.meta.ValidateTaskLease(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch()); err != nil {
+	if ok && isTerminalTaskStatus(existing.Status) {
+		s.completeSchedulerRunning(req.GetTaskId())
+		return &logservepb.CompleteTaskResponse{Accepted: true}, nil
+	}
+	validated, err := s.meta.ValidateTaskLease(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch())
+	if err != nil {
+		return nil, err
+	}
+	if validated.ActorID != "" {
+		if err := s.completeActorCall(ctx, validated, req); err != nil {
 			return nil, err
 		}
-		if err := s.completeActorCall(ctx, existing, req); err != nil {
+		if err := s.appendTaskTerminal(ctx, validated, req.GetStatus(), req.GetResultJson(), req.GetError()); err != nil {
 			return nil, err
 		}
 		if _, err := s.meta.CompleteTask(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch(), req.GetStatus(), req.GetResultJson(), req.GetError()); err != nil {
 			return nil, err
 		}
-		if existing.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
+		if ok && existing.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
 			s.meta.DecrementWorkerLoad(req.GetWorkerId())
 		}
+		s.completeSchedulerRunning(req.GetTaskId())
+		s.updateSchedulerWorker(req.GetWorkerId())
 		return &logservepb.CompleteTaskResponse{Accepted: true}, nil
+	}
+	if err := s.appendTaskTerminal(ctx, validated, req.GetStatus(), req.GetResultJson(), req.GetError()); err != nil {
+		return nil, err
 	}
 	task, err := s.meta.CompleteTask(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch(), req.GetStatus(), req.GetResultJson(), req.GetError())
 	if err != nil {
@@ -398,6 +569,8 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 	if ok && existing.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
 		s.meta.DecrementWorkerLoad(req.GetWorkerId())
 	}
+	s.completeSchedulerRunning(req.GetTaskId())
+	s.updateSchedulerWorker(req.GetWorkerId())
 	wasTerminal := ok && isTerminalTaskStatus(existing.Status)
 	if task.LLMModelName != "" && req.GetStatus() == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED && !wasTerminal {
 		if err := s.materializeLLMTaskCompletion(ctx, task.TaskID); err != nil {
@@ -417,7 +590,57 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 	}
 	return &logservepb.CompleteTaskResponse{Accepted: true}, nil
 }
+func (s *Service) appendTaskStarted(ctx context.Context, task metadata.Task, workerID string) error {
+	payload, _ := json.Marshal(map[string]any{
+		"task_id":          task.TaskID,
+		"worker_id":        workerID,
+		"task_lease_epoch": task.TaskLeaseEpoch,
+		"timestamp_ms":     time.Now().UnixMilli(),
+	})
+	_, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+		StreamId:       taskStream(task.TaskID),
+		EventType:      "TaskStarted",
+		IdempotencyKey: fmt.Sprintf("%s:started:%s:%d", task.TaskID, workerID, task.TaskLeaseEpoch),
+		Payload:        payload,
+	})
+	return err
+}
 
+func (s *Service) appendTaskTerminal(ctx context.Context, task metadata.Task, status logservepb.TaskStatus, resultJSON []byte, taskErr string) error {
+	eventType := "TaskCompleted"
+	if status == logservepb.TaskStatus_TASK_STATUS_FAILED {
+		eventType = "TaskFailed"
+	}
+	_, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+		StreamId:       taskStream(task.TaskID),
+		EventType:      eventType,
+		IdempotencyKey: taskTerminalIdempotencyKey(task.TaskID, eventType, task.WorkerID, task.TaskLeaseEpoch),
+		Payload:        taskTerminalLogPayload(task, status, resultJSON, taskErr),
+	})
+	return err
+}
+
+func taskTerminalLogPayload(task metadata.Task, status logservepb.TaskStatus, resultJSON []byte, taskErr string) []byte {
+	payload := map[string]any{
+		"task_id":          task.TaskID,
+		"worker_id":        task.WorkerID,
+		"status":           status.String(),
+		"task_lease_epoch": task.TaskLeaseEpoch,
+		"timestamp_ms":     time.Now().UnixMilli(),
+	}
+	if len(resultJSON) > 0 {
+		payload["result_json"] = json.RawMessage(resultJSON)
+	}
+	if taskErr != "" {
+		payload["error"] = taskErr
+	}
+	data, _ := json.Marshal(payload)
+	return data
+}
+
+func taskTerminalIdempotencyKey(taskID, eventType, workerID string, leaseEpoch uint64) string {
+	return fmt.Sprintf("%s:%s:%s:%d", taskID, eventType, workerID, leaseEpoch)
+}
 func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (metadata.Task, bool, error) {
 	return s.enqueueTaskWithMetadata(ctx, spec, nil)
 }
@@ -444,13 +667,19 @@ func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.
 			return metadata.Task{}, false, fmt.Errorf("backpressure: last log append latency %dms exceeds slow threshold %dms", lastLogAppend.Milliseconds(), logAppendSlowLimit.Milliseconds())
 		}
 	}
-	s.queueMu.Lock()
-	if queueHighWatermark > 0 && len(s.queue) >= int(queueHighWatermark) {
-		backlog := len(s.queue)
-		s.queueMu.Unlock()
-		return metadata.Task{}, false, fmt.Errorf("backpressure: queue backlog %d exceeds high watermark %d", backlog, queueHighWatermark)
+	if queueHighWatermark > 0 {
+		backlog := 0
+		if s.useSchedulerV2() {
+			backlog = s.scheduler.QueueDepth()
+		} else {
+			s.queueMu.Lock()
+			backlog = len(s.queue)
+			s.queueMu.Unlock()
+		}
+		if backlog >= int(queueHighWatermark) {
+			return metadata.Task{}, false, fmt.Errorf("backpressure: queue backlog %d exceeds high watermark %d", backlog, queueHighWatermark)
+		}
 	}
-	s.queueMu.Unlock()
 
 	payload, err := marshalTaskSubmittedPayload(spec)
 	if err != nil {
@@ -484,6 +713,11 @@ func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.
 		mutate(&taskRecord)
 	}
 	task, duplicate := s.meta.CreateTask(taskRecord, spec.GetIdempotencyKey())
+	if !duplicate {
+		if err := s.metadataPersisted(); err != nil {
+			return metadata.Task{}, false, err
+		}
+	}
 	if duplicate {
 		if err := ensureIdempotencyFingerprint("task", spec.GetIdempotencyKey(), task.IdempotencyFingerprint, fingerprint); err != nil {
 			return metadata.Task{}, false, err
@@ -495,9 +729,13 @@ func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.
 	s.specs[task.TaskID] = cloneSpec(spec)
 	s.specMu.Unlock()
 
-	s.queueMu.Lock()
-	defer s.queueMu.Unlock()
-	s.queue = append(s.queue, task.TaskID)
+	if s.useSchedulerV2() {
+		s.scheduler.Enqueue(s.schedulerMetaFromTask(task))
+	} else {
+		s.queueMu.Lock()
+		s.queue = append(s.queue, task.TaskID)
+		s.queueMu.Unlock()
+	}
 	return task, false, nil
 }
 

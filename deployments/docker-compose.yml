@@ -2,41 +2,63 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: logserve
-      POSTGRES_PASSWORD: logserve
-      POSTGRES_DB: logserve
+      POSTGRES_USER: ${LOGSERVE_POSTGRES_USER:-logserve}
+      POSTGRES_PASSWORD: ${LOGSERVE_POSTGRES_PASSWORD:?set LOGSERVE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${LOGSERVE_POSTGRES_DB:-logserve}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${LOGSERVE_POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
 
   nats:
     image: nats:2.10
     command: ["-js"]
     ports:
-      - "4222:4222"
+      - "127.0.0.1:${LOGSERVE_NATS_PORT:-4222}:4222"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: logserve
-      MINIO_ROOT_PASSWORD: logserve123
+      MINIO_ROOT_USER: ${LOGSERVE_S3_ACCESS_KEY:?set LOGSERVE_S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${LOGSERVE_S3_SECRET_KEY:?set LOGSERVE_S3_SECRET_KEY}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:${LOGSERVE_MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${LOGSERVE_MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio-data:/data
+    security_opt:
+      - no-new-privileges:true
 
   logd:
     build:
       context: ..
       dockerfile: deployments/Dockerfile
     command: ["logserve-logd", "--addr", "0.0.0.0:50051", "--data-dir", "/var/lib/logserve/logstore"]
+    environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
     ports:
-      - "50051:50051"
+      - "127.0.0.1:${LOGSERVE_LOGD_PORT:-50051}:50051"
     volumes:
       - logstore-data:/var/lib/logserve/logstore
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 1.0
 
   control:
     build:
@@ -44,29 +66,51 @@ services:
       dockerfile: deployments/Dockerfile
     command: ["logserve-control", "--addr", "0.0.0.0:50052", "--log-addr", "logd:50051"]
     environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
       LOGSERVE_METADATA_STORE: postgres
-      LOGSERVE_POSTGRES_DSN: postgres://logserve:logserve@postgres:5432/logserve?sslmode=disable
+      LOGSERVE_POSTGRES_DSN: postgres://${LOGSERVE_POSTGRES_USER:-logserve}:${LOGSERVE_POSTGRES_PASSWORD:?set LOGSERVE_POSTGRES_PASSWORD}@postgres:5432/${LOGSERVE_POSTGRES_DB:-logserve}?sslmode=${LOGSERVE_POSTGRES_SSLMODE:-disable}
       LOGSERVE_RESULT_STORE: minio
       LOGSERVE_S3_ENDPOINT: http://minio:9000
-      LOGSERVE_S3_BUCKET: logserve-results
-      LOGSERVE_S3_ACCESS_KEY: logserve
-      LOGSERVE_S3_SECRET_KEY: logserve123
-      LOGSERVE_S3_REGION: us-east-1
+      LOGSERVE_S3_BUCKET: ${LOGSERVE_S3_BUCKET:-logserve-results}
+      LOGSERVE_S3_ACCESS_KEY: ${LOGSERVE_S3_ACCESS_KEY:?set LOGSERVE_S3_ACCESS_KEY}
+      LOGSERVE_S3_SECRET_KEY: ${LOGSERVE_S3_SECRET_KEY:?set LOGSERVE_S3_SECRET_KEY}
+      LOGSERVE_S3_REGION: ${LOGSERVE_S3_REGION:-us-east-1}
     ports:
-      - "50052:50052"
+      - "127.0.0.1:${LOGSERVE_CONTROL_PORT:-50052}:50052"
     depends_on:
       - logd
       - postgres
       - nats
       - minio
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 1.0
 
   worker:
     build:
       context: ..
       dockerfile: deployments/Dockerfile
     command: ["logserve-worker", "--worker-id", "worker-1", "--control-addr", "control:50052", "--log-addr", "logd:50051", "--executor", "/app/executor/python/server.py"]
+    environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
     depends_on:
       - control
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
 
 volumes:
   postgres-data:

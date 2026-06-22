@@ -80,15 +80,28 @@ type ReplayResult struct {
 	SnapshotReplayCommands uint64
 }
 
+type RecordIterator func(func(*logservepb.LogRecord) error) error
+
 func Replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader) (ReplayResult, error) {
-	full, err := replay(actorID, records, loader, false)
+	return ReplayEach(actorID, func(emit func(*logservepb.LogRecord) error) error {
+		for _, rec := range records {
+			if err := emit(rec); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, loader)
+}
+
+func ReplayEach(actorID string, iterate RecordIterator, loader ResultLoader) (ReplayResult, error) {
+	full, err := replayEach(actorID, iterate, loader, false)
 	if err != nil {
 		if !errors.Is(err, errActorCreateEventNotFound) {
 			return ReplayResult{}, err
 		}
 		full = ReplayResult{}
 	}
-	withSnapshot, err := replay(actorID, records, loader, true)
+	withSnapshot, err := replayEach(actorID, iterate, loader, true)
 	if err != nil {
 		return ReplayResult{}, err
 	}
@@ -103,27 +116,30 @@ func Replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 	}, nil
 }
 
-func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader, useSnapshot bool) (ReplayResult, error) {
+func replayEach(actorID string, iterate RecordIterator, loader ResultLoader, useSnapshot bool) (ReplayResult, error) {
+	if iterate == nil {
+		return ReplayResult{}, errors.New("record iterator is required")
+	}
 	var state State
 	var snapshotCommandCount uint64
 	if useSnapshot {
-		for _, rec := range records {
+		if err := iterate(func(rec *logservepb.LogRecord) error {
 			if rec.GetEventType() != "ActorSnapshotCreated" {
-				continue
+				return nil
 			}
 			var payload EventPayload
 			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
-				return ReplayResult{}, err
+				return err
 			}
 			if payload.SnapshotRef == "" {
-				continue
+				return nil
 			}
 			if loader == nil {
-				return ReplayResult{}, errors.New("snapshot loader is required")
+				return errors.New("snapshot loader is required")
 			}
 			data, err := loader.LoadResult(payload.SnapshotRef)
 			if err != nil {
-				return ReplayResult{}, err
+				return err
 			}
 			state.ActorID = actorID
 			state.ClassName = payload.ClassName
@@ -138,15 +154,18 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			state.SnapshotEvery = payload.SnapshotEvery
 			state.UpdatedAtMs = payload.TimestampMs
 			snapshotCommandCount = payload.SnapshotCommandCount
+			return nil
+		}); err != nil {
+			return ReplayResult{}, err
 		}
 	}
 
 	var commands uint64
-	for _, rec := range records {
+	if err := iterate(func(rec *logservepb.LogRecord) error {
 		var payload EventPayload
 		if len(rec.GetPayload()) > 0 {
 			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
-				return ReplayResult{}, err
+				return err
 			}
 		}
 		if payload.TimestampMs == 0 {
@@ -181,7 +200,7 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			state.UpdatedAtMs = payload.TimestampMs
 		case "ActorCommandApplied":
 			if useSnapshot && payload.CommandCount <= snapshotCommandCount {
-				continue
+				return nil
 			}
 			if payload.CommandSeq > 0 {
 				state.CommandCount = payload.CommandSeq
@@ -196,7 +215,7 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			commands++
 		case "ActorCommandFailed":
 			if useSnapshot && payload.CommandCount <= snapshotCommandCount {
-				continue
+				return nil
 			}
 			if payload.CommandSeq > 0 {
 				state.CommandCount = payload.CommandSeq
@@ -228,15 +247,18 @@ func replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 			state.UpdatedAtMs = payload.TimestampMs
 			if useSnapshot && payload.SnapshotRef != "" {
 				if loader == nil {
-					return ReplayResult{}, errors.New("snapshot loader is required")
+					return errors.New("snapshot loader is required")
 				}
 				data, err := loader.LoadResult(payload.SnapshotRef)
 				if err != nil {
-					return ReplayResult{}, err
+					return err
 				}
 				state.StateJSON = NormalizeJSON(data)
 			}
 		}
+		return nil
+	}); err != nil {
+		return ReplayResult{}, err
 	}
 	if state.ActorID == "" {
 		return ReplayResult{}, errActorCreateEventNotFound

@@ -58,7 +58,11 @@ func (s *Service) RegisterModel(ctx context.Context, req *logservepb.RegisterMod
 	}); err != nil {
 		return nil, err
 	}
-	return &logservepb.RegisterModelResponse{Model: s.meta.RegisterModel(registered)}, nil
+	registeredModel := s.meta.RegisterModel(registered)
+	if err := s.metadataPersisted(); err != nil {
+		return nil, err
+	}
+	return &logservepb.RegisterModelResponse{Model: registeredModel}, nil
 }
 
 func (s *Service) SetSchedulingPolicy(ctx context.Context, req *logservepb.SetSchedulingPolicyRequest) (*logservepb.SetSchedulingPolicyResponse, error) {
@@ -138,20 +142,12 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 	if req.GetTaskId() == "" {
 		return nil, errors.New("task_id is required")
 	}
-	resp, err := s.log.ReadLog(ctx, &logservepb.ReadLogRequest{
-		StreamId: llmStream(req.GetTaskId()),
-		FromSeq:  1,
-		Limit:    1000,
-	})
-	if err != nil {
-		return nil, err
-	}
 	out := &logservepb.ReplayLLMResponse{TaskId: req.GetTaskId()}
-	for _, rec := range resp.GetRecords() {
+	if err := s.forEachLogRecord(ctx, llmStream(req.GetTaskId()), func(rec *logservepb.LogRecord) error {
 		var payload llmEventPayload
 		if len(rec.GetPayload()) > 0 {
 			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		if payload.TimestampMs == 0 {
@@ -200,11 +196,17 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 			out.FirstTokenMs = payload.FirstTokenMs
 			out.TotalLatencyMs = payload.TotalLatencyMs
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 func (s *Service) canAssignTaskToWorker(taskID string, spec *logservepb.TaskSpec, workerID string) bool {
+	if s.useSchedulerV2() {
+		return s.canAssignTaskToWorkerIndexed(taskID, spec, workerID)
+	}
 	if spec.GetActorId() == "" && spec.GetTargetWorkerId() != "" && spec.GetTargetWorkerId() != workerID {
 		return false
 	}
@@ -227,7 +229,42 @@ func (s *Service) canAssignTaskToWorker(taskID string, spec *logservepb.TaskSpec
 	}
 }
 
+func (s *Service) canAssignTaskToWorkerIndexed(taskID string, spec *logservepb.TaskSpec, workerID string) bool {
+	if spec.GetActorId() == "" && spec.GetTargetWorkerId() != "" && spec.GetTargetWorkerId() != workerID {
+		return false
+	}
+	if spec.GetLlmModelName() == "" {
+		return true
+	}
+	worker, ok := s.meta.GetWorker(workerID)
+	if !ok || !workerHasCapacity(worker) {
+		return false
+	}
+	switch s.getSchedulingPolicy() {
+	case logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY:
+		return true
+	case logservepb.SchedulingPolicy_SCHEDULING_POLICY_PREDICTED_LATENCY:
+		preferred := s.predictedLLMWorker(taskID, spec)
+		return preferred == "" || preferred == workerID
+	default:
+		return true
+	}
+}
+
 func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) string {
+	if s.useSchedulerV2() {
+		s.syncSchedulerWorkers()
+		createdAtMs := int64(0)
+		if task, ok := s.meta.GetTask(taskID); ok {
+			createdAtMs = task.CreatedAtMs
+		}
+		return s.scheduler.PreferredLocalityWorker(
+			modelKeyFromParts(spec.GetLlmModelName(), spec.GetLlmModelVersion()),
+			createdAtMs,
+			time.Now().UnixMilli(),
+			localityQueueWait.Milliseconds(),
+		)
+	}
 	workers := s.meta.ActiveWorkers(schedulerWorkerLease)
 	if len(workers) == 0 {
 		return ""
@@ -356,13 +393,10 @@ func (s *Service) llmStatsForWorker(modelName, modelVersion, workerID string) (l
 }
 
 func (s *Service) materializeLLMTaskCompletion(ctx context.Context, taskID string) error {
-	records, err := s.readAllLog(ctx, llmStream(taskID))
-	if err != nil {
-		return err
-	}
-	for _, rec := range records {
-		if rec.GetEventType() != "LLMCompleted" {
-			continue
+	var done bool
+	return s.forEachLogRecord(ctx, llmStream(taskID), func(rec *logservepb.LogRecord) error {
+		if done || rec.GetEventType() != "LLMCompleted" {
+			return nil
 		}
 		var payload llmEventPayload
 		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
@@ -372,9 +406,9 @@ func (s *Service) materializeLLMTaskCompletion(ctx context.Context, taskID strin
 			payload.TimestampMs = rec.GetTimestampMs()
 		}
 		s.materializeLLMCompleted(payload)
+		done = true
 		return nil
-	}
-	return nil
+	})
 }
 
 func (s *Service) materializeLLMCompleted(payload llmEventPayload) {
@@ -423,13 +457,9 @@ func (s *Service) bootstrapLLMStats(ctx context.Context) error {
 	s.llmStats = make(map[llmStatsKey]llmWorkerStats)
 	s.llmStatsMu.Unlock()
 	for _, streamID := range streams {
-		records, err := s.readAllLog(ctx, streamID)
-		if err != nil {
-			return err
-		}
-		for _, rec := range records {
+		if err := s.forEachLogRecord(ctx, streamID, func(rec *logservepb.LogRecord) error {
 			if rec.GetEventType() != "LLMCompleted" {
-				continue
+				return nil
 			}
 			var payload llmEventPayload
 			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
@@ -439,6 +469,9 @@ func (s *Service) bootstrapLLMStats(ctx context.Context) error {
 				payload.TimestampMs = rec.GetTimestampMs()
 			}
 			s.materializeLLMCompleted(payload)
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -26,13 +26,29 @@ type EventPayload struct {
 	LatencyMs              int64           `json:"latency_ms,omitempty"`
 }
 
+type RecordIterator func(func(*logservepb.LogRecord) error) error
+
 func Replay(workflowID string, records []*logservepb.LogRecord) (State, error) {
+	return ReplayEach(workflowID, func(emit func(*logservepb.LogRecord) error) error {
+		for _, rec := range records {
+			if err := emit(rec); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func ReplayEach(workflowID string, iterate RecordIterator) (State, error) {
 	var state State
-	for _, rec := range records {
+	if iterate == nil {
+		return State{}, errors.New("record iterator is required")
+	}
+	if err := iterate(func(rec *logservepb.LogRecord) error {
 		var payload EventPayload
 		if len(rec.GetPayload()) > 0 {
 			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
-				return State{}, err
+				return err
 			}
 		}
 		if payload.TimestampMs == 0 {
@@ -43,7 +59,7 @@ func Replay(workflowID string, records []*logservepb.LogRecord) (State, error) {
 		case "WorkflowStarted":
 			def, err := ParseDefinition(payload.DefinitionJSON)
 			if err != nil {
-				return State{}, err
+				return err
 			}
 			state = NewState(workflowID, def, payload.TimestampMs)
 			state.IdempotencyKey = payload.IdempotencyKey
@@ -97,6 +113,9 @@ func Replay(workflowID string, records []*logservepb.LogRecord) (State, error) {
 			state.CompletedAtMs = payload.TimestampMs
 			state.UpdatedAtMs = payload.TimestampMs
 		}
+		return nil
+	}); err != nil {
+		return State{}, err
 	}
 	if state.WorkflowID == "" {
 		return State{}, errors.New("workflow start event not found")

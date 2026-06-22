@@ -1,4 +1,5 @@
 import json
+import os
 import time
 
 import grpc
@@ -7,12 +8,13 @@ from ._generated import control_pb2 as pb
 
 
 class GrpcControlTransport:
-    def __init__(self, address="127.0.0.1:50052", *, channel=None, poll_interval_s=0.1):
+    def __init__(self, address="127.0.0.1:50052", *, channel=None, poll_interval_s=0.1, api_token=None):
         self.address = address
         self.channel = channel or grpc.insecure_channel(address)
         self.poll_interval_s = poll_interval_s
-        self._rpc = _ControlRpc(self.channel)
-
+        token = api_token if api_token is not None else os.environ.get("LOGSERVE_API_TOKEN", "")
+        self._metadata = _auth_metadata(token)
+        self._rpc = _ControlRpc(self.channel, self._metadata)
     def run(self, command, payload=None, timeout=None):
         payload = payload or {}
         if command == "submit":
@@ -242,39 +244,52 @@ class GrpcControlTransport:
 
 
 class _ControlRpc:
-    def __init__(self, channel):
-        self.SubmitTask = _unary(channel, "SubmitTask", pb.SubmitTaskRequest, pb.SubmitTaskResponse)
-        self.GetTaskStatus = _unary(channel, "GetTaskStatus", pb.GetTaskStatusRequest, pb.GetTaskStatusResponse)
-        self.SubmitWorkflow = _unary(channel, "SubmitWorkflow", pb.SubmitWorkflowRequest, pb.SubmitWorkflowResponse)
+    def __init__(self, channel, metadata=None):
+        self.SubmitTask = _unary(channel, metadata, "SubmitTask", pb.SubmitTaskRequest, pb.SubmitTaskResponse)
+        self.GetTaskStatus = _unary(channel, metadata, "GetTaskStatus", pb.GetTaskStatusRequest, pb.GetTaskStatusResponse)
+        self.SubmitWorkflow = _unary(channel, metadata, "SubmitWorkflow", pb.SubmitWorkflowRequest, pb.SubmitWorkflowResponse)
         self.GetWorkflowStatus = _unary(
-            channel, "GetWorkflowStatus", pb.GetWorkflowStatusRequest, pb.GetWorkflowStatusResponse
+            channel, metadata, "GetWorkflowStatus", pb.GetWorkflowStatusRequest, pb.GetWorkflowStatusResponse
         )
-        self.ReplayWorkflow = _unary(channel, "ReplayWorkflow", pb.ReplayWorkflowRequest, pb.ReplayWorkflowResponse)
-        self.RegisterModel = _unary(channel, "RegisterModel", pb.RegisterModelRequest, pb.RegisterModelResponse)
+        self.ReplayWorkflow = _unary(channel, metadata, "ReplayWorkflow", pb.ReplayWorkflowRequest, pb.ReplayWorkflowResponse)
+        self.RegisterModel = _unary(channel, metadata, "RegisterModel", pb.RegisterModelRequest, pb.RegisterModelResponse)
         self.SetSchedulingPolicy = _unary(
-            channel, "SetSchedulingPolicy", pb.SetSchedulingPolicyRequest, pb.SetSchedulingPolicyResponse
+            channel, metadata, "SetSchedulingPolicy", pb.SetSchedulingPolicyRequest, pb.SetSchedulingPolicyResponse
         )
-        self.SubmitLLM = _unary(channel, "SubmitLLM", pb.SubmitLLMRequest, pb.SubmitLLMResponse)
-        self.ReplayLLM = _unary(channel, "ReplayLLM", pb.ReplayLLMRequest, pb.ReplayLLMResponse)
+        self.SubmitLLM = _unary(channel, metadata, "SubmitLLM", pb.SubmitLLMRequest, pb.SubmitLLMResponse)
+        self.ReplayLLM = _unary(channel, metadata, "ReplayLLM", pb.ReplayLLMRequest, pb.ReplayLLMResponse)
         self.SetBackpressure = _unary(
-            channel, "SetBackpressure", pb.SetBackpressureRequest, pb.SetBackpressureResponse
+            channel, metadata, "SetBackpressure", pb.SetBackpressureRequest, pb.SetBackpressureResponse
         )
         self.GetDashboardSnapshot = _unary(
-            channel, "GetDashboardSnapshot", pb.GetDashboardSnapshotRequest, pb.DashboardSnapshot
+            channel, metadata, "GetDashboardSnapshot", pb.GetDashboardSnapshotRequest, pb.DashboardSnapshot
         )
-        self.CreateActor = _unary(channel, "CreateActor", pb.CreateActorRequest, pb.CreateActorResponse)
-        self.CallActor = _unary(channel, "CallActor", pb.CallActorRequest, pb.CallActorResponse)
-        self.GetActorStatus = _unary(channel, "GetActorStatus", pb.GetActorStatusRequest, pb.GetActorStatusResponse)
-        self.ReplayActor = _unary(channel, "ReplayActor", pb.ReplayActorRequest, pb.ReplayActorResponse)
+        self.CreateActor = _unary(channel, metadata, "CreateActor", pb.CreateActorRequest, pb.CreateActorResponse)
+        self.CallActor = _unary(channel, metadata, "CallActor", pb.CallActorRequest, pb.CallActorResponse)
+        self.GetActorStatus = _unary(channel, metadata, "GetActorStatus", pb.GetActorStatusRequest, pb.GetActorStatusResponse)
+        self.ReplayActor = _unary(channel, metadata, "ReplayActor", pb.ReplayActorRequest, pb.ReplayActorResponse)
 
 
-def _unary(channel, method, request_cls, response_cls):
-    return channel.unary_unary(
+def _auth_metadata(api_token):
+    if not api_token:
+        return None
+    return (("authorization", f"Bearer {api_token}"),)
+
+
+def _unary(channel, default_metadata, method, request_cls, response_cls):
+    call = channel.unary_unary(
         f"/logserve.v1.ControlService/{method}",
         request_serializer=request_cls.SerializeToString,
         response_deserializer=response_cls.FromString,
     )
 
+    def invoke(request, *, timeout=None, metadata=None):
+        merged_metadata = default_metadata
+        if metadata:
+            merged_metadata = tuple(default_metadata or ()) + tuple(metadata)
+        return call(request, timeout=timeout, metadata=merged_metadata)
+
+    return invoke
 
 def _json_bytes(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

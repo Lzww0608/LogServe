@@ -240,6 +240,52 @@ func TestReplayTaskSpecIgnoresStaleCompletionAfterRedelivery(t *testing.T) {
 	}
 }
 
+func TestReplayTaskSpecIgnoresStaleStartAndCompletionAfterRedelivery(t *testing.T) {
+	spec := &logservepb.TaskSpec{
+		TaskId:         "task-stale-start-replay",
+		TaskName:       "stale_start",
+		FunctionName:   "stale_start",
+		FunctionSource: "def stale_start():\n    return \"ok\"\n",
+	}
+	submittedPayload, err := marshalTaskSubmittedPayload(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redeliveredPayload, _ := json.Marshal(map[string]any{"task_lease_epoch": uint64(1)})
+	startedPayload, _ := json.Marshal(map[string]any{"task_lease_epoch": uint64(1)})
+	completedPayload, _ := json.Marshal(map[string]any{
+		"task_lease_epoch": uint64(1),
+		"result_json":      json.RawMessage(`"stale"`),
+	})
+
+	_, status, _, ok, err := replayTaskSpec([]*logservepb.LogRecord{
+		taskRecord("TaskSubmitted", submittedPayload),
+		taskRecord("TaskRedelivered", redeliveredPayload),
+		taskRecord("TaskStarted", startedPayload),
+		taskRecord("TaskCompleted", completedPayload),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("task spec was not replayed")
+	}
+	if status != logservepb.TaskStatus_TASK_STATUS_QUEUED {
+		t.Fatalf("status = %s, want QUEUED after stale start and completion", status)
+	}
+}
+
+func TestTaskTerminalIdempotencyKeyIncludesWorkerAndLeaseEpoch(t *testing.T) {
+	completedOld := taskTerminalIdempotencyKey("task-1", "TaskCompleted", "worker-1", 1)
+	completedNew := taskTerminalIdempotencyKey("task-1", "TaskCompleted", "worker-2", 2)
+	failedOld := taskTerminalIdempotencyKey("task-1", "TaskFailed", "worker-1", 1)
+	if completedOld == completedNew {
+		t.Fatal("terminal idempotency key should include worker and lease epoch")
+	}
+	if completedOld == failedOld {
+		t.Fatal("TaskCompleted and TaskFailed must not share the same idempotency key")
+	}
+}
 func taskRecord(eventType string, payload []byte) *logservepb.LogRecord {
 	return &logservepb.LogRecord{
 		StreamId:    "task:task-stale-replay",

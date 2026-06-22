@@ -51,11 +51,9 @@ func (s *Service) bootstrapTasks(ctx context.Context) error {
 		return err
 	}
 	for _, streamID := range streams {
-		records, err := s.readAllLog(ctx, streamID)
-		if err != nil {
-			return err
-		}
-		spec, status, leaseEpoch, ok, err := replayTaskSpec(records)
+		spec, status, leaseEpoch, ok, err := replayTaskSpecEach(func(emit func(*logservepb.LogRecord) error) error {
+			return s.forEachLogRecord(ctx, streamID, emit)
+		})
 		if err != nil {
 			return err
 		}
@@ -76,65 +74,101 @@ func (s *Service) bootstrapTasks(ctx context.Context) error {
 		} else {
 			return err
 		}
-		s.meta.CreateTask(task, spec.GetIdempotencyKey())
+		created, _ := s.meta.CreateTask(task, spec.GetIdempotencyKey())
 		s.specMu.Lock()
 		s.specs[spec.GetTaskId()] = cloneSpec(spec)
 		s.specMu.Unlock()
 		if status == logservepb.TaskStatus_TASK_STATUS_QUEUED || status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
-			s.queueMu.Lock()
-			if !containsTaskID(s.queue, spec.GetTaskId()) {
-				s.queue = append(s.queue, spec.GetTaskId())
+			if s.useSchedulerV2() {
+				s.scheduler.Enqueue(s.schedulerMetaFromTask(created))
+			} else {
+				s.queueMu.Lock()
+				if !containsTaskID(s.queue, spec.GetTaskId()) {
+					s.queue = append(s.queue, spec.GetTaskId())
+				}
+				s.queueMu.Unlock()
 			}
-			s.queueMu.Unlock()
 		}
 	}
 	return nil
 }
 
 func replayTaskSpec(records []*logservepb.LogRecord) (*logservepb.TaskSpec, logservepb.TaskStatus, uint64, bool, error) {
+	return replayTaskSpecEach(func(emit func(*logservepb.LogRecord) error) error {
+		for _, rec := range records {
+			if err := emit(rec); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func replayTaskSpecEach(iterate func(func(*logservepb.LogRecord) error) error) (*logservepb.TaskSpec, logservepb.TaskStatus, uint64, bool, error) {
 	var spec *logservepb.TaskSpec
 	status := logservepb.TaskStatus_TASK_STATUS_QUEUED
 	var leaseEpoch uint64
-	for _, rec := range records {
+	var redeliveredLeaseEpoch uint64
+	if iterate == nil {
+		return nil, status, leaseEpoch, false, nil
+	}
+	if err := iterate(func(rec *logservepb.LogRecord) error {
 		switch rec.GetEventType() {
 		case "TaskSubmitted":
 			var payload taskSubmittedPayload
 			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
-				return nil, 0, 0, false, err
+				return err
 			}
 			if len(payload.TaskSpec) == 0 {
-				continue
+				return nil
 			}
 			decoded := &logservepb.TaskSpec{}
 			if err := protojson.Unmarshal(payload.TaskSpec, decoded); err != nil {
-				return nil, 0, 0, false, err
+				return err
 			}
 			spec = decoded
 			status = logservepb.TaskStatus_TASK_STATUS_QUEUED
 		case "TaskStarted":
-			var payload taskLifecyclePayload
-			_ = json.Unmarshal(rec.GetPayload(), &payload)
-			if payload.TaskLeaseEpoch > leaseEpoch {
-				leaseEpoch = payload.TaskLeaseEpoch
-			}
-			status = logservepb.TaskStatus_TASK_STATUS_RUNNING
-		case "TaskRedelivered":
 			if isTerminalTaskStatus(status) {
-				continue
+				return nil
 			}
 			payloadEpoch := taskEventLeaseEpoch(rec.GetPayload())
+			if payloadEpoch == 0 {
+				if leaseEpoch == 0 && redeliveredLeaseEpoch == 0 {
+					status = logservepb.TaskStatus_TASK_STATUS_RUNNING
+				}
+				return nil
+			}
+			if payloadEpoch <= redeliveredLeaseEpoch {
+				return nil
+			}
+			if payloadEpoch >= leaseEpoch {
+				leaseEpoch = payloadEpoch
+				status = logservepb.TaskStatus_TASK_STATUS_RUNNING
+			}
+		case "TaskRedelivered":
+			if isTerminalTaskStatus(status) {
+				return nil
+			}
+			payloadEpoch := taskEventLeaseEpoch(rec.GetPayload())
+			if payloadEpoch > redeliveredLeaseEpoch {
+				redeliveredLeaseEpoch = payloadEpoch
+			}
 			if payloadEpoch == 0 || payloadEpoch >= leaseEpoch {
 				status = logservepb.TaskStatus_TASK_STATUS_QUEUED
 			}
 		case "TaskCompleted":
-			if taskTerminalEventApplies(status, leaseEpoch, rec.GetPayload()) {
+			if taskTerminalEventApplies(status, leaseEpoch, redeliveredLeaseEpoch, rec.GetPayload()) {
 				status = logservepb.TaskStatus_TASK_STATUS_SUCCEEDED
 			}
 		case "TaskFailed":
-			if taskTerminalEventApplies(status, leaseEpoch, rec.GetPayload()) {
+			if taskTerminalEventApplies(status, leaseEpoch, redeliveredLeaseEpoch, rec.GetPayload()) {
 				status = logservepb.TaskStatus_TASK_STATUS_FAILED
 			}
 		}
+		return nil
+	}); err != nil {
+		return nil, 0, 0, false, err
 	}
 	if spec == nil {
 		return nil, status, leaseEpoch, false, nil
@@ -145,19 +179,18 @@ func replayTaskSpec(records []*logservepb.LogRecord) (*logservepb.TaskSpec, logs
 	}
 	return spec, status, leaseEpoch, true, nil
 }
-
-func taskTerminalEventApplies(status logservepb.TaskStatus, currentLeaseEpoch uint64, payload []byte) bool {
+func taskTerminalEventApplies(status logservepb.TaskStatus, currentLeaseEpoch, redeliveredLeaseEpoch uint64, payload []byte) bool {
 	if isTerminalTaskStatus(status) {
 		return false
 	}
 	eventLeaseEpoch := taskEventLeaseEpoch(payload)
 	if eventLeaseEpoch == 0 {
-		return true
+		return currentLeaseEpoch == 0 && redeliveredLeaseEpoch == 0
 	}
 	if status != logservepb.TaskStatus_TASK_STATUS_RUNNING {
 		return false
 	}
-	return eventLeaseEpoch == currentLeaseEpoch
+	return eventLeaseEpoch == currentLeaseEpoch && eventLeaseEpoch > redeliveredLeaseEpoch
 }
 
 func taskEventLeaseEpoch(payload []byte) uint64 {
@@ -170,31 +203,23 @@ func taskEventLeaseEpoch(payload []byte) uint64 {
 }
 
 func (s *Service) bootstrapModels(ctx context.Context) error {
-	records, err := s.readAllLog(ctx, "system:models")
-	if err != nil {
-		return err
-	}
-	for _, rec := range records {
+	return s.forEachLogRecord(ctx, "system:models", func(rec *logservepb.LogRecord) error {
 		if rec.GetEventType() != "ModelRegistered" {
-			continue
+			return nil
 		}
 		var model logservepb.ModelInfo
 		if err := json.Unmarshal(rec.GetPayload(), &model); err != nil {
 			return err
 		}
 		s.meta.RegisterModel(&model)
-	}
-	return nil
+		return nil
+	})
 }
 
 func (s *Service) bootstrapWorkers(ctx context.Context) error {
-	records, err := s.readAllLog(ctx, "system:workers")
-	if err != nil {
-		return err
-	}
-	for _, rec := range records {
+	return s.forEachLogRecord(ctx, "system:workers", func(rec *logservepb.LogRecord) error {
 		if rec.GetEventType() != "WorkerRegistered" {
-			continue
+			return nil
 		}
 		var payload struct {
 			WorkerID     string `json:"worker_id"`
@@ -210,7 +235,7 @@ func (s *Service) bootstrapWorkers(ctx context.Context) error {
 			return err
 		}
 		if payload.WorkerID == "" {
-			continue
+			return nil
 		}
 		cachedModels := make(map[string]bool, len(payload.CachedModels))
 		for _, model := range payload.CachedModels {
@@ -227,19 +252,16 @@ func (s *Service) bootstrapWorkers(ctx context.Context) error {
 			Capacity:      payload.Capacity,
 			LastHeartbeat: rec.GetTimestampMs(),
 		})
-	}
-	return nil
+		s.updateSchedulerWorker(payload.WorkerID)
+		return nil
+	})
 }
 
 func (s *Service) bootstrapScheduler(ctx context.Context) error {
-	records, err := s.readAllLog(ctx, "system:scheduler")
-	if err != nil {
-		return err
-	}
 	var policy logservepb.SchedulingPolicy
-	for _, rec := range records {
+	if err := s.forEachLogRecord(ctx, "system:scheduler", func(rec *logservepb.LogRecord) error {
 		if rec.GetEventType() != "SchedulingPolicyChanged" {
-			continue
+			return nil
 		}
 		var payload struct {
 			Policy string `json:"policy"`
@@ -250,6 +272,9 @@ func (s *Service) bootstrapScheduler(ctx context.Context) error {
 		if value, ok := logservepb.SchedulingPolicy_value[payload.Policy]; ok {
 			policy = logservepb.SchedulingPolicy(value)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if policy != logservepb.SchedulingPolicy_SCHEDULING_POLICY_UNSPECIFIED {
 		s.configMu.Lock()
@@ -260,22 +285,18 @@ func (s *Service) bootstrapScheduler(ctx context.Context) error {
 }
 
 func (s *Service) bootstrapBackpressure(ctx context.Context) error {
-	records, err := s.readAllLog(ctx, "system:backpressure")
-	if err != nil {
-		return err
-	}
 	var payload struct {
 		QueueHighWatermark uint32 `json:"queue_high_watermark"`
 		RedeliveryTimeout  int64  `json:"redelivery_timeout_ms"`
 		LogAppendSlow      int64  `json:"log_append_slow_ms"`
 	}
-	for _, rec := range records {
+	if err := s.forEachLogRecord(ctx, "system:backpressure", func(rec *logservepb.LogRecord) error {
 		if rec.GetEventType() != "BackpressureConfigured" {
-			continue
+			return nil
 		}
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
-			return err
-		}
+		return json.Unmarshal(rec.GetPayload(), &payload)
+	}); err != nil {
+		return err
 	}
 	s.configMu.Lock()
 	if payload.QueueHighWatermark > 0 {
@@ -298,11 +319,9 @@ func (s *Service) bootstrapWorkflows(ctx context.Context) error {
 	}
 	for _, streamID := range streams {
 		workflowID := strings.TrimPrefix(streamID, "wf:")
-		records, err := s.readAllLog(ctx, streamID)
-		if err != nil {
-			return err
-		}
-		state, err := workflow.Replay(workflowID, records)
+		state, err := workflow.ReplayEach(workflowID, func(emit func(*logservepb.LogRecord) error) error {
+			return s.forEachLogRecord(ctx, streamID, emit)
+		})
 		if err != nil {
 			continue
 		}
@@ -377,7 +396,7 @@ func (s *Service) restoreWorkflowTasks(state workflow.State) error {
 		if err != nil {
 			return err
 		}
-		s.meta.CreateTask(metadata.Task{
+		created, _ := s.meta.CreateTask(metadata.Task{
 			TaskID:                 spec.GetTaskId(),
 			TaskName:               spec.GetTaskName(),
 			Status:                 logservepb.TaskStatus_TASK_STATUS_QUEUED,
@@ -390,11 +409,15 @@ func (s *Service) restoreWorkflowTasks(state workflow.State) error {
 		s.specMu.Lock()
 		s.specs[step.TaskID] = cloneSpec(spec)
 		s.specMu.Unlock()
-		s.queueMu.Lock()
-		if !containsTaskID(s.queue, step.TaskID) {
-			s.queue = append(s.queue, step.TaskID)
+		if s.useSchedulerV2() {
+			s.scheduler.Enqueue(s.schedulerMetaFromTask(created))
+		} else {
+			s.queueMu.Lock()
+			if !containsTaskID(s.queue, step.TaskID) {
+				s.queue = append(s.queue, step.TaskID)
+			}
+			s.queueMu.Unlock()
 		}
-		s.queueMu.Unlock()
 	}
 	return nil
 }
@@ -406,11 +429,9 @@ func (s *Service) bootstrapActors(ctx context.Context) error {
 	}
 	for _, streamID := range streams {
 		actorID := strings.TrimPrefix(streamID, "actor:")
-		records, err := s.readAllLog(ctx, streamID)
-		if err != nil {
-			return err
-		}
-		replayed, err := actor.Replay(actorID, records, s)
+		replayed, err := actor.ReplayEach(actorID, func(emit func(*logservepb.LogRecord) error) error {
+			return s.forEachLogRecord(ctx, streamID, emit)
+		}, s)
 		if err != nil {
 			continue
 		}
@@ -425,30 +446,6 @@ func (s *Service) listStreams(ctx context.Context, prefix string) ([]string, err
 		return nil, err
 	}
 	return resp.GetStreamIds(), nil
-}
-
-func (s *Service) readAllLog(ctx context.Context, streamID string) ([]*logservepb.LogRecord, error) {
-	fromSeq := uint64(1)
-	out := make([]*logservepb.LogRecord, 0)
-	for {
-		resp, err := s.log.ReadLog(ctx, &logservepb.ReadLogRequest{
-			StreamId: streamID,
-			FromSeq:  fromSeq,
-			Limit:    bootstrapReadLimit,
-		})
-		if err != nil {
-			return nil, err
-		}
-		records := resp.GetRecords()
-		if len(records) == 0 {
-			return out, nil
-		}
-		out = append(out, records...)
-		fromSeq = records[len(records)-1].GetSeq() + 1
-		if len(records) < bootstrapReadLimit {
-			return out, nil
-		}
-	}
 }
 
 func containsTaskID(taskIDs []string, taskID string) bool {

@@ -5,6 +5,7 @@ import (
 
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/logstore"
+	"github.com/logserve/logserve/internal/rpcauth"
 	"google.golang.org/grpc"
 )
 
@@ -29,7 +30,7 @@ func StartWithOptions(addr, dataDir string, opts logstore.Options) (*Server, err
 		_ = store.Close()
 		return nil, err
 	}
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(rpcauth.ServerOptionsFromEnv()...)
 	logservepb.RegisterLogServiceServer(grpcServer, logstore.NewService(store))
 	srv := &Server{addr: lis.Addr().String(), listener: lis, grpc: grpcServer, store: store}
 	go func() {

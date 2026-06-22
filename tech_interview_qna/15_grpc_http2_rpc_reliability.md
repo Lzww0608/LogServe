@@ -2883,6 +2883,273 @@ deadline/cancellation/retry 过程中的最终观察结果。
 status code 的定义在单机和分布式里一样，但分布式环境会让 status 的来源变复杂。单机里 status 多半是 handler 返回；分布式里它可能由客户端库、服务端库、代理、连接错误、deadline 或 retry 合成。中间服务不能无脑透传下游错误，要做语义转换和脱敏。排查时要看每一跳的 status、source、attempt 和 trace，而不是只看最外层 code。
 ```
 
+## Q061. RPC 为什么不能简单等价于本地函数调用？
+
+**回答：**
+
+RPC 最容易误导人的地方，是它把远程调用包装成了本地方法调用的样子。客户端看到的是一个 stub，一个方法名，一组参数和一个返回值；真正发生的事情却是跨进程、跨机器、跨网络的协议交互。两者的失败语义完全不同。
+
+本地函数调用的边界通常比较清楚：调用栈还在，参数在同一地址空间里，函数返回就说明这段代码执行完了；如果 panic 或异常，调用方能在当前进程里处理。RPC 多了序列化、连接复用、服务发现、负载均衡、TLS、HTTP/2 stream、服务端排队、业务执行、响应回传。任何一段都可能失败，而且失败后调用方未必知道远端执行到了哪一步。
+
+这里最重要的区别是“观察结果”和“业务结果”不相等。客户端超时，只能说明客户端没有在 deadline 前收到成功响应；它不能证明请求没到服务端，也不能证明服务端没有写库。服务端成功写入后，响应可能在网络上丢了。客户端看到 `DEADLINE_EXCEEDED`，用户却已经被扣款，这种事在 RPC 里并不矛盾。
+
+所以 RPC 不能按本地函数的直觉设计。接口要显式处理 deadline、cancel、幂等键、状态查询、错误码、重试策略和可观测性。面试时可以直说：RPC 追求的是“像本地调用一样好用”，不是“和本地调用一样确定”。
+
+```text
+本地函数调用：失败通常发生在当前进程内，调用方比较容易判断执行状态。
+RPC 调用：失败可能发生在发送前、发送中、服务端执行中、响应返回中。
+RPC 返回失败：只说明调用方没有拿到成功结果，不说明远端没有产生副作用。
+```
+
+## Q062. 网络调用的不确定性包括哪些方面？
+
+**回答：**
+
+网络调用的不确定性可以按链路拆开看，不要只说“网络会抖”。一次 gRPC 调用至少要经历名称解析、负载均衡选择、连接建立、TLS/ALPN、HTTP/2 stream 创建、请求发送、服务端排队、业务执行、响应返回。每一段都有自己的失败模式。
+
+DNS 或服务发现可能返回旧地址，resolver 刷新不及时，某个实例已经下线但客户端还握着旧连接。连接层可能遇到 SYN 重传、TCP reset、半开连接、NAT 超时、拥塞窗口过小。TLS 层可能握手慢、证书过期、SNI 不匹配、ALPN 没谈成 HTTP/2。HTTP/2 层可能受 max concurrent streams 限制，新的 RPC 在客户端队列里等着发出去。
+
+服务端也有不确定性。请求到了网卡，不代表业务 handler 已经开始；handler 开始了，不代表能在 deadline 前结束；写库成功了，不代表响应能回到客户端。中间代理还会引入自己的超时、缓冲、重试、连接池和错误映射。
+
+还有两个经常被忽略的点。第一，排队也是延迟。客户端连接池排队、服务端 worker pool 排队、下游数据库连接池排队，都会把 p99 拉长。第二，时间不完全可靠。deadline 跨机器传播时要处理 clock skew，所以更稳的做法是传播剩余 timeout，而不是假设每台机器的时钟完全一致。
+
+```text
+排查 RPC 不确定性时，我会按阶段看：resolver、connect、TLS、HTTP/2 queue、send、server queue、handler、downstream、response、retry。只看总耗时，很容易把排队误判成网络慢，把下游慢误判成 gRPC 框架慢。
+```
+
+## Q063. HTTP/2 multiplexing 如何改善连接复用？
+
+**回答：**
+
+HTTP/2 multiplexing 的核心是把一次请求/响应放进一个 stream，再把多个 stream 的 frame 交错发送到同一条 TCP 连接上。HTTP/1.1 虽然有 keep-alive 和 pipelining，但一条连接上的并发能力有限，慢响应会挡住后面的响应。实际系统常靠多条连接绕过去，连接数、TLS 状态、拥塞窗口和服务端 fd 都会增加。
+
+HTTP/2 改善的是连接利用率。一个 gRPC channel 可以复用底层 HTTP/2 连接，多个 RPC 同时跑在不同 stream 上。请求 A 的 DATA frame 和请求 B 的 DATA frame 可以交错出现，慢请求不会在 HTTP 层把快请求完全堵死。header 压缩也会减少重复 metadata 的成本，内部 RPC 里 `:path`、`content-type`、authorization、trace header 往往高度重复。
+
+这对 gRPC 很重要。unary RPC 可以少建连接，server streaming 和 bidirectional streaming 也能在同一连接上维持多个逻辑流。连接长时间复用后，TCP 拥塞窗口更稳定，TLS 握手成本也被摊薄。
+
+但 multiplexing 不是免费午餐。它把多个 RPC 放进同一个连接，也让这条连接变成共享故障域。连接级 flow control、TCP 丢包、max concurrent streams、连接上的锁竞争，都可能影响同一连接里的多个 RPC。工程上不能只记住“HTTP/2 一条连接跑很多请求”，还要记住“这很多请求共享底层资源”。
+
+## Q064. HTTP/2 仍然会受 TCP 层 head-of-line blocking 影响吗？
+
+**回答：**
+
+会。HTTP/2 解决的是 HTTP 层的 head-of-line blocking，不解决 TCP 字节流层面的 head-of-line blocking。RFC 9113 也明确说明，HTTP/2 运行在 TCP 连接上，协议本身没有处理 TCP 层队头阻塞。
+
+原因在 TCP 的可靠有序字节流语义。假设同一条 TCP 连接上有 stream A、B、C，底层某个 TCP segment 丢了。即使后面的 segment 已经到达内核，应用层也不能跳过缺失字节直接交付后面的 HTTP/2 frame。HTTP/2 frame 被编码在同一个 TCP byte stream 里，缺了前面的字节，就没法安全解析后面的边界。
+
+结果是一个丢包可能影响这条连接上的所有 stream。业务上看起来是多个独立 RPC 同时抖了一下；实际上是底层 TCP 等重传。网络丢包率高、RTT 大、连接承载 stream 太多时，这个问题更明显。
+
+这也是为什么 HTTP/3/QUIC 会把多个 stream 放在传输层，而不是都压进一个 TCP byte stream。回到 gRPC/HTTP/2，常见缓解手段是降低丢包、控制单连接并发、把长流和短请求拆到不同 channel、必要时使用多个连接分散风险。它不能改变 TCP 的基本语义，只能减少被同一条连接拖住的范围。
+
+## Q065. gRPC deadline 为什么需要端到端传播？
+
+**回答：**
+
+deadline 表达的是调用方愿意等到什么时候。它不是某一层自己的 timeout，而是一次用户请求或上游任务的整体时间预算。只在入口设置 deadline，不向下游传播，会让后端继续做调用方已经不需要的工作。
+
+看一个简单链路：客户端给 API Server 500ms，API Server 做鉴权和排队用了 120ms，再调用 User Service。如果 User Service 仍然拿到 500ms，它可能又调用 DB 500ms。客户端 500ms 到点已经放弃，后端却继续跑，流量高时这会形成无效负载。越超时越忙，越忙越超时。
+
+端到端传播的正确含义是传剩余预算。入口有 500ms，中间花了 120ms，下游最多只能拿到大约 380ms，还要留一点本层收尾时间。gRPC 在传播 deadline 时会把绝对时间点转换成 timeout，并扣掉已经消耗的时间，这样可以减轻机器时钟不一致带来的问题。
+
+服务端还要真的使用这个 deadline。只把 metadata 传下去没有用，业务代码要把 context 传给数据库、下游 RPC、外部命令和长循环。长任务要定期检查取消信号，发现调用方已经放弃就停止工作或进入可恢复的后台流程。
+
+```text
+deadline 的目标不是让所有调用都更快，而是让每一层知道还剩多少预算。
+不传播 deadline，系统会在超时后继续消耗 CPU、连接池、线程池和下游配额。
+```
+
+## Q066. 客户端超时后服务端可能仍在执行，这会带来什么语义问题？
+
+**回答：**
+
+这个问题的核心是：客户端本地判断失败，服务端本地判断可能成功。gRPC 官方 core concepts 里就讲过，客户端和服务端会独立判断一次 RPC 是否成功，它们的结论可能不一致。客户端可能因为 deadline 到了认为失败，服务端可能已经完成写入，只是响应晚了。
+
+这会带来“半成功不清楚”的语义。比如客户端调用 `CreateOrder` 超时。可能订单没创建，可能订单创建了但响应丢了，可能库存扣了但支付没扣，可能服务端还在执行。客户端如果直接重试，可能创建两个订单；如果直接报失败，用户刷新后又看到订单存在。
+
+取消也不是回滚。RPC 被 cancel 之后，后续工作应该停止，但取消之前已经发生的副作用不会自动撤销。写库、发消息、扣库存、调用第三方支付，这些动作一旦提交，就要靠业务事务、补偿、状态机或幂等设计处理。
+
+解决办法不是“把 timeout 调长”。更稳的接口要有 operation id 或 idempotency key。客户端带同一个 key 重试，服务端用唯一约束或请求日志返回同一个结果。对耗时操作，可以把同步 RPC 设计成“提交命令 + 查询状态”：第一次返回 `operation_id`，后续通过 `GetOperation` 确认 `PENDING/SUCCEEDED/FAILED`。这样客户端超时后还有办法判断远端状态。
+
+面试里要把边界说清楚：超时是调用方观察到的结果，不是远端事务状态。只要接口有副作用，就必须设计“超时后如何确认结果”。
+
+## Q067. RPC retry 为什么必须绑定幂等性？
+
+**回答：**
+
+retry 的前提不是“这次失败了”，而是“再做一次不会把系统状态弄坏”。网络错误只能说明客户端没有拿到一个成功响应，不能说明服务端没有执行。没有幂等性，重试就是重复执行副作用。
+
+读请求通常比较容易重试，比如按 id 查询用户资料。写请求就麻烦得多：创建订单、扣款、发优惠券、提交任务、发送邮件，都可能在第一次调用里已经执行。客户端看到 `UNAVAILABLE` 或 `DEADLINE_EXCEEDED` 后立刻重试，可能把订单建两遍，或者消息发两次。
+
+gRPC 的透明重试也有边界。框架只能在非常有限的场景下确认请求没有进入服务端应用逻辑，比如请求还没离开客户端，或者只到达了服务端 gRPC library 但没有被 handler 看见。只要业务 handler 可能已经处理，框架就不能替业务证明“安全”。
+
+幂等性的实现通常靠业务键，而不是靠运气。常见做法包括：客户端生成 idempotency key；服务端按 key 记录请求指纹和最终结果；创建资源时使用客户端指定的 resource id；写库时用唯一约束防重；状态流转使用 compare-and-set；消息发送使用 outbox 和去重表。重试时服务端看到同一个 key，要么返回第一次的结果，要么明确拒绝参数不一致的重复请求。
+
+```text
+可以自动重试的不是某个 status code，而是“某个方法在某种错误下可安全重试”。
+status code 只是触发条件，幂等性才是语义许可。
+```
+
+## Q068. gRPC status code 如何区分可重试和不可重试错误？
+
+**回答：**
+
+status code 能提供重试线索，但不能单独决定重试。gRPC 官方状态码里，`UNAVAILABLE` 通常表示服务暂时不可用，可能适合带 backoff 的重试；文档也提醒，非幂等操作不一定安全。`RESOURCE_EXHAUSTED` 可能是配额或容量问题，是否重试要看有没有 retry-after、令牌桶恢复时间和调用方预算。`ABORTED` 更像并发冲突，通常要在更高层重启读改写流程，而不是原样重放一个 RPC。`DEADLINE_EXCEEDED` 更敏感，因为带副作用的操作可能已经成功，只是响应晚到。
+
+不可重试错误通常是请求本身或权限状态的问题。`INVALID_ARGUMENT` 表示参数不合法，重试同一个请求没有意义。`UNAUTHENTICATED` 要重新拿凭证，`PERMISSION_DENIED` 要改权限。`NOT_FOUND`、`ALREADY_EXISTS`、`FAILED_PRECONDITION` 是否能“再试”，取决于系统状态是否会被修复；它们一般不该被客户端库无脑自动重试。`INTERNAL`、`UNKNOWN`、`DATA_LOSS` 更像服务端或数据异常，自动重试可能只会放大故障。
+
+还要注意 status 的来源。有些 code 是应用返回的，有些是 gRPC library 或代理合成的。连接断开时可能没有 trailers，客户端只能合成一个状态。排查时要看 attempt 级别的 status、最终 call status、有没有收到 response headers、请求是否已经 committed。
+
+一个比较稳的策略是把重试规则写在服务配置和方法文档里：哪些方法幂等，哪些 code 可重试，最多几次，backoff 和 jitter 怎么配，是否有 retry budget。不要让每个调用方自己猜。
+
+## Q069. 流式 RPC 的 backpressure 如何实现？
+
+**回答：**
+
+流式 RPC 的 backpressure 主要来自两层：HTTP/2 flow control 和应用层消费节奏。HTTP/2 有连接级和 stream 级窗口。接收方读走数据后，才会通过窗口更新告诉发送方还能继续发。接收方不读，窗口就不释放，发送方最终会被挡住。
+
+gRPC 把这层机制包装到 stream API 里。写入 stream 返回，不一定代表数据已经到达网络对端；它可能只是交给 gRPC runtime 缓冲。发送太快时，runtime 会等待底层 flow control 允许继续发送。官方 flow control 文档也提醒，流控主要用于 streaming RPC，默认由 gRPC 处理，但部分语言允许手动控制。
+
+应用层也要配合。服务端 streaming 时，如果客户端读取慢，服务端不能把所有结果先查出来塞进内存，再等网络慢慢发。更好的做法是边读下游、边写 stream、边观察 context cancel。双向流更要小心：如果客户端和服务端都同步地大量写入，却都不读对方消息，就可能互相等窗口，形成死锁。
+
+实际设计里我会加几条约束：每个 stream 有最大未处理消息数；每条消息有大小上限；应用队列满了就停止读上游或返回资源耗尽；长流要有心跳和取消；客户端要明确消费循环，不能只写不读。
+
+```text
+HTTP/2 flow control 解决“字节能不能继续发”。
+应用层 backpressure 解决“业务还能不能继续生产”。
+少了任何一层，流式 RPC 都可能把内存或尾延迟拖垮。
+```
+
+## Q070. metadata 适合放 trace context、auth token 还是业务大字段？
+
+**回答：**
+
+metadata 适合放和本次 RPC 相关的小型旁路信息，比如 trace context、request id、authorization token、租户 id、调用方标识、实验开关、压测标记。它不适合放业务大字段，更不适合当成第二个 request body。
+
+gRPC metadata 底层走 HTTP/2 headers 和 trailers。官方文档也提醒，请求 header 大小可能受服务端限制，常见建议默认值是 8 KiB。header 还会经过代理、网关、日志系统和安全策略；放太大容易触发 header too large、HPACK 压缩效率下降、代理丢字段或连接错误。
+
+trace context 很适合 metadata，因为它小，而且必须跨服务传播。auth token 也常放 metadata，通常走 `authorization` 这类标准 header，但要保证通道加密，日志里不能明文打印。业务大字段应该放 protobuf message body，特别大的对象更应该放对象存储或分块流，不要塞进 metadata。
+
+还要区分 metadata 和业务契约。metadata 是调用上下文，不应该承载决定业务结果的大量字段。否则接口会变得难测试、难版本兼容，也容易被中间层误删。业务上必须参与校验、持久化或审计的内容，最好放进 request message。
+
+## Q071. mTLS 在服务间调用中解决什么问题？
+
+**回答：**
+
+mTLS 解决的是服务间通信的传输安全和双方身份认证。普通 TLS 通常是客户端验证服务端证书，确认自己连到的是目标服务，并加密传输内容。mTLS 多了客户端证书，服务端也能验证调用方是谁。这样服务 A 调服务 B 时，B 不只知道“有人连过来了”，还能知道“这是带某个证书身份的 workload”。
+
+这能防几类问题。第一，防中间人窃听和篡改，RPC payload、metadata、token 不会以明文在网络里跑。第二，防假服务，客户端不会把请求发给伪装的后端。第三，防假客户端，服务端可以拒绝没有可信证书的调用方。第四，给授权和审计提供身份基础，比如把证书里的 SAN、SPIFFE ID 或服务账号映射成调用主体。
+
+但 mTLS 不是完整授权系统。它证明“对方是谁”，不自动证明“对方能做这个操作”。服务端仍然要做方法级权限、租户隔离、token 校验、审计日志和最小权限。证书轮换、CA 信任链、吊销策略、时钟偏差、sidecar 终止 TLS 后的本地明文边界，也都要纳入设计。
+
+面试里可以这样讲：mTLS 让内部服务调用从“相信内网”变成“相信证书身份”。这一步很关键，但它只是安全链路的底座，不替代业务鉴权。
+
+## Q072. 负载均衡与长连接复用为什么可能冲突？
+
+**回答：**
+
+冲突来自粒度不同。很多负载均衡器，尤其是 L4 负载均衡，是按连接分配后端的；HTTP/2/gRPC 又鼓励长连接复用，一条连接上可以跑很多 RPC。结果是负载均衡器只在连接建立时做了一次选择，后续大量 stream 都粘在同一个后端上。
+
+如果客户端数量很多、每个客户端流量差不多，这通常还能接受。但如果少量客户端流量很大，或者某些连接上有长时间的 streaming RPC，后端负载就会偏。某个后端可能被几个大连接压满，另一个后端很空。新实例上线也不一定立刻分到流量，因为旧连接还握在老实例上。
+
+L7 负载均衡可以解析 HTTP/2，把不同 stream 分发到不同后端，粒度更细；代价是它在数据路径上解析协议、终止或转发连接，延迟和资源成本更高。客户端侧负载均衡则让客户端知道多个后端，对每次 RPC 或每个 subchannel 做选择，但客户端要接服务发现、健康检查和策略配置。
+
+长连接和负载均衡不是谁对谁错。高吞吐短 RPC 可以复用连接，但要关注每个后端的 active streams、连接分布和 pending RPC。长流最好单独隔离 channel 或服务池，因为流一旦开始，通常不能在中途无损迁移到另一个后端。
+
+## Q073. 连接池在 HTTP/2 中是否仍然有意义？
+
+**回答：**
+
+有意义，但目的变了。HTTP/1.1 时代连接池主要是为了并发和复用，因为一条连接很难同时跑很多请求。HTTP/2 一条连接可以 multiplex 多个 stream，所以连接池不再是“每个并发请求一条连接”的工具。它更像是隔离、扩展和故障范围控制工具。
+
+gRPC 性能建议通常是复用 channel 和 stub，因为反复建连接会浪费 DNS、TCP、TLS 和 HTTP/2 初始化成本。但同一个 HTTP/2 连接有并发 stream 上限。active RPC 到达上限后，额外 RPC 会在客户端排队。长时间 streaming RPC 占住 stream，也会让短 unary 请求排队。
+
+这时多 channel 或连接池就有意义：把高负载方法和普通方法分开，把长流和短请求分开，把大消息和小消息分开，或者用多个连接绕开单连接 max concurrent streams 和 TCP HOL 的共享影响。连接池还可以改善少量大客户端下的后端分布，让 client-side LB 有更多 subchannel 可选。
+
+不能走到另一个极端。连接太多会增加服务端 fd、TLS 内存、keepalive、拥塞窗口竞争和负载均衡抖动。合理做法是先复用 channel，只有在指标显示客户端排队、stream 上限、长流干扰或单连接抖动时，再引入有边界的 channel pool。
+
+## Q074. 大对象通过 RPC 传输为什么可能拖垮内存和 tail latency？
+
+**回答：**
+
+大对象会把 RPC 从“短小控制消息”变成“数据搬运通道”。问题不只是网络带宽。序列化前后通常有多份拷贝：业务对象一份，protobuf message 一份，编码后的 byte buffer 一份，gRPC/HTTP/2 buffer 里还有一份或多份。客户端和服务端如果都一次性构造整个 request/response，内存峰值会很高。
+
+尾延迟也会被拉长。大响应占用连接窗口、发送队列和拥塞窗口，同一 HTTP/2 连接上的小 RPC 可能一起抖。丢包后重传成本更大，TCP HOL 影响也更明显。超时或失败后，如果客户端重试，等于把大对象再传一遍；如果这个 RPC 还有副作用，重试语义更难判断。
+
+flow control 只能限制发送速度，不能替你消除业务层内存。如果服务端先把 2GB 结果全部查进内存，再慢慢写 stream，HTTP/2 flow control 也救不了内存峰值。正确做法是让生产和消费真正流式化：分页、chunk、server streaming、client streaming、断点续传、校验和、对象存储引用。
+
+面试里可以给一个设计边界：RPC message 适合放控制信息和中小型结果；大对象走对象存储或流式协议，RPC 只返回 URI、etag、checksum、size、content type、过期时间和访问权限。这样失败恢复、重试和缓存都更清楚。
+
+## Q075. 如何设计 RPC 接口避免半成功状态不清楚？
+
+**回答：**
+
+要避免半成功不清楚，接口一开始就要承认“客户端可能不知道服务端做到哪一步”。不要把有副作用的 RPC 设计成一个模糊的 `DoSomething`，然后指望超时后靠日志猜。更稳的做法是让每个命令都有可追踪的业务身份。
+
+第一，客户端生成 request id 或 idempotency key。服务端用它做唯一约束，保存请求指纹和最终结果。客户端超时后用同一个 key 重试，服务端返回同一结果，而不是重新执行一次。
+
+第二，把长操作拆成 command 和 query。比如 `StartExport` 返回 `operation_id`，`GetExportOperation` 返回 `PENDING/RUNNING/SUCCEEDED/FAILED/CANCELLED`。这样客户端 deadline 到了以后，可以查询状态。同步等待只是一个体验优化，不是唯一真相来源。
+
+第三，服务端内部要有明确的状态机。不要让“写了 A 表但没写 B 表”散落在代码里。可以用事务、outbox、saga、补偿任务或恢复扫描，把中间状态收敛到最终状态。对外暴露时也要承认中间态，而不是只返回成功/失败两个词。
+
+第四，错误码要配合语义。重复提交同一个幂等键可以返回第一次的成功结果；同一个幂等键但请求参数不同，应该返回明确的冲突或参数错误；操作仍在执行，可以返回 `PENDING` 状态，而不是让客户端盲重试。
+
+```text
+好的副作用 RPC 一般都有：幂等键、操作状态、结果查询、明确状态机、可恢复日志。
+半成功不可怕，可怕的是系统没有任何稳定标识让调用方确认它到底成功到哪一步。
+```
+
+## Q076. 如何给 RPC API 做版本兼容？
+
+**回答：**
+
+RPC API 的版本兼容要同时看 wire format、生成代码和业务语义。protobuf 能帮你做字段级兼容，但它不替你保证行为兼容。
+
+字段演进的基本规则是只做向后兼容的新增。新增字段用新的 tag；删除字段后把 tag 和字段名 reserved，避免以后复用；不要随便改已有字段的类型、含义、单位和默认值；枚举要考虑未知值；proto3 标量默认值和“没设置”在很多场景下不好区分，必要时用 `optional` 或 wrapper 表达 presence。oneof、map、repeated 字段也要注意跨语言行为。
+
+方法演进要更谨慎。给 request 增加可选字段通常安全；强制老客户端必须传新字段就不安全。改变排序、分页 token、幂等语义、权限要求、错误码、deadline 预期，都可能破坏调用方。大的语义变化最好开新 method 或新 service，比如 `CreateTaskV2`，再做双写、灰度和迁移。
+
+部署顺序也重要。服务端通常要先兼容老客户端，再让客户端逐步使用新字段。跨团队环境里，要做 contract test、兼容性检查、生成代码检查和线上指标观察。不要只编译当前仓库通过，就认为 RPC API 兼容。
+
+面试可以这样说：protobuf 的 tag 兼容只是底线，真正的 RPC 兼容还包括错误语义、幂等语义、鉴权、分页、默认值和 rollout 顺序。
+
+## Q077. 如何在 RPC 链路中统一日志、metrics、tracing？
+
+**回答：**
+
+统一可观测性最好的切入点是拦截器。客户端 interceptor 在发起 RPC 前注入 trace context、request id、caller、deadline、attempt 信息；服务端 interceptor 在请求进入 handler 前读取这些上下文，创建 span，记录 method、peer、tenant、auth subject 和剩余 deadline。handler 代码不要每个地方手写一套埋点。
+
+日志要能串起来。每条关键日志至少带 trace id、span id、request id、grpc method、status、deadline、duration、attempt、peer 和业务 operation id。错误日志要记录 status source：是 handler 返回、下游返回、客户端取消、deadline、transport 断开，还是代理合成。不要把 token、metadata 全量、用户隐私或大 request body 打进日志。
+
+metrics 要低基数。适合做标签的是 service、method、status、caller、target、是否重试、是否超时。不要把 user id、order id、error message 放进标签。gRPC 的 OpenTelemetry 指标本身就区分 client call、client attempt、server call，也提供 duration、sent/received compressed message size、retry/hedging 等维度。排查 retry 时，call 级指标和 attempt 级指标都要看。
+
+tracing 用来解释一次请求的路径。每个 RPC client span 和 server span 要能通过 trace context 连起来，下游数据库、消息队列、对象存储也尽量纳入同一 trace。p99 问题不要只看一条慢 trace，还要结合 histogram；trace 解释“这次为什么慢”，metrics 告诉你“这种慢出现了多少”。
+
+## Q078. 如何排查 RPC p99 延迟：DNS、连接、TLS、序列化、排队、下游分别怎么看？
+
+**回答：**
+
+排查 p99 要先分段。总耗时只有一个数字，定位不了问题。客户端侧至少拆出 resolver/DNS、LB pick、连接建立、TLS 握手、HTTP/2 stream 排队、请求序列化、发送、等待响应、响应反序列化。服务端侧拆出 transport 接收、handler 排队、业务执行、下游调用、响应序列化、发送。
+
+DNS 和服务发现看解析耗时、解析失败率、地址刷新间隔、旧地址比例、连接是否还打到已摘除实例。连接看 channel state、connect latency、连接重建次数、TCP reset、keepalive、NAT idle timeout。TLS 看握手耗时、证书校验失败、ALPN 是否谈成 HTTP/2、证书轮换是否造成尖峰。
+
+HTTP/2 和客户端排队看 active streams、pending RPC、max concurrent streams、flow-control stall、连接级窗口、单连接是否承载过多长流。序列化看 request/response size、protobuf marshal/unmarshal CPU、压缩开销、分配次数和 GC。服务端排队看 worker pool、线程池、event loop、数据库连接池、限流队列和 CPU run queue。
+
+下游要按 fan-out 拆。一个 RPC 慢，可能不是本服务慢，而是它等了 5 个下游里最慢的那个。要看每个下游的 p50/p95/p99、错误码、deadline 剩余预算、重试次数和并发量。重试尤其容易把 p99 拉长：用户看到的是一次 logical call，内部可能已经尝试了多次。
+
+实际步骤我会这样做：先用指标确认是全局慢、某方法慢、某调用方慢还是某后端慢；再用 tracing 看慢请求卡在哪一段；最后用日志和 runtime 指标验证，比如 DNS 失败、连接重建、stream 排队、GC、锁竞争、下游连接池耗尽。不要一开始就改 timeout，timeout 变长只会把问题藏得更深。
+
+## Q079. 如何在面试中说明 RPC 可靠性不是框架自动解决的问题？
+
+**回答：**
+
+可以把话说得很直接：gRPC 给的是传输和编程模型，不是业务可靠性的自动证明。它提供 HTTP/2、protobuf、deadline、status code、metadata、flow control、retry policy、拦截器和观测指标；这些是工具，不会自动决定一个下单接口能不能重试，也不会自动知道扣款是否已经提交。
+
+框架能解决一部分确定问题。比如它能把请求编码成 protobuf，能在 HTTP/2 stream 上传输，能在 deadline 到时让调用方停止等待，能用 status code 表达 RPC 结果，能在 retry policy 满足时创建新的 attempt。可是框架不知道业务副作用。`CreateOrder` 超时后订单是否创建，只有业务状态机、幂等键、数据库约束和操作日志知道。
+
+面试时不要把可靠性吹成“用了 gRPC 就可靠”。更好的说法是：RPC 可靠性分三层。第一层是传输可靠性，靠 HTTP/2、TLS、连接管理、flow control。第二层是调用可靠性，靠 deadline、cancel、retry、backoff、status code、负载均衡。第三层是业务可靠性，靠幂等、事务、状态查询、补偿、审计和可观测性。前两层框架能提供很多支持，第三层必须由业务设计完成。
+
+最后可以补一句工程判断：我会默认所有跨网络调用都可能出现“请求执行了但响应没回来”。只要这个假设成立，接口设计自然会走向幂等键、operation id、状态机和明确错误语义。这比背几个 gRPC 参数更能体现分布式系统思维。
+
 ## 参考资料
 
 - [RFC 9113: HTTP/2](https://www.rfc-editor.org/rfc/rfc9113.html)

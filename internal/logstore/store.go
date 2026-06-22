@@ -1,6 +1,9 @@
 package logstore
 
 import (
+	"bufio"
+	"bytes"
+	"container/list"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -17,15 +20,25 @@ import (
 )
 
 const (
-	magic                   uint32 = 0x4c535647
-	version                 uint16 = 1
-	headerSize                     = 36
-	defaultSegmentSizeBytes int64  = 64 << 20
-	defaultFsyncInterval           = 100 * time.Millisecond
-	retentionFileName              = "retention.json"
+	magic                         uint32 = 0x4c535647
+	version                       uint16 = 1
+	headerSize                           = 36
+	indexMagic                    uint32 = 0x4c534958
+	indexVersion                  uint16 = 2
+	legacyIndexVersion            uint16 = 1
+	indexFileHeaderSize                  = 40
+	indexDictionaryHeaderSize            = 8
+	indexFixedEntrySize                  = 24
+	legacyIndexRecordHeaderSize          = 36
+	defaultSegmentSizeBytes       int64  = 64 << 20
+	defaultSegmentReaderCacheSize        = 64
+	defaultFsyncInterval                 = 100 * time.Millisecond
+	retentionFileName                    = "retention.json"
 )
 
 var errCorruptRecord = errors.New("corrupt log record")
+var errCorruptIndex = errors.New("corrupt index")
+var indexCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
 type FsyncPolicy string
 
@@ -36,16 +49,18 @@ const (
 )
 
 type Options struct {
-	SegmentSizeBytes int64
-	FsyncPolicy      FsyncPolicy
-	FsyncInterval    time.Duration
+	SegmentSizeBytes       int64
+	FsyncPolicy            FsyncPolicy
+	FsyncInterval          time.Duration
+	SegmentReaderCacheSize int
 }
 
 func DefaultOptions() Options {
 	return Options{
-		SegmentSizeBytes: defaultSegmentSizeBytes,
-		FsyncPolicy:      FsyncAlways,
-		FsyncInterval:    defaultFsyncInterval,
+		SegmentSizeBytes:       defaultSegmentSizeBytes,
+		FsyncPolicy:            FsyncAlways,
+		FsyncInterval:          defaultFsyncInterval,
+		SegmentReaderCacheSize: defaultSegmentReaderCacheSize,
 	}
 }
 
@@ -58,6 +73,9 @@ func (opts Options) normalize() (Options, error) {
 	}
 	if opts.FsyncInterval <= 0 {
 		opts.FsyncInterval = defaultFsyncInterval
+	}
+	if opts.SegmentReaderCacheSize < 0 {
+		opts.SegmentReaderCacheSize = 0
 	}
 	switch opts.FsyncPolicy {
 	case FsyncAlways, FsyncBatch, FsyncInterval:
@@ -75,19 +93,38 @@ type Store struct {
 	indexFile          *os.File
 	activeSegmentID    uint64
 	activeSegmentBytes int64
-	nextSeq            map[string]uint64
-	index              map[string][]indexEntry
+	streams            map[string]*streamState
 	idempotency        map[string]Record
-	trimBefore         map[string]uint64
+	segmentReaders     map[uint64]*segmentReader
+	segmentReaderLRU   *list.List
 	lastSync           time.Time
 }
 
-type indexEntry struct {
-	StreamID  string
+type streamState struct {
+	streamID   string
+	nextSeq    uint64
+	trimBefore uint64
+	entries    []streamIndexEntry
+}
+
+type streamIndexEntry struct {
 	Seq       uint64
 	SegmentID uint64
-	Offset    int64
-	Length    int64
+	Offset    uint64
+	Length    uint32
+}
+
+type recoveredIndexEntry struct {
+	streamID string
+	entry    streamIndexEntry
+}
+
+type segmentReader struct {
+	segmentID uint64
+	file      *os.File
+	refs      int
+	element   *list.Element
+	cached    bool
 }
 
 type retentionFile struct {
@@ -113,12 +150,12 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	}
 
 	s := &Store{
-		dir:         dir,
-		options:     normalized,
-		nextSeq:     make(map[string]uint64),
-		index:       make(map[string][]indexEntry),
-		idempotency: make(map[string]Record),
-		trimBefore:  make(map[string]uint64),
+		dir:              dir,
+		options:          normalized,
+		streams:          make(map[string]*streamState),
+		idempotency:      make(map[string]Record),
+		segmentReaders:   make(map[uint64]*segmentReader),
+		segmentReaderLRU: list.New(),
 	}
 
 	if err := s.recover(); err != nil {
@@ -137,7 +174,7 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.closeActiveFilesLocked(true)
+	return errors.Join(s.closeActiveFilesLocked(true), s.closeSegmentReadersLocked())
 }
 
 func (s *Store) Append(req AppendRequest) (Record, bool, error) {
@@ -157,7 +194,8 @@ func (s *Store) Append(req AppendRequest) (Record, bool, error) {
 		}
 	}
 
-	seq := s.nextSeq[req.StreamID]
+	state := s.streamStateLocked(req.StreamID)
+	seq := state.nextSeq
 	if seq == 0 {
 		seq = 1
 	}
@@ -178,28 +216,27 @@ func (s *Store) Append(req AppendRequest) (Record, bool, error) {
 	if err := s.ensureWritableSegmentLocked(int64(len(encoded))); err != nil {
 		return Record{}, false, err
 	}
+	if len(encoded) > int(^uint32(0)) {
+		return Record{}, false, errors.New("record too large for index")
+	}
 
 	offset := s.activeSegmentBytes
 	if _, err := s.logFile.Write(encoded); err != nil {
 		return Record{}, false, err
 	}
-	entry := indexEntry{
-		StreamID:  rec.StreamID,
+	entry := streamIndexEntry{
 		Seq:       rec.Seq,
 		SegmentID: s.activeSegmentID,
-		Offset:    offset,
-		Length:    int64(len(encoded)),
-	}
-	if err := s.appendIndex(entry); err != nil {
-		return Record{}, false, err
+		Offset:    uint64(offset),
+		Length:    uint32(len(encoded)),
 	}
 	if err := s.syncForPolicyLocked(); err != nil {
 		return Record{}, false, err
 	}
 
 	s.activeSegmentBytes += int64(len(encoded))
-	s.index[rec.StreamID] = append(s.index[rec.StreamID], entry)
-	s.nextSeq[rec.StreamID] = seq + 1
+	state.entries = append(state.entries, entry)
+	state.nextSeq = seq + 1
 	if rec.IdempotencyKey != "" {
 		s.idempotency[idempotencyKey(rec.StreamID, rec.IdempotencyKey)] = idempotencyRecord(rec)
 	}
@@ -207,62 +244,78 @@ func (s *Store) Append(req AppendRequest) (Record, bool, error) {
 }
 
 func (s *Store) Read(streamID string, fromSeq uint64, limit int) ([]Record, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	out := make([]Record, 0, limit)
+	err := s.ReadEach(streamID, fromSeq, limit, func(rec Record) error {
+		out = append(out, rec)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) ReadEach(streamID string, fromSeq uint64, limit int, emit func(Record) error) error {
 	if streamID == "" {
-		return nil, errors.New("stream_id is required")
+		return errors.New("stream_id is required")
+	}
+	if emit == nil {
+		return errors.New("emit is required")
 	}
 	if fromSeq == 0 {
 		fromSeq = 1
 	}
-	if limit <= 0 {
-		limit = 100
-	}
 
 	s.mu.Lock()
-	if trimmedBefore := s.trimBefore[streamID]; trimmedBefore > fromSeq {
-		fromSeq = trimmedBefore
-	}
-	entries := s.index[streamID]
-	selected := make([]indexEntry, 0, min(limit, len(entries)))
-	for _, entry := range entries {
-		if entry.Seq < fromSeq {
-			continue
+	var selected []streamIndexEntry
+	if state := s.streams[streamID]; state != nil {
+		if state.trimBefore > fromSeq {
+			fromSeq = state.trimBefore
 		}
-		selected = append(selected, entry)
-		if len(selected) == limit {
-			break
+		entries := state.entries
+		start := sort.Search(len(entries), func(i int) bool {
+			return entries[i].Seq >= fromSeq
+		})
+		end := len(entries)
+		if limit > 0 {
+			end = min(start+limit, len(entries))
+		}
+		if start < end {
+			selected = append([]streamIndexEntry(nil), entries[start:end]...)
 		}
 	}
 	s.mu.Unlock()
 
-	out := make([]Record, 0, len(selected))
-	var (
-		currentSegmentID uint64
-		currentFile      *os.File
-	)
+	var current *segmentReader
 	defer func() {
-		if currentFile != nil {
-			_ = currentFile.Close()
+		if current != nil {
+			s.releaseSegmentReader(current)
 		}
 	}()
 	for _, entry := range selected {
-		if currentFile == nil || currentSegmentID != entry.SegmentID {
-			if currentFile != nil {
-				_ = currentFile.Close()
+		if current == nil || current.segmentID != entry.SegmentID {
+			if current != nil {
+				s.releaseSegmentReader(current)
 			}
-			file, err := os.Open(segmentPath(s.dir, entry.SegmentID, ".log"))
+			reader, err := s.acquireSegmentReader(entry.SegmentID)
 			if err != nil {
-				return nil, err
+				current = nil
+				return err
 			}
-			currentFile = file
-			currentSegmentID = entry.SegmentID
+			current = reader
 		}
-		rec, err := readIndexedRecordFromFile(currentFile, entry)
+		rec, err := readIndexedRecordFromFile(current.file, streamID, entry)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, rec)
+		if err := emit(rec); err != nil {
+			return err
+		}
 	}
-	return out, nil
+	return nil
 }
 
 func (s *Store) Trim(streamID string, beforeSeq uint64) (TrimStats, error) {
@@ -276,10 +329,11 @@ func (s *Store) Trim(streamID string, beforeSeq uint64) (TrimStats, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.index[streamID]; !ok && s.nextSeq[streamID] == 0 {
+	state := s.streams[streamID]
+	if state == nil || state.nextSeq == 0 {
 		return TrimStats{}, fmt.Errorf("stream %q not found", streamID)
 	}
-	nextSeq := s.nextSeq[streamID]
+	nextSeq := state.nextSeq
 	if nextSeq == 0 {
 		nextSeq = 1
 	}
@@ -289,8 +343,8 @@ func (s *Store) Trim(streamID string, beforeSeq uint64) (TrimStats, error) {
 	if beforeSeq < 1 {
 		beforeSeq = 1
 	}
-	if beforeSeq > s.trimBefore[streamID] {
-		s.trimBefore[streamID] = beforeSeq
+	if beforeSeq > state.trimBefore {
+		state.trimBefore = beforeSeq
 		if err := s.persistRetentionLocked(); err != nil {
 			return TrimStats{}, err
 		}
@@ -303,11 +357,10 @@ func (s *Store) Stats(streamID, prefix string) []TrimStats {
 	defer s.mu.Unlock()
 
 	streams := make(map[string]bool)
-	for id := range s.index {
-		streams[id] = true
-	}
-	for id := range s.trimBefore {
-		streams[id] = true
+	for id, state := range s.streams {
+		if len(state.entries) > 0 || state.trimBefore > 0 {
+			streams[id] = true
+		}
 	}
 	ids := make([]string, 0, len(streams))
 	for id := range streams {
@@ -331,8 +384,11 @@ func (s *Store) ListStreams(prefix string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	out := make([]string, 0, len(s.index))
-	for streamID := range s.index {
+	out := make([]string, 0, len(s.streams))
+	for streamID, state := range s.streams {
+		if len(state.entries) == 0 {
+			continue
+		}
 		if prefix == "" || strings.HasPrefix(streamID, prefix) {
 			out = append(out, streamID)
 		}
@@ -352,6 +408,15 @@ func (s *Store) recover() error {
 		return s.rewriteIndex()
 	}
 
+	loadedFromIndex, usedLegacyIndex, err := s.loadFromIndexFiles(segmentIDs)
+	if err == nil && loadedFromIndex {
+		if usedLegacyIndex {
+			return s.rewriteIndex()
+		}
+		return nil
+	}
+
+	s.resetRecoveredState()
 	for _, segmentID := range segmentIDs {
 		size, err := s.recoverSegment(segmentID)
 		if err != nil {
@@ -360,7 +425,334 @@ func (s *Store) recover() error {
 		s.activeSegmentID = segmentID
 		s.activeSegmentBytes = size
 	}
+	s.sortStreamEntries()
 	return s.rewriteIndex()
+}
+
+func (s *Store) loadFromIndexFiles(segmentIDs []uint64) (bool, bool, error) {
+	usedLegacyIndex := false
+	bySegment := make(map[uint64][]recoveredIndexEntry, len(segmentIDs))
+
+	for _, segmentID := range segmentIDs {
+		path := segmentPath(s.dir, segmentID, ".index")
+		items, legacy, err := readSegmentIndex(path, segmentID)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, usedLegacyIndex, nil
+		}
+		if err != nil {
+			return false, usedLegacyIndex, err
+		}
+		usedLegacyIndex = usedLegacyIndex || legacy
+		bySegment[segmentID] = items
+		for _, item := range items {
+			state := s.streamStateLocked(item.streamID)
+			state.entries = append(state.entries, item.entry)
+			if state.nextSeq <= item.entry.Seq {
+				state.nextSeq = item.entry.Seq + 1
+			}
+		}
+	}
+
+	for _, segmentID := range segmentIDs {
+		if err := validateIndexedSegmentCoverage(s.dir, segmentID, bySegment[segmentID]); err != nil {
+			return false, usedLegacyIndex, err
+		}
+	}
+	s.sortStreamEntries()
+	if err := s.hydrateIdempotencyFromIndex(bySegment, segmentIDs); err != nil {
+		return false, usedLegacyIndex, err
+	}
+
+	lastSegmentID := segmentIDs[len(segmentIDs)-1]
+	info, err := os.Stat(segmentPath(s.dir, lastSegmentID, ".log"))
+	if err != nil {
+		return false, usedLegacyIndex, err
+	}
+	s.activeSegmentID = lastSegmentID
+	s.activeSegmentBytes = info.Size()
+	return true, usedLegacyIndex, nil
+}
+
+func (s *Store) resetRecoveredState() {
+	s.streams = make(map[string]*streamState)
+	s.idempotency = make(map[string]Record)
+}
+
+func (s *Store) streamStateLocked(streamID string) *streamState {
+	state := s.streams[streamID]
+	if state == nil {
+		state = &streamState{streamID: streamID}
+		s.streams[streamID] = state
+	}
+	return state
+}
+
+func (s *Store) sortStreamEntries() {
+	for _, state := range s.streams {
+		sort.Slice(state.entries, func(i, j int) bool {
+			return state.entries[i].Seq < state.entries[j].Seq
+		})
+	}
+}
+
+func validateIndexedSegmentCoverage(dir string, segmentID uint64, items []recoveredIndexEntry) error {
+	info, err := os.Stat(segmentPath(dir, segmentID, ".log"))
+	if err != nil {
+		return err
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].entry.Offset < items[j].entry.Offset
+	})
+	var expectedOffset uint64
+	for _, item := range items {
+		if item.entry.Offset != expectedOffset {
+			return errCorruptIndex
+		}
+		expectedOffset += uint64(item.entry.Length)
+	}
+	if expectedOffset != uint64(info.Size()) {
+		return errCorruptIndex
+	}
+	return nil
+}
+
+func (s *Store) hydrateIdempotencyFromIndex(bySegment map[uint64][]recoveredIndexEntry, segmentIDs []uint64) error {
+	for _, segmentID := range segmentIDs {
+		items := bySegment[segmentID]
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].entry.Offset < items[j].entry.Offset
+		})
+		file, err := os.Open(segmentPath(s.dir, segmentID, ".log"))
+		if err != nil {
+			return err
+		}
+		for _, item := range items {
+			rec, err := readIndexedRecordFromFile(file, item.streamID, item.entry)
+			if err != nil {
+				_ = file.Close()
+				return err
+			}
+			if rec.IdempotencyKey != "" {
+				s.idempotency[idempotencyKey(rec.StreamID, rec.IdempotencyKey)] = idempotencyRecord(rec)
+			}
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readSegmentIndex(path string, segmentID uint64) ([]recoveredIndexEntry, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if info.Size() == 0 {
+		return nil, false, nil
+	}
+
+	reader := bufio.NewReader(file)
+	probe, err := reader.Peek(4)
+	if err != nil {
+		return nil, false, errCorruptIndex
+	}
+	if binary.BigEndian.Uint32(probe) == indexMagic {
+		versionProbe, err := reader.Peek(6)
+		if err != nil {
+			return nil, false, errCorruptIndex
+		}
+		switch binary.BigEndian.Uint16(versionProbe[4:6]) {
+		case indexVersion:
+			items, err := readDictionarySegmentIndex(reader, segmentID)
+			return items, false, err
+		case legacyIndexVersion:
+			items, err := readLegacyBinarySegmentIndex(reader, segmentID)
+			return items, true, err
+		default:
+			return nil, false, errCorruptIndex
+		}
+	}
+	items, err := readJSONSegmentIndex(reader, segmentID)
+	return items, true, err
+}
+
+func readDictionarySegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndexEntry, error) {
+	header := make([]byte, indexFileHeaderSize)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, errCorruptIndex
+	}
+	if binary.BigEndian.Uint32(header[0:4]) != indexMagic {
+		return nil, errCorruptIndex
+	}
+	if binary.BigEndian.Uint16(header[4:6]) != indexVersion {
+		return nil, errCorruptIndex
+	}
+	if binary.BigEndian.Uint16(header[6:8]) != indexFileHeaderSize {
+		return nil, errCorruptIndex
+	}
+	if binary.BigEndian.Uint64(header[8:16]) != segmentID {
+		return nil, errCorruptIndex
+	}
+	streamCount := binary.BigEndian.Uint32(header[16:20])
+	entryCount := binary.BigEndian.Uint64(header[20:28])
+	dictionaryBytes := binary.BigEndian.Uint64(header[28:36])
+	actualCRC := binary.BigEndian.Uint32(header[36:40])
+
+	payload, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	if dictionaryBytes > uint64(len(payload)) {
+		return nil, errCorruptIndex
+	}
+	if uint64(streamCount)*uint64(indexDictionaryHeaderSize) > dictionaryBytes {
+		return nil, errCorruptIndex
+	}
+	dictLen := int(dictionaryBytes)
+	entryBytes := len(payload) - dictLen
+	if entryBytes%indexFixedEntrySize != 0 || uint64(entryBytes/indexFixedEntrySize) != entryCount {
+		return nil, errCorruptIndex
+	}
+	expectedCRC := crc32.Checksum(header[:36], indexCRCTable)
+	expectedCRC = crc32.Update(expectedCRC, indexCRCTable, payload)
+	if actualCRC != expectedCRC {
+		return nil, errCorruptIndex
+	}
+
+	dictionary := make([]string, int(streamCount))
+	dictPayload := payload[:dictLen]
+	pos := 0
+	for i := uint32(0); i < streamCount; i++ {
+		if len(dictPayload)-pos < indexDictionaryHeaderSize {
+			return nil, errCorruptIndex
+		}
+		streamIDID := binary.BigEndian.Uint32(dictPayload[pos : pos+4])
+		streamLen := int(binary.BigEndian.Uint16(dictPayload[pos+4 : pos+6]))
+		pos += indexDictionaryHeaderSize
+		if streamIDID >= streamCount || streamLen == 0 || len(dictPayload)-pos < streamLen {
+			return nil, errCorruptIndex
+		}
+		if dictionary[streamIDID] != "" {
+			return nil, errCorruptIndex
+		}
+		dictionary[streamIDID] = string(dictPayload[pos : pos+streamLen])
+		pos += streamLen
+	}
+	if pos != len(dictPayload) {
+		return nil, errCorruptIndex
+	}
+	for _, streamID := range dictionary {
+		if streamID == "" {
+			return nil, errCorruptIndex
+		}
+	}
+
+	items := make([]recoveredIndexEntry, 0, int(entryCount))
+	entriesPayload := payload[dictLen:]
+	for pos := 0; pos < len(entriesPayload); pos += indexFixedEntrySize {
+		streamIDID := binary.BigEndian.Uint32(entriesPayload[pos : pos+4])
+		seq := binary.BigEndian.Uint64(entriesPayload[pos+4 : pos+12])
+		offset := binary.BigEndian.Uint64(entriesPayload[pos+12 : pos+20])
+		length := binary.BigEndian.Uint32(entriesPayload[pos+20 : pos+24])
+		if streamIDID >= streamCount || seq == 0 || length == 0 {
+			return nil, errCorruptIndex
+		}
+		items = append(items, recoveredIndexEntry{
+			streamID: dictionary[streamIDID],
+			entry: streamIndexEntry{
+				Seq:       seq,
+				SegmentID: segmentID,
+				Offset:    offset,
+				Length:    length,
+			},
+		})
+	}
+	return items, nil
+}
+
+func readLegacyBinarySegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndexEntry, error) {
+	items := make([]recoveredIndexEntry, 0)
+	for {
+		header := make([]byte, legacyIndexRecordHeaderSize)
+		if _, err := io.ReadFull(r, header); err != nil {
+			if errors.Is(err, io.EOF) {
+				return items, nil
+			}
+			return nil, errCorruptIndex
+		}
+		if binary.BigEndian.Uint32(header[0:4]) != indexMagic {
+			return nil, errCorruptIndex
+		}
+		if binary.BigEndian.Uint16(header[4:6]) != legacyIndexVersion {
+			return nil, errCorruptIndex
+		}
+		streamLen := int(binary.BigEndian.Uint16(header[6:8]))
+		seq := binary.BigEndian.Uint64(header[8:16])
+		recordSegmentID := binary.BigEndian.Uint64(header[16:24])
+		offset := binary.BigEndian.Uint64(header[24:32])
+		length := binary.BigEndian.Uint32(header[32:36])
+		if recordSegmentID != segmentID || streamLen == 0 || length == 0 {
+			return nil, errCorruptIndex
+		}
+		streamAndCRC := make([]byte, streamLen+4)
+		if _, err := io.ReadFull(r, streamAndCRC); err != nil {
+			return nil, errCorruptIndex
+		}
+		actualCRC := binary.BigEndian.Uint32(streamAndCRC[streamLen:])
+		expectedCRC := crc32.Checksum(header, indexCRCTable)
+		expectedCRC = crc32.Update(expectedCRC, indexCRCTable, streamAndCRC[:streamLen])
+		if actualCRC != expectedCRC {
+			return nil, errCorruptIndex
+		}
+		items = append(items, recoveredIndexEntry{
+			streamID: string(streamAndCRC[:streamLen]),
+			entry: streamIndexEntry{
+				Seq:       seq,
+				SegmentID: recordSegmentID,
+				Offset:    offset,
+				Length:    length,
+			},
+		})
+	}
+}
+
+func readJSONSegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndexEntry, error) {
+	decoder := json.NewDecoder(r)
+	items := make([]recoveredIndexEntry, 0)
+	for {
+		var raw struct {
+			StreamID  string `json:"stream_id"`
+			Seq       uint64 `json:"seq"`
+			SegmentID uint64 `json:"segment_id"`
+			Offset    int64  `json:"offset"`
+			Length    int64  `json:"length"`
+		}
+		if err := decoder.Decode(&raw); err != nil {
+			if errors.Is(err, io.EOF) {
+				return items, nil
+			}
+			return nil, err
+		}
+		if raw.StreamID == "" || raw.Seq == 0 || raw.SegmentID != segmentID || raw.Offset < 0 || raw.Length <= 0 || raw.Length > int64(^uint32(0)) {
+			return nil, errCorruptIndex
+		}
+		items = append(items, recoveredIndexEntry{
+			streamID: raw.StreamID,
+			entry: streamIndexEntry{
+				Seq:       raw.Seq,
+				SegmentID: raw.SegmentID,
+				Offset:    uint64(raw.Offset),
+				Length:    uint32(raw.Length),
+			},
+		})
+	}
 }
 
 func (s *Store) loadRetention() error {
@@ -380,20 +772,20 @@ func (s *Store) loadRetention() error {
 		if streamID == "" || meta.TrimmedBeforeSeq == 0 {
 			continue
 		}
-		s.trimBefore[streamID] = meta.TrimmedBeforeSeq
+		s.streamStateLocked(streamID).trimBefore = meta.TrimmedBeforeSeq
 	}
 	return nil
 }
 
 func (s *Store) persistRetentionLocked() error {
-	file := retentionFile{Streams: make(map[string]retentionStream, len(s.trimBefore))}
+	file := retentionFile{Streams: make(map[string]retentionStream, len(s.streams))}
 	now := time.Now().UnixMilli()
-	for streamID, beforeSeq := range s.trimBefore {
-		if beforeSeq == 0 {
+	for streamID, state := range s.streams {
+		if state.trimBefore == 0 {
 			continue
 		}
 		file.Streams[streamID] = retentionStream{
-			TrimmedBeforeSeq: beforeSeq,
+			TrimmedBeforeSeq: state.trimBefore,
 			UpdatedAtMs:      now,
 		}
 	}
@@ -414,25 +806,31 @@ func (s *Store) persistRetentionLocked() error {
 }
 
 func (s *Store) streamStatsLocked(streamID string) TrimStats {
-	entries := s.index[streamID]
-	trimmedBefore := s.trimBefore[streamID]
-	nextSeq := s.nextSeq[streamID]
-	if nextSeq == 0 {
-		nextSeq = 1
+	state := s.streams[streamID]
+	trimmedBefore := uint64(0)
+	nextSeq := uint64(1)
+	if state != nil {
+		trimmedBefore = state.trimBefore
+		nextSeq = state.nextSeq
+		if nextSeq == 0 {
+			nextSeq = 1
+		}
 	}
 	stats := TrimStats{
 		StreamID:         streamID,
 		NextSeq:          nextSeq,
 		TrimmedBeforeSeq: trimmedBefore,
 	}
-	for _, entry := range entries {
-		if trimmedBefore > 0 && entry.Seq < trimmedBefore {
-			stats.CompactableRecords++
-			stats.CompactableBytes += uint64(entry.Length)
-			continue
-		}
-		if stats.FirstSeq == 0 || entry.Seq < stats.FirstSeq {
-			stats.FirstSeq = entry.Seq
+	if state != nil {
+		for _, entry := range state.entries {
+			if trimmedBefore > 0 && entry.Seq < trimmedBefore {
+				stats.CompactableRecords++
+				stats.CompactableBytes += uint64(entry.Length)
+				continue
+			}
+			if stats.FirstSeq == 0 || entry.Seq < stats.FirstSeq {
+				stats.FirstSeq = entry.Seq
+			}
 		}
 	}
 	if stats.FirstSeq == 0 {
@@ -461,16 +859,20 @@ func (s *Store) recoverSegment(segmentID uint64) (int64, error) {
 			}
 			break
 		}
-		entry := indexEntry{
-			StreamID:  rec.StreamID,
+		length := nextOffset - offset
+		if length <= 0 || length > int64(^uint32(0)) {
+			return 0, errors.New("record too large for index")
+		}
+		entry := streamIndexEntry{
 			Seq:       rec.Seq,
 			SegmentID: segmentID,
-			Offset:    offset,
-			Length:    nextOffset - offset,
+			Offset:    uint64(offset),
+			Length:    uint32(length),
 		}
-		s.index[rec.StreamID] = append(s.index[rec.StreamID], entry)
-		if s.nextSeq[rec.StreamID] <= rec.Seq {
-			s.nextSeq[rec.StreamID] = rec.Seq + 1
+		state := s.streamStateLocked(rec.StreamID)
+		state.entries = append(state.entries, entry)
+		if state.nextSeq <= rec.Seq {
+			state.nextSeq = rec.Seq + 1
 		}
 		if rec.IdempotencyKey != "" {
 			s.idempotency[idempotencyKey(rec.StreamID, rec.IdempotencyKey)] = idempotencyRecord(rec)
@@ -503,27 +905,14 @@ func (s *Store) rewriteIndex() error {
 		segmentIDs = []uint64{s.activeSegmentID}
 	}
 
-	bySegment := make(map[uint64][]indexEntry)
-	for _, entries := range s.index {
-		for _, entry := range entries {
-			bySegment[entry.SegmentID] = append(bySegment[entry.SegmentID], entry)
-		}
-	}
-
 	for _, segmentID := range segmentIDs {
-		entries := bySegment[segmentID]
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].Offset < entries[j].Offset
-		})
 		file, err := os.OpenFile(segmentPath(s.dir, segmentID, ".index"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
 		}
-		for _, entry := range entries {
-			if err := writeIndexEntry(file, entry); err != nil {
-				_ = file.Close()
-				return err
-			}
+		if err := writeSegmentIndex(file, segmentID, s.segmentIndexEntriesLocked(segmentID)); err != nil {
+			_ = file.Close()
+			return err
 		}
 		if err := errors.Join(file.Sync(), file.Close()); err != nil {
 			return err
@@ -532,16 +921,214 @@ func (s *Store) rewriteIndex() error {
 	return nil
 }
 
-func (s *Store) appendIndex(entry indexEntry) error {
-	return writeIndexEntry(s.indexFile, entry)
+func (s *Store) segmentIndexEntriesLocked(segmentID uint64) []recoveredIndexEntry {
+	entries := make([]recoveredIndexEntry, 0)
+	for streamID, state := range s.streams {
+		for _, entry := range state.entries {
+			if entry.SegmentID != segmentID {
+				continue
+			}
+			entries = append(entries, recoveredIndexEntry{
+				streamID: streamID,
+				entry:    entry,
+			})
+		}
+	}
+	return entries
 }
 
-func readIndexedRecordFromFile(file *os.File, entry indexEntry) (Record, error) {
-	rec, nextOffset, err := readRecordAt(file, entry.Offset)
+func (s *Store) flushActiveIndexLocked() error {
+	if s.indexFile == nil || s.activeSegmentID == 0 {
+		return nil
+	}
+	if err := s.indexFile.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := s.indexFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return writeSegmentIndex(s.indexFile, s.activeSegmentID, s.segmentIndexEntriesLocked(s.activeSegmentID))
+}
+
+func writeSegmentIndex(w io.Writer, segmentID uint64, entries []recoveredIndexEntry) error {
+	entries = append([]recoveredIndexEntry(nil), entries...)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].entry.Offset < entries[j].entry.Offset
+	})
+
+	streamSet := make(map[string]struct{})
+	for _, item := range entries {
+		if item.streamID == "" {
+			return errors.New("stream_id is required")
+		}
+		if len(item.streamID) > 0xffff {
+			return errors.New("stream_id too large")
+		}
+		if item.entry.SegmentID != segmentID || item.entry.Seq == 0 || item.entry.Length == 0 {
+			return errCorruptIndex
+		}
+		streamSet[item.streamID] = struct{}{}
+	}
+	if uint64(len(streamSet)) > uint64(^uint32(0)) {
+		return errors.New("too many streams in segment index")
+	}
+
+	streamIDs := make([]string, 0, len(streamSet))
+	for streamID := range streamSet {
+		streamIDs = append(streamIDs, streamID)
+	}
+	sort.Strings(streamIDs)
+	streamIDsByName := make(map[string]uint32, len(streamIDs))
+
+	var dictionary bytes.Buffer
+	for i, streamID := range streamIDs {
+		streamIDID := uint32(i)
+		streamBytes := []byte(streamID)
+		streamIDsByName[streamID] = streamIDID
+		header := make([]byte, indexDictionaryHeaderSize)
+		binary.BigEndian.PutUint32(header[0:4], streamIDID)
+		binary.BigEndian.PutUint16(header[4:6], uint16(len(streamBytes)))
+		dictionary.Write(header)
+		dictionary.Write(streamBytes)
+	}
+
+	var fixedEntries bytes.Buffer
+	for _, item := range entries {
+		entry := make([]byte, indexFixedEntrySize)
+		binary.BigEndian.PutUint32(entry[0:4], streamIDsByName[item.streamID])
+		binary.BigEndian.PutUint64(entry[4:12], item.entry.Seq)
+		binary.BigEndian.PutUint64(entry[12:20], item.entry.Offset)
+		binary.BigEndian.PutUint32(entry[20:24], item.entry.Length)
+		fixedEntries.Write(entry)
+	}
+
+	payload := append(dictionary.Bytes(), fixedEntries.Bytes()...)
+	header := make([]byte, indexFileHeaderSize)
+	binary.BigEndian.PutUint32(header[0:4], indexMagic)
+	binary.BigEndian.PutUint16(header[4:6], indexVersion)
+	binary.BigEndian.PutUint16(header[6:8], indexFileHeaderSize)
+	binary.BigEndian.PutUint64(header[8:16], segmentID)
+	binary.BigEndian.PutUint32(header[16:20], uint32(len(streamIDs)))
+	binary.BigEndian.PutUint64(header[20:28], uint64(len(entries)))
+	binary.BigEndian.PutUint64(header[28:36], uint64(dictionary.Len()))
+	crc := crc32.Checksum(header[:36], indexCRCTable)
+	crc = crc32.Update(crc, indexCRCTable, payload)
+	binary.BigEndian.PutUint32(header[36:40], crc)
+
+	if _, err := w.Write(header); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func (s *Store) acquireSegmentReader(segmentID uint64) (*segmentReader, error) {
+	if s.options.SegmentReaderCacheSize <= 0 {
+		file, err := os.Open(segmentPath(s.dir, segmentID, ".log"))
+		if err != nil {
+			return nil, err
+		}
+		return &segmentReader{segmentID: segmentID, file: file, refs: 1}, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if reader := s.segmentReaders[segmentID]; reader != nil {
+		reader.refs++
+		if reader.element != nil {
+			s.segmentReaderLRU.MoveToBack(reader.element)
+		}
+		return reader, nil
+	}
+
+	file, err := os.Open(segmentPath(s.dir, segmentID, ".log"))
+	if err != nil {
+		return nil, err
+	}
+	reader := &segmentReader{segmentID: segmentID, file: file, refs: 1, cached: true}
+	reader.element = s.segmentReaderLRU.PushBack(reader)
+	s.segmentReaders[segmentID] = reader
+	s.evictSegmentReadersLocked()
+	return reader, nil
+}
+
+func (s *Store) releaseSegmentReader(reader *segmentReader) {
+	if reader == nil {
+		return
+	}
+	if !reader.cached {
+		_ = reader.file.Close()
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if reader.refs > 0 {
+		reader.refs--
+	}
+	if reader.refs == 0 && reader.element != nil {
+		s.segmentReaderLRU.MoveToBack(reader.element)
+	}
+	s.evictSegmentReadersLocked()
+}
+
+func (s *Store) evictSegmentReadersLocked() {
+	limit := s.options.SegmentReaderCacheSize
+	if limit <= 0 {
+		return
+	}
+	for len(s.segmentReaders) > limit {
+		var evicted bool
+		for element := s.segmentReaderLRU.Front(); element != nil; {
+			next := element.Next()
+			reader := element.Value.(*segmentReader)
+			if reader.refs == 0 {
+				s.segmentReaderLRU.Remove(element)
+				delete(s.segmentReaders, reader.segmentID)
+				reader.cached = false
+				reader.element = nil
+				_ = reader.file.Close()
+				evicted = true
+				break
+			}
+			element = next
+		}
+		if !evicted {
+			return
+		}
+	}
+}
+
+func (s *Store) closeSegmentReadersLocked() error {
+	var err error
+	for segmentID, reader := range s.segmentReaders {
+		err = errors.Join(err, reader.file.Close())
+		delete(s.segmentReaders, segmentID)
+		reader.cached = false
+		reader.element = nil
+	}
+	s.segmentReaderLRU.Init()
+	return err
+}
+
+func (s *Store) cachedSegmentReaderCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.segmentReaders)
+}
+func readIndexedRecordFromFile(file *os.File, streamID string, entry streamIndexEntry) (Record, error) {
+	const maxInt64 = uint64(1<<63 - 1)
+	if entry.Offset > maxInt64 {
+		return Record{}, errCorruptIndex
+	}
+	offset := int64(entry.Offset)
+	rec, nextOffset, err := readRecordAt(file, offset)
 	if err != nil {
 		return Record{}, err
 	}
-	if rec.StreamID != entry.StreamID || rec.Seq != entry.Seq || nextOffset-entry.Offset != entry.Length {
+	if rec.StreamID != streamID || rec.Seq != entry.Seq || nextOffset-offset != int64(entry.Length) {
 		return Record{}, errCorruptRecord
 	}
 	return cloneRecord(rec), nil
@@ -574,7 +1161,7 @@ func (s *Store) openActiveFilesLocked() error {
 	if err != nil {
 		return err
 	}
-	indexFile, err := os.OpenFile(segmentPath(s.dir, s.activeSegmentID, ".index"), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	indexFile, err := os.OpenFile(segmentPath(s.dir, s.activeSegmentID, ".index"), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		_ = logFile.Close()
 		return err
@@ -595,6 +1182,7 @@ func (s *Store) openActiveFilesLocked() error {
 func (s *Store) closeActiveFilesLocked(sync bool) error {
 	var err error
 	if sync {
+		err = errors.Join(err, s.flushActiveIndexLocked())
 		err = errors.Join(err, s.syncFilesLocked())
 	}
 	if s.logFile != nil {
@@ -734,29 +1322,6 @@ func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
 		TimestampMs:    timestampMs,
 		CRC32:          expectedCRC,
 	}, offset + int64(headerSize+bodyLen), nil
-}
-
-func writeIndexEntry(w io.Writer, entry indexEntry) error {
-	data, err := json.Marshal(struct {
-		StreamID  string `json:"stream_id"`
-		Seq       uint64 `json:"seq"`
-		SegmentID uint64 `json:"segment_id"`
-		Offset    int64  `json:"offset"`
-		Length    int64  `json:"length"`
-	}{
-		StreamID:  entry.StreamID,
-		Seq:       entry.Seq,
-		SegmentID: entry.SegmentID,
-		Offset:    entry.Offset,
-		Length:    entry.Length,
-	})
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "%s\n", data); err != nil {
-		return err
-	}
-	return nil
 }
 
 func segmentPath(dir string, segmentID uint64, ext string) string {

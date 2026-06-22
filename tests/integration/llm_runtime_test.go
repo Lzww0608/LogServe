@@ -310,6 +310,7 @@ func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPol
 		submitLLMForTest(t, env.controlClient, "model-A", "hello")
 		var worker string
 		var taskID string
+		var taskEpoch uint64
 		for _, poller := range pollOrder {
 			resp, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: poller})
 			if err != nil {
@@ -318,6 +319,7 @@ func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPol
 			if resp.GetHasTask() {
 				worker = poller
 				taskID = resp.GetTask().GetTaskId()
+				taskEpoch = resp.GetTask().GetTaskLeaseEpoch()
 				break
 			}
 		}
@@ -325,10 +327,11 @@ func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPol
 			t.Fatal("no worker selected")
 		}
 		if _, err := env.controlClient.CompleteTask(context.Background(), &logservepb.CompleteTaskRequest{
-			TaskId:     taskID,
-			WorkerId:   worker,
-			Status:     logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
-			ResultJson: []byte(`"ok"`),
+			TaskId:         taskID,
+			WorkerId:       worker,
+			TaskLeaseEpoch: taskEpoch,
+			Status:         logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
+			ResultJson:     []byte(`"ok"`),
 		}); err != nil {
 			t.Fatal(err)
 		}

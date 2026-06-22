@@ -7495,6 +7495,922 @@ idempotency key for writes
 
 单机 retry storm 是本地资源被重复 attempt 打满；分布式 retry storm 是多个层次、多个客户端和多个区域把局部失败乘法放大。分布式场景必须靠 deadline、retry budget、jitter、限流、观测和幂等语义一起控制。
 
+## Q070. 失败后为什么第一反应不能总是重试？
+
+**回答：**
+
+失败后不能马上重试，是因为失败只说明“这次调用没有得到可用结果”，并不说明“再来一次一定安全”。这里至少混着三件事：错误是不是临时的、原操作有没有副作用、下游是不是已经过载。
+
+最容易犯错的是把所有失败都看成 transient failure。比如网络抖动、连接被重置、少量 `5xx`、临时 leader 切换，这些有机会靠重试恢复；但参数校验失败、权限失败、余额不足、幂等 key 冲突、payload mismatch，重试同一个请求大概率还是失败。更麻烦的是 timeout。调用方没有等到响应，不代表服务端没有执行。原请求可能已经扣款、建单、发券、写消息，只是响应在回来的路上丢了。
+
+所以我会先把失败分成几类：
+
+```text
+可以考虑重试:
+  连接建立失败
+  少量瞬时 5xx
+  leader failover / transient unavailable
+  受控的 429/503，并且尊重 Retry-After
+
+通常不该重试:
+  400 参数错误
+  401/403 权限错误
+  payload mismatch
+  幂等 key 被错误复用
+  明确的业务拒绝，比如余额不足
+  已知非幂等写操作，且没有 operation id
+```
+
+第二个判断是副作用边界。读请求或天然幂等写请求比较适合自动重试；创建订单、扣款、发消息这类操作，只有在有 idempotency key、业务唯一约束、状态机保护或外部 provider 幂等支持时，才应该自动重试。否则一次用户意图会变成多次业务效果。
+
+第三个判断是系统状态。下游已经慢了，重试会继续吃它的线程、连接、CPU 和队列空间。失败如果来自 overload，重试不一定是在修复可用性，反而是在把下游恢复时间拉长。AWS Builders Library 里那句“retries are selfish”很实用：重试是在要求下游为同一个用户意图再花一次资源。这个要求必须有预算。
+
+面试里可以这样回答：
+
+```text
+我不会把 retry 当成默认动作。
+我会先判断错误类型、操作是否幂等、是否还有 deadline、是否还有 retry budget、下游是否过载。
+如果这些条件不成立，正确做法可能是失败返回、查询状态、进入人工/异步确认，或者让调用方用同一个 operation id 继续确认，而不是简单循环。
+```
+
+**一句话**
+
+重试不是“失败后再试一次”，而是在结果不确定时，用有限预算、明确语义和可观测信号去重新确认同一个业务意图；条件不满足时，重试会制造更多错误。
+
+## Q071. 超时错误是否代表操作没有发生？
+
+**回答：**
+
+不代表。超时只代表调用方在自己的等待窗口内没有拿到最终响应。它描述的是调用方视角，不是服务端事实。
+
+一次 RPC 或 HTTP 调用超时，大致可能落在几个窗口里：
+
+```text
+client timeout before request leaves process
+  服务端没有收到，请求大概率没有发生
+
+request reaches server, server has not crossed side-effect boundary
+  可能没有发生，也可能很快会发生
+
+server completes side effect, response lost or delayed
+  操作已经发生，但调用方看到 timeout
+
+server continues after client gave up
+  调用方不等了，服务端仍在跑
+```
+
+这也是 timeout 和 cancellation 容易混淆的地方。timeout 是“我不等了”；cancellation 是“我希望你停下”。即使框架把 deadline 传给了服务端，服务端也通常需要协作式地检查取消信号。已经提交的数据库事务、已经发送给支付通道的扣款、已经投递到 broker 的消息，不会因为客户端不等响应就自动回滚。
+
+所以接口语义上不能把 timeout 翻译成“操作失败”。更稳妥的状态是 unknown：
+
+```text
+success:    已确认成功
+failure:    已确认没有发生或业务拒绝
+unknown:    调用方不知道是否发生
+```
+
+这个 `unknown` 很重要。它决定了后续动作不能是“重新发起一个新操作”，而应该是“确认同一个操作”。手段通常有三种：
+
+1. 客户端用相同 idempotency key 重试，让服务端返回第一次执行结果。
+2. 客户端查询 operation status，比如 `GET /payments/{operation_id}`。
+3. 后台通过对账、回调、outbox 状态机把 unknown 收敛成 success 或 failure。
+
+扣款场景最典型：用户点了支付，客户端 2 秒超时。正确页面不应该直接显示“支付失败，请重新支付”，因为第一次扣款可能已经成功。更安全的文案和状态应该是“结果确认中”，然后用支付单号或 operation id 查询最终结果。
+
+**一句话**
+
+超时不是业务事实，而是观测失败。面试里一定要把它讲成“结果未知”，再说明如何用幂等 key、状态查询和对账把未知状态收敛掉。
+
+## Q072. 重试如何把一次请求变成多次副作用？
+
+**回答：**
+
+重试会把一次用户意图变成多个 attempt。只要副作用边界没有被同一个 operation id 保护，每个 attempt 都可能独立生效。
+
+一个很常见的时间线是这样：
+
+```text
+T1 client -> POST /charges, idempotency key 缺失
+T2 server 调用支付通道，扣款成功
+T3 server 准备返回 success
+T4 response 在网络中丢失，client timeout
+T5 client 重新 POST /charges
+T6 server 把第二次请求当成新扣款，再扣一次
+```
+
+从用户看，他只点了一次“支付”。从系统看，服务端收到了两次创建扣款的请求。没有幂等 key 时，系统没有证据说明这两次请求属于同一个业务意图。
+
+多层重试会让问题更明显：
+
+```text
+mobile sdk retries 2 times
+api gateway retries 2 times
+service client retries 3 times
+message consumer retries 5 times
+```
+
+每一层都觉得自己只是“少量重试”，但乘起来就是大量 attempt。副作用如果在最底层，底层看到的是一串合法请求，而不是一个用户动作。
+
+副作用不只包括扣款。常见的还有：
+
+- 创建两笔订单。
+- 给同一个用户发两张优惠券。
+- 给同一个收件人发多封邮件。
+- 把同一条业务事件写入外部系统多次。
+- 重复调用第三方发货、签约、开票接口。
+- 对计数器做多次 `increment`。
+
+解决方向不是“不许重试”，而是把 attempt 和 operation 分开：
+
+```text
+operation_id: 用户这次业务意图
+attempt_id:   为了完成这个意图发起的第几次网络尝试
+```
+
+服务端应该用 `operation_id` 做业务去重，用 `attempt_id` 做观测。日志、trace 和指标里保留 attempt 很有用，但业务状态机只能接受一个 operation。
+
+**一句话**
+
+重试本身只是多次尝试；真正危险的是系统没有把这些尝试绑定到同一个业务意图上，于是每次尝试都跨过了副作用边界。
+
+## Q073. 幂等 key 如何降低重复请求风险？
+
+**回答：**
+
+幂等 key 的作用是给“同一个业务意图的多次 attempt”一个稳定身份。服务端看到相同 key 时，不再把请求当成新操作，而是查已有执行记录，返回已有结果或等待正在执行的那次完成。
+
+一个比较完整的幂等记录通常不是只存一个 key，而是存一小段状态机：
+
+```text
+idempotency_key
+scope: tenant + endpoint + resource + account
+payload_fingerprint
+status: in_progress | succeeded | failed | expired
+response_snapshot / result_reference
+created_at
+expires_at
+```
+
+处理流程可以写成：
+
+```text
+receive request(key, payload)
+  canonicalize payload -> fingerprint
+  insert key + fingerprint + in_progress atomically
+
+if insert succeeds:
+  execute business operation
+  persist final result under the same key
+  return result
+
+if key already exists:
+  compare fingerprint
+  if mismatch: reject, do not execute
+  if succeeded/failed: return stored result or stable result reference
+  if in_progress: wait, poll, or return 409/202
+```
+
+这里有两个关键点。
+
+第一，插入幂等记录必须和“抢占执行权”绑定在一起。两个并发请求带着同一个 key 进来，不能都通过检查再分别执行。工程里通常用唯一索引、条件写、`INSERT ... ON CONFLICT`、CAS 或分布式存储的 conditional put 来保证只有一个 winner。
+
+第二，幂等 key 降低的是重复副作用风险，不是让所有错误消失。它有作用域和生命周期。作用域太宽会误杀正常请求，作用域太窄挡不住重复请求；TTL 太短会让迟到重试变成新操作，TTL 太长会带来存储成本和隐私压力。
+
+还要注意，幂等 key 最好由客户端在发起业务意图时生成，而不是每次 retry 重新生成。每次 retry 换 key，相当于告诉服务端“这是一个新操作”。
+
+**一句话**
+
+幂等 key 把“多次网络尝试”收敛成“同一个业务操作”。它真正依赖的是唯一约束、payload fingerprint、持久化结果和明确作用域，不是一个 header 名字。
+
+## Q074. 幂等 key 复用但 payload 不一致应该如何处理？
+
+**回答：**
+
+应该拒绝，并且不能执行新的业务操作。相同 idempotency key 代表同一个业务意图；payload 不一致说明客户端把同一个身份拿去表达了两个不同意图。继续执行会破坏幂等语义。
+
+例如第一次请求是：
+
+```text
+Idempotency-Key: k-123
+amount: 100
+currency: CNY
+user_id: u1
+```
+
+第二次请求变成：
+
+```text
+Idempotency-Key: k-123
+amount: 200
+currency: CNY
+user_id: u1
+```
+
+这不能解释为“修改第一次请求”。它更像一次客户端 bug、重放攻击、SDK 复用错误，或者业务层把 key 作用域定义错了。服务端如果按第二次执行，第一次结果就被覆盖；如果仍返回第一次结果，客户端又可能误以为 200 元请求成功。最清楚的处理是返回稳定的 mismatch 错误。
+
+接口层可以选择不同状态码，重点是语义要稳定：
+
+```text
+409 Conflict
+422 Unprocessable Content
+400 Bad Request
+```
+
+响应里应该说明：这个 key 已经被用于另一组参数。不要把原始敏感 payload 全量打回去，可以返回 request hash、operation id、创建时间、状态等非敏感信息。
+
+实现上要比对 canonical fingerprint，而不是直接比对原始 JSON 字符串。字段顺序、空白、默认值、数字格式、时间格式都可能造成无意义差异。比较对象应该覆盖会影响业务效果的字段：金额、币种、用户、资源、租户、操作类型、关键选项。trace id、request id、timestamp 这类每次 attempt 都变化的字段，不应该进入 fingerprint。
+
+还有一个边界：如果第一次请求还没开始执行，只是参数校验失败，很多系统不会保存幂等结果。这时客户端修正参数后能否复用 key，要看接口合同。但一旦某个 key 已经和一个业务 payload 绑定，后续就不应该悄悄改绑。
+
+**一句话**
+
+相同 key 加不同 payload 是语义冲突，不是一次正常重试。正确动作是拒绝并暴露 mismatch，而不是覆盖、合并或再次执行。
+
+## Q075. 重试风暴为什么会放大下游故障？
+
+**回答：**
+
+重试风暴的本质是反馈回路失控：下游变慢导致上游超时，上游把超时当成失败开始重试，下游收到更多请求后更慢，更多请求继续超时。这个环一旦形成，小故障就会被放大成级联故障。
+
+一个简化模型：
+
+```text
+normal traffic: 1000 rps
+failure rate:   20%
+client retries: 2 additional attempts
+extra traffic:  1000 * 20% * 2 = 400 rps
+```
+
+这还只是单层。如果 gateway、service A、service B 都有自己的 retry，放大不是相加，而是相乘。AWS 的文章里用过 5 层调用、每层 3 次尝试的例子，最底层数据库可能看到 243 倍请求。真实系统里未必正好到这个数字，但方向是一样的：每层“我只重试几次”的局部理性，会变成全局过载。
+
+重试风暴会同时放大多种资源压力：
+
+- 线程和 goroutine 被慢请求占住。
+- 连接池被旧 attempt 占住，新请求拿不到连接。
+- 队列长度上升，排队时间进入 timeout 窗口。
+- 下游缓存命中率下降，数据库看到更多重复查询。
+- 日志、trace、指标量暴涨，观测系统也被拖慢。
+- 外部 provider 被重复调用，触发限流，失败率更高。
+
+它还会拖慢恢复。下游刚恢复一点容量，本来可以处理新请求；但旧 attempt、迟到 retry、消息重投递一起压上来，把恢复窗口再次打满。
+
+控制手段要组合使用：
+
+```text
+retry budget           限制同一个 logical request 的总 attempt
+single retry owner     避免每层都自动重试
+exponential backoff    拉开重试间隔
+jitter                 打散同步重试
+client-side throttling 本地限速，不把拒绝请求也打到服务端
+load shedding          下游明确拒绝低优先级请求
+circuit breaker        在适合的边界快速失败
+idempotency            防止重复 attempt 变成重复副作用
+```
+
+**一句话**
+
+重试风暴不是请求多了一点，而是失败率、超时、排队和多层 retry 形成正反馈；如果没有预算和退避，它会把下游从“慢”推到“不可恢复”。
+
+## Q076. 指数退避为什么通常要加 jitter？
+
+**回答：**
+
+指数退避只解决“不要立刻重试”，不一定解决“大家不要同一时间重试”。如果所有客户端都按同一个公式退避，它们可能在同一批时间点再次冲击下游。
+
+没有 jitter 时，时间线往往长这样：
+
+```text
+attempt 1 failed at t=0
+retry after 100ms
+retry after 200ms
+retry after 400ms
+retry after 800ms
+cap at 1000ms
+then every 1000ms
+```
+
+如果几千个客户端在同一秒遇到故障，它们会一起在 100ms、200ms、400ms、800ms 这些时间点回来。到达 cap 后更糟，大家每秒一起撞一次。下游看到的不是平滑流量，而是一排尖峰。
+
+jitter 的目的就是把这些尖峰打散：
+
+```text
+base delay = min(cap, initial * 2^attempt)
+actual delay = random(0, base delay)          # full jitter
+```
+
+也可以用 equal jitter、decorrelated jitter 等变体。具体选哪种要看系统，但核心思想一样：不要让失败客户端重新同步。
+
+jitter 也不只用于 retry。定时任务、健康检查、缓存刷新、token 更新、连接重建、consumer 重新上线，都可能形成同步尖峰。很多系统平时看平均 QPS 不高，但每分钟第一秒、每天零点、部署完成后一瞬间会打出尖峰。这里加一点稳定或随机的分散，比盲目扩容更有效。
+
+还有一个工程细节：对周期性后台任务，完全随机有时不利于排查。可以用 deterministic jitter，比如按 host id、tenant id、shard id 做 hash，生成稳定偏移。这样问题重复出现时模式仍然可见，排障会轻松一些。
+
+**一句话**
+
+指数退避让单个客户端慢下来，jitter 让一群客户端别排队一起回来。没有 jitter，backoff 到 cap 后很容易变成有节奏的集体冲击。
+
+## Q077. deadline propagation 如何避免无意义的下游工作？
+
+**回答：**
+
+deadline propagation 的作用是把调用方剩余时间传下去，让下游知道这项工作是否还有意义。没有传播时，每一层只看自己的 timeout，很容易在用户已经放弃后继续做昂贵工作。
+
+例如入口请求总预算 800ms：
+
+```text
+client -> gateway      spent 100ms
+service A queueing     spent 200ms
+service A compute      spent 150ms
+remaining budget       350ms
+```
+
+service A 再调用 service B 时，不应该给 B 一个新的 800ms timeout，而应该给它剩余的 350ms，甚至还要扣掉本地收尾和网络余量。如果 B 的最短可行工作都要 700ms，最合理的动作是尽早失败，不要把请求继续压进下游队列。
+
+这能避免几类浪费：
+
+- 用户已经收到 timeout，但后端还在跑数据库大查询。
+- 上游已经取消请求，下游继续调用外部 provider。
+- 链路后半段没有足够时间返回，仍然占着线程和连接。
+- 队列中的任务过期后还被 worker 执行。
+- 多层 timeout 叠加，实际耗时远超入口 SLO。
+
+实现上不要只传“timeout duration”，更要传“绝对截止时间”或“剩余预算”。gRPC 会在传播时处理 deadline 和 timeout 的转换，避免简单传播绝对时间带来的时钟偏差问题。Go 里常见做法是用 `context.Context` 携带 deadline 和 cancellation signal。消息队列或异步任务里，也可以把 `expire_at`、`not_after`、`deadline_ms` 写进消息，让 consumer 在执行前判断是否还有价值。
+
+但 deadline propagation 不是魔法。服务端业务代码必须检查取消信号；数据库、HTTP client、RPC client 也要使用带 deadline 的 context。已经提交的事务和外部副作用不会自动撤销，所以它主要减少无意义工作，不负责回滚已经发生的业务效果。
+
+**一句话**
+
+deadline propagation 把“这件事还来得及吗”传给每一层。它防止下游为一个已经过期的用户意图继续消耗资源，也让 timeout 从局部配置变成端到端预算。
+
+## Q078. at-least-once delivery 下消费者如何保证外部副作用安全？
+
+**回答：**
+
+at-least-once 的意思是消息不会轻易丢，但可能被处理多次。消费者要保护的是外部可见副作用，而不是假设 handler 只会运行一次。
+
+最基本的原则是：消息 ID、业务 operation ID 和外部副作用 ID 要能对应起来。消费者收到同一条消息的第二次投递时，应该知道它已经处理过，或者至少知道它对应的外部调用已经发起过。
+
+常见做法是 inbox / dedupe 表：
+
+```text
+message_id
+consumer_name
+business_key
+status: processing | done | failed
+result_reference
+created_at
+updated_at
+```
+
+处理流程：
+
+```text
+receive message
+try insert (consumer_name, message_id)
+  if duplicate and done: ack safely
+  if duplicate and processing: skip, wait, or use lease fencing
+  if new: continue
+
+execute local transaction / state transition
+call external API with provider idempotency key if possible
+mark done durably
+ack / commit offset
+```
+
+外部副作用要再加一层保护。比如调用支付、邮件、发券接口时，最好把业务 operation id 传给 provider，或者在本地 outbox 中记录 `external_request_id`。如果 provider 支持幂等，重复发送同一个 `external_request_id` 只会返回同一结果；如果不支持，就要减少自动重试，把 unknown 状态交给查询、对账或人工处理。
+
+顺序也重要。先 ack 再处理，消费者崩溃会丢消息；先处理再 ack，ack 失败会重复投递。at-least-once 通常选择后者，因为重复可以靠幂等处理，丢失很难补。Kafka 里就是“处理后提交 offset”对应 at-least-once；SQS 里是处理后 delete message，delete 失败时消息可能再次出现。
+
+**一句话**
+
+at-least-once 下不要问“怎样避免 handler 重跑”，而要问“handler 重跑时，外部效果怎样仍然只算一次”。答案通常是 inbox 去重、业务状态机、provider 幂等 key 和处理后 ack。
+
+## Q079. 消息处理成功但 ack 失败会发生什么？
+
+**回答：**
+
+会发生重复投递。消费者已经完成了业务处理，但 broker 没有收到或没有持久化 ack，于是它只能认为这条消息还没被成功消费。后面同一条消息会再次交给当前消费者或另一个消费者。
+
+时间线很清楚：
+
+```text
+T1 consumer receives message M
+T2 consumer writes DB / calls external API successfully
+T3 consumer sends ack or commits offset
+T4 ack request times out, connection breaks, or broker write fails
+T5 broker redelivers M
+```
+
+这里不能因为“我的业务处理成功了”就假设 broker 也知道。业务状态和消费位点是两个系统里的事实。ack 失败的本质就是这两个事实没有一起提交。
+
+不同队列表现略有差异：
+
+```text
+SQS:
+  message processed
+  DeleteMessage fails
+  visibility timeout expires
+  message appears again
+
+Kafka:
+  records processed
+  offset commit fails
+  consumer restarts or rebalance
+  records after last committed offset are read again
+
+RabbitMQ-like ack:
+  handler done
+  ack lost or channel closes
+  broker requeues unacked delivery
+```
+
+正确处理方式不是“看到重复就报错”，而是让重复成为正常路径。消费者要能查到：这条 message id 或 business id 是否已经完成。如果完成了，直接 ack；如果外部副作用状态 unknown，就走查询或对账；如果本地只做到一半，要按状态机继续推进，而不是从头再做一次危险副作用。
+
+工程上常见的不变量是：
+
+```text
+ack happens only after durable effect
+reprocessing the same message is safe
+external side effect has idempotency protection or reconciliation path
+```
+
+如果想进一步缩小重复窗口，可以把消费位点和业务输出放进同一个事务边界。Kafka 在“读 Kafka、处理、写 Kafka”场景可以用事务把输出和 offset 一起提交；写外部数据库时，可以把 offset 存在同一个数据库里。写第三方 API 时通常做不到完全原子，只能靠幂等和对账。
+
+**一句话**
+
+处理成功但 ack 失败，就是业务事实成功、broker 事实未成功。系统必须接受重投递，并用去重表、状态机和外部幂等来吸收它。
+
+## Q080. 扣款成功但响应失败如何向用户提供确定结果？
+
+**回答：**
+
+核心是把“支付请求”建模成一个可查询的 operation，而不是把一次 HTTP 响应当成唯一真相。扣款成功但响应失败时，用户最需要的是最终确定结果，不是让他再点一次支付。
+
+比较稳的流程是：
+
+```text
+client creates payment operation id
+client sends POST /payments with idempotency key
+server writes local payment_order = processing
+server calls payment provider with same business request id if supported
+provider charges successfully
+server stores provider_charge_id and marks succeeded
+response to client is lost
+client retries same idempotency key or queries operation id
+server returns succeeded + charge information
+```
+
+如果服务端也没拿到 provider 最终结果，就不要轻易返回失败。状态应该是 `processing` 或 `unknown`，然后通过 provider 查询、异步回调、定时对账把它收敛。
+
+用户侧可以这样设计：
+
+- 支付按钮点击后生成稳定 operation id。
+- 客户端 timeout 后展示“支付结果确认中”，而不是“支付失败”。
+- 页面轮询 `GET /payments/{operation_id}`。
+- 服务端重复收到同一 key 时返回同一 payment order。
+- 如果 provider 回调先到，更新本地状态；如果查询先确认，也更新本地状态。
+- 最终只允许一个支付单进入 `succeeded`，退款、撤销、补偿走独立状态。
+
+账务系统里还要有 ledger 思维。扣款不是一个布尔值，而是一条有 provider reference、金额、币种、用户、订单、状态、对账批次的事实记录。前端展示可以简单，但后端必须能回答：这笔钱到底扣没扣、扣了几次、哪一次是有效业务扣款、异常怎么冲正。
+
+面试里可以补一句：支付这种场景不要依赖客户端“不要重复点击”。按钮防抖只能降低误触，不能解决网络 timeout、进程重启、服务端重试和回调乱序。
+
+**一句话**
+
+扣款响应失败时，正确动作是确认同一个 payment operation 的最终状态。用 idempotency key、支付单状态、provider reference、回调和对账给用户一个确定结果，而不是发起第二次扣款。
+
+## Q081. 事务 outbox 如何解决数据库写入和消息发送双写？
+
+**回答：**
+
+事务 outbox 解决的是这类问题：业务数据库更新成功后必须发消息，但数据库和消息 broker 不能放在同一个本地事务里。如果先写 DB 再发消息，服务可能在两步之间崩溃；如果先发消息再写 DB，消费者可能看到一个数据库里还不存在或最终回滚的事实。
+
+outbox 的做法是把“业务状态”和“待发送消息”写进同一个数据库事务：
+
+```text
+begin transaction
+  update order set status = 'paid'
+  insert into outbox(event_id, aggregate_id, event_type, payload, status)
+commit
+```
+
+事务提交后，后台 relay 再扫描 outbox，把消息发到 broker：
+
+```text
+select pending outbox events
+send to broker
+mark event as sent
+```
+
+这样至少保证一个关键不变量：只要业务事务提交，待发送消息也一定持久化；如果业务事务回滚，消息不会出现。服务在 commit 后、send 前崩溃没关系，outbox 行还在，relay 重启后继续发。
+
+但 outbox 不是“全局 exactly-once”。它通常仍然会重复发送。比如 relay 发消息成功后，还没来得及把 outbox 行标记为 sent 就崩溃了；重启后它会再次发送同一 event。所以下游消费者必须按 `event_id` 幂等处理。
+
+实现时要关心几个细节：
+
+```text
+outbox.event_id must be stable and unique
+aggregate_id + aggregate_version preserve per-aggregate order
+relay must use lease/fencing to avoid multiple workers sending same row blindly
+consumer must dedupe event_id
+sent marking and retry count must be observable
+poison event needs DLQ or manual repair path
+```
+
+如果消息顺序重要，不要只靠全局扫描时间。通常会给同一个 aggregate 维护单调 version，让消费者能发现乱序、缺口和重复。跨 aggregate 的全局顺序一般很贵，也往往不是业务真正需要的。
+
+**一句话**
+
+outbox 把“写数据库”和“记录要发的消息”合进一个本地事务，消除了双写丢消息窗口；它不消除重复发送，所以消费者仍然要幂等。
+
+## Q082. saga 补偿为什么不是严格回滚？
+
+**回答：**
+
+Saga 的补偿不是数据库事务 rollback。每个本地事务一旦提交，它的效果已经对外可见；补偿只是后面再执行一个业务上的反向动作，尽量把系统带回可接受状态。
+
+比如下单流程：
+
+```text
+create order pending
+reserve inventory
+reserve credit
+confirm order
+```
+
+如果 reserve credit 失败，可以释放库存、取消订单。但这和 ACID rollback 不一样。库存曾经被占用过，其他用户可能在这段时间看到库存减少；订单也可能已经触发了日志、风控、客服消息、推荐系统事件。补偿只能新增事实：
+
+```text
+inventory reserved
+credit reservation failed
+inventory released
+order cancelled
+```
+
+它不能抹掉历史。
+
+外部副作用更明显。邮件发出后不能“回滚未发送”，只能再发一封更正邮件；扣款成功后不能假装没扣过，只能退款或冲正；物流单创建后可能要取消，取消失败还要人工处理。这些动作都有自己的失败模式和审计要求。
+
+Saga 还缺少事务隔离。多个 saga 并发执行时，中间状态会被其他流程看到。比如一个账户额度先被 A saga 预留，B saga 同时读到额度不足；后来 A 又补偿释放。这个短暂状态不是数据库异常，而是 saga 模型的一部分。要处理它，通常需要预留状态、版本号、超时释放、业务锁、额度快照或其他隔离策略。
+
+面试里可以把补偿说清楚：它是 business compensation，不是 storage rollback。它要求业务定义“反向动作”是否存在、是否幂等、是否允许失败、失败后谁接管。
+
+**一句话**
+
+Saga 补偿是在已经提交、已经可见的事实之后追加修正事实。它追求业务可恢复，不提供数据库 rollback 那种原子撤销。
+
+## Q083. 分布式 exactly-once 为什么通常要拆解成幂等、去重、事务边界？
+
+**回答：**
+
+因为 exactly-once 这个词太容易误导。面试里听到它，第一反应应该是问边界：exactly once delivery、exactly once execution，还是 exactly once effect？三者差别很大。
+
+```text
+exactly-once delivery:
+  消息只投递一次
+
+exactly-once execution:
+  handler 只运行一次
+
+exactly-once effect:
+  最终对外可见的业务效果只发生一次
+```
+
+分布式系统里，网络会丢响应，进程会崩溃，broker 会重投递，客户端会重试。要求“函数绝不运行两次”通常不现实，也不是最有价值的目标。真正需要保护的是业务效果：不要重复扣款、不要重复发货、不要重复创建有效订单。
+
+所以会拆成几个可实现的机制：
+
+```text
+operation identity:
+  idempotency key / business operation id
+
+deduplication:
+  去重表、inbox、message id、producer sequence
+
+transaction boundary:
+  状态更新和消息/offset 在同一事务边界内提交
+
+fencing:
+  epoch、lease、producer id，防止旧实例继续写
+
+state machine:
+  只允许合法状态迁移，重复事件变成 no-op
+
+reconciliation:
+  对账把 unknown 和跨系统不一致收敛
+```
+
+Kafka 的 exactly-once 也有边界。读 Kafka、处理、写 Kafka 的链路可以把输出记录和消费 offset 放进 Kafka 事务里；但写到外部支付系统、数据库、邮件 provider 时，仍然需要外部系统配合，或者把 offset 和输出存到同一个外部存储，再做幂等处理。
+
+这就是为什么我更愿意说 effectively-once effect。系统可以承认消息可能重投、handler 可能重跑、响应可能丢失，但通过去重、幂等和事务边界，让业务承诺只生效一次。
+
+**一句话**
+
+分布式 exactly-once 不是一个开关。要落地，必须拆成身份、去重、事务边界、fencing、状态机和对账；否则这个词只是在掩盖失败窗口。
+
+## Q084. 如果去重表丢失，系统如何恢复？
+
+**回答：**
+
+去重表丢失后，系统失去的是“哪些请求已经被处理过”的快速记忆。直接恢复写流量很危险，因为迟到重试、消息重投递和客户端补偿请求可能被当成新操作，再次产生副作用。
+
+第一步通常是止血：
+
+```text
+pause unsafe consumers
+turn off automatic retry for non-idempotent operations
+reject or hold writes that require dedupe
+keep read/status query available if possible
+```
+
+然后要找权威事实源重建。去重表本身最好不是唯一事实源。可用来源包括：
+
+- 业务主表里的 `operation_id`、订单号、支付单号。
+- append-only ledger 或审计日志。
+- outbox / inbox 表。
+- broker 中仍保留的事件日志。
+- 外部 provider 的交易流水和回调记录。
+- 对账文件。
+- 备份和 WAL。
+
+重建的目标不是恢复每个历史 attempt，而是恢复“哪些 business operation 已经产生了最终效果”。比如支付系统可以从 payment_order、provider_charge_id 和 ledger entry 重建幂等记录；消息消费者可以从已落库的业务结果和 event_id 重建 inbox。
+
+还要处理重建窗口：
+
+```text
+last reliable dedupe snapshot at T0
+system paused at T2
+need replay authoritative log from T0 to T2
+need identify writes whose result is unknown
+```
+
+对 unknown 的操作，不要自动补发副作用。应该进入状态查询、provider 对账、人工确认或补偿流程。
+
+恢复后还要调整设计。如果去重表丢失就会造成不可接受的重复扣款，说明它应该有更强的持久化、备份、复制和恢复演练；或者业务主表应该把 operation id 作为唯一约束，让去重表只是加速层，而不是唯一正确性来源。
+
+**一句话**
+
+去重表丢失后不能盲目继续处理写请求。先暂停危险路径，再从业务事实、日志、outbox、provider 流水和备份重建“已生效 operation”，最后把 unknown 单独收敛。
+
+## Q085. 幂等 key 的生命周期如何影响存储成本和正确性？
+
+**回答：**
+
+幂等 key 的生命周期就是 dedupe window。它太短，会挡不住迟到重试；太长，会占用存储、索引和隐私预算。这个参数直接影响正确性，不只是清理策略。
+
+TTL 太短的风险：
+
+```text
+client sends POST /payments with key K
+server charges successfully
+client response lost
+idempotency record expires after 5 minutes
+client or job retries K after 10 minutes
+server treats K as new operation
+```
+
+这就是重复副作用。移动端离线、消息队列延迟、批处理重放、跨区域故障恢复、provider 回调延迟，都可能让 retry 晚到。
+
+TTL 太长也有代价：
+
+- 幂等表越来越大，唯一索引和查询变慢。
+- 热 key 或高基数 key 增加存储压力。
+- 保存完整响应可能包含敏感信息。
+- 跨租户、跨资源误复用的影响时间变长。
+- 清理任务本身可能形成数据库负载尖峰。
+
+TTL 应该按业务风险选，而不是拍脑袋。可以看这些窗口：
+
+```text
+client retry max duration
+message retention / visibility timeout / redelivery window
+workflow retry policy
+external provider settlement and callback delay
+user dispute / reconciliation period
+business operation reversibility
+```
+
+支付、发货、开票这类不可轻易重复的操作，dedupe window 通常要长于普通写 API。低风险的配置更新、幂等状态设置，可以短一些。也可以分层保存：热表保留短期完整响应，冷表或 ledger 长期保留 operation id、fingerprint、最终状态和结果引用。
+
+还有一个实用做法：TTL 过期后，如果同 key 再来，不一定直接当新请求执行。可以先查业务主表是否存在相同 operation id；对高风险操作，即使幂等缓存过期，也要通过业务唯一约束兜底。
+
+**一句话**
+
+幂等 key TTL 是正确性窗口。短了会让迟到重试变成新操作，长了会增加存储和隐私成本；高风险业务要用业务事实源兜底，不能只靠缓存过期策略。
+
+## Q086. 外部 API 不支持幂等时上层系统如何降风险？
+
+**回答：**
+
+如果外部 API 不支持幂等，上层系统不能承诺严格 exactly-once。能做的是降低重复调用概率，把未知结果显式记录下来，并准备查询、对账和人工处理路径。
+
+第一层是本地 operation 表。所有外部调用先落本地状态：
+
+```text
+operation_id
+provider
+request_payload_hash
+status: pending | sending | sent_unknown | succeeded | failed | needs_review
+provider_reference
+attempt_count
+```
+
+同一个 operation 只允许一个 worker 持有发送权。可以用数据库行锁、lease、fencing token、单分区队列或 per-key 串行化来避免并发发送。
+
+第二层是减少 unknown 后的盲目重试。外部调用 timeout 后，不要马上再发一次危险请求。先看 provider 有没有查询接口：按商户订单号、时间窗口、金额、用户、幂等性较弱的业务字段去查。如果能确认成功，就更新本地状态；如果确认不存在，再决定是否补发；如果查不到确定结果，就进入 `sent_unknown`，等待回调或对账。
+
+第三层是利用外部系统的天然唯一约束。即使它不叫 idempotency key，也可能支持 merchant order id、client reference、invoice number、dedupe token、幂等的 PUT 资源名。只要 provider 会把重复 reference 拒绝或返回已有结果，就能变成一种业务幂等。
+
+如果这些都没有，系统要保守：
+
+- 降低自动重试次数。
+- 对 timeout 使用更长的确认流程。
+- 对高金额或不可逆操作进入人工审核。
+- 用对账任务发现重复或漏处理。
+- 为重复成功设计退款、撤销或冲正流程。
+- 在产品层把状态展示成“处理中”，不要鼓励用户再次提交。
+
+**一句话**
+
+外部 API 不支持幂等时，上层只能做风险控制，不能假装有 exactly-once。关键是本地 operation 状态、单发送者、查询确认、对账和人工兜底。
+
+## Q087. 如何设计测试覆盖重复请求、并发请求、迟到响应和客户端超时？
+
+**回答：**
+
+这类测试要围绕不变量设计，而不是只测 happy path。核心不变量可以写得很直白：同一个业务 operation 不管被提交多少次，最终有效副作用只能有一次；payload mismatch 不能执行；unknown 状态最终能被确认或进入补偿流程。
+
+可以搭一个 fake provider 和 fault injector。fake provider 记录所有外部副作用，并能按测试要求制造超时、迟到响应、成功但丢响应、重复回调、查询延迟。
+
+测试用例至少覆盖这些：
+
+```text
+same key + same payload repeated sequentially
+  only one business row, same response/result reference
+
+same key + different payload
+  mismatch error, no new side effect
+
+same key + concurrent requests
+  exactly one winner crosses side-effect boundary
+  others wait, replay result, or receive in_progress response
+
+client timeout while server succeeds
+  retry same key returns success
+  no second provider call
+
+first response delayed, retry returns earlier
+  late response does not overwrite final state incorrectly
+
+provider success but local response lost
+  status query returns confirmed result after reconciliation
+
+message processed but ack/offset commit fails
+  redelivery does not repeat external side effect
+
+outbox relay sends but mark-sent fails
+  duplicate event is deduped by consumer
+```
+
+并发测试要故意卡在危险窗口：
+
+```text
+after idempotency record insert, before business commit
+after business commit, before response write
+after external call success, before local status update
+after broker send success, before outbox mark sent
+after handler done, before ack commit
+```
+
+只用 sleep 不够稳定。更好的办法是在代码里加测试 hook、barrier、fake clock 或 failpoint，让测试精确停在窗口上。
+
+还要做压力和性质测试。比如 100 个 goroutine 同时用同一个 key 请求，随机注入 timeout、panic、网络错误，最后检查 provider side effects 数量、业务表状态、outbox/inbox 状态和指标。测试断言应该查最终事实，不只看 HTTP status。
+
+**一句话**
+
+这类测试要主动制造重复、并发、迟到和崩溃窗口。看点不是请求返回了什么，而是最终业务事实、外部副作用次数和状态机不变量是否正确。
+
+## Q088. 如何用指标判断系统出现了重试风暴？
+
+**回答：**
+
+判断 retry storm 不能只看入口 QPS。入口 QPS 可能没涨，但下游 QPS、attempt 数、timeout 和排队时间已经被 retry 放大了。要把 logical request 和 attempt 分开观测。
+
+最有用的一组指标是放大系数：
+
+```text
+retry_amplification = downstream_attempt_count / logical_request_count
+```
+
+如果用户请求量稳定，但每个 logical request 的 attempt 数上升，说明系统正在用更多下游资源处理同一批业务意图。
+
+具体指标可以分几类：
+
+```text
+attempt metrics:
+  attempts_per_logical_request
+  retry_count_by_dependency
+  retry_budget_exhausted_total
+  retry_delay_histogram
+  hedged_or_transparent_retry_count
+
+failure metrics:
+  timeout_rate
+  429/503 rate
+  connection_reset_total
+  deadline_exceeded_total
+  circuit_open_total
+
+resource metrics:
+  in_flight_requests
+  queue_depth
+  connection_pool_wait
+  thread_pool_active
+  consumer_lag
+  db_lock_wait
+
+idempotency metrics:
+  idempotency_hit_total
+  idempotency_mismatch_total
+  dedupe_hit_total
+  duplicate_side_effect_blocked_total
+
+load relation:
+  downstream_qps / ingress_qps
+  provider_calls / successful_business_operations
+```
+
+trace 也要能看 attempt。一个 trace 里如果同一 dependency span 出现多次，并且 attempt metadata 递增，就能直接看出重试发生在哪一层。没有 attempt 标签时，事故复盘很容易误判成“用户流量突然变大”。
+
+告警可以盯几个组合信号：
+
+- 入口 QPS 平稳，下游 QPS 上升。
+- timeout 先升高，随后 retry attempt 上升。
+- p99 上升和 connection pool wait 上升同时出现。
+- 429/503 上升后客户端请求没有下降，反而 retry 增多。
+- retry budget exhausted 增加，成功率没有改善。
+- idempotency hit 激增，说明重复请求正在变多。
+
+单看错误率不够。错误率可能不高，但重试已经把资源吃光；或者错误率下降只是因为 retry 掩盖了用户可见失败，但下游成本和延迟已经不可接受。
+
+**一句话**
+
+retry storm 的指标特征是 attempt 增长快于 logical request，且 timeout、排队、连接等待和下游 QPS 一起上升。没有 per-attempt 观测，就很难把它和真实流量增长区分开。
+
+## Q089. 如何在面试中把重试讲成一致性问题而不是简单循环？
+
+**回答：**
+
+可以从一句话切进去：重试处理的不是“代码再跑一次”，而是“第一次操作结果未知时，如何保证多次 attempt 仍然对应同一个业务事实”。这句话能把话题从循环控制拉到一致性。
+
+我会按这个顺序讲：
+
+```text
+1. failure does not imply no effect
+2. timeout creates unknown state
+3. retry creates multiple attempts
+4. multiple attempts need one operation identity
+5. operation identity needs idempotency/dedup/state machine
+6. side effects need transaction boundary or reconciliation
+7. overload needs retry budget/backoff/jitter/deadline
+```
+
+然后给一个扣款例子。用户只点了一次支付，但响应丢了。客户端如果重新发起新扣款，就可能重复扣钱；如果用同一个 idempotency key 查询或重试，服务端可以返回第一次扣款结果。这里的一致性问题是：用户意图、服务端订单、支付通道流水、消息事件和客户端展示必须最终对齐。
+
+再往下展开，可以把机制分层：
+
+```text
+API layer:
+  idempotency key, payload fingerprint, stable error semantics
+
+storage layer:
+  unique constraint, transaction, state machine transition
+
+messaging layer:
+  outbox/inbox, message id dedupe, offset/ack ordering
+
+external side effect:
+  provider idempotency key, operation record, query/reconciliation
+
+resilience layer:
+  deadline propagation, retry budget, backoff, jitter, load shedding
+
+observability layer:
+  logical request id, attempt id, retry metrics, duplicate blocking metrics
+```
+
+最后要主动说边界。幂等 key 不是锁，不是权限，不是万能 exactly-once；timeout 不是失败证明；saga 补偿不是 rollback；outbox 保证本地事务和消息记录一起提交，但消费者仍要幂等。把这些边界讲清楚，面试官通常会觉得你不是在背“重试三次加指数退避”，而是真的理解分布式副作用。
+
+可以用这样的收尾：
+
+```text
+我会把 retry 看成一致性协议的一部分。
+它必须回答三个问题：这是不是同一个业务意图，之前有没有跨过副作用边界，以及系统是否还有资源和时间继续尝试。
+如果回答不了，就不能盲目 retry。
+```
+
+**一句话**
+
+面试里不要把重试讲成 `for` 循环。把它讲成 unknown result、operation identity、幂等去重、事务边界和过载控制的组合，层次就出来了。
 ## 参考和校验点
 
 - [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) 定义 HTTP 方法的 safe、idempotent、cacheable 语义，并说明幂等关注的是请求对服务器资源的预期效果。

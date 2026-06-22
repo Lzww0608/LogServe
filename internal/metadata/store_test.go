@@ -1,8 +1,11 @@
 package metadata
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/logserve/logserve/gen/logservepb"
 )
 
 func TestMemoryStoreImplementsStore(t *testing.T) {
@@ -49,5 +52,38 @@ func TestUpsertWorkerPreservesExplicitHeartbeat(t *testing.T) {
 	}
 	if active := store.ActiveWorkers(time.Second); len(active) != 0 {
 		t.Fatalf("active workers = %d, want 0 for stale bootstrapped worker", len(active))
+	}
+}
+
+func TestCompleteTaskRejectsQueuedExpiredLease(t *testing.T) {
+	store := NewMemoryStore()
+	created, duplicate := store.CreateTask(Task{
+		TaskID:   "task-expired-lease",
+		TaskName: "expired",
+		Status:   logservepb.TaskStatus_TASK_STATUS_QUEUED,
+	}, "")
+	if duplicate {
+		t.Fatal("unexpected duplicate task")
+	}
+	leased, err := store.LeaseTask(created.TaskID, "worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	store.RequeueExpiredRunningTasks(time.Nanosecond)
+
+	_, err = store.CompleteTask(created.TaskID, "worker-1", leased.TaskLeaseEpoch, logservepb.TaskStatus_TASK_STATUS_SUCCEEDED, []byte(`"stale"`), "")
+	if err == nil || !strings.Contains(err.Error(), "stale task lease") {
+		t.Fatalf("CompleteTask error = %v, want stale task lease", err)
+	}
+	current, ok := store.GetTask(created.TaskID)
+	if !ok {
+		t.Fatal("task missing")
+	}
+	if current.Status != logservepb.TaskStatus_TASK_STATUS_QUEUED {
+		t.Fatalf("status = %s, want QUEUED", current.Status)
+	}
+	if len(current.ResultJSON) != 0 {
+		t.Fatalf("result_json = %s, want empty", current.ResultJSON)
 	}
 }

@@ -11,8 +11,8 @@ import (
 	"github.com/logserve/logserve/internal/control"
 	"github.com/logserve/logserve/internal/metadata"
 	"github.com/logserve/logserve/internal/objectstore"
+	"github.com/logserve/logserve/internal/rpcauth"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 type Server struct {
@@ -26,17 +26,20 @@ type Server struct {
 type Options struct {
 	MetadataStore string
 	PostgresDSN   string
+	APIToken      string
 }
 
 func Start(addr, logAddr string) (*Server, error) {
 	return StartWithOptions(addr, logAddr, Options{
 		MetadataStore: os.Getenv("LOGSERVE_METADATA_STORE"),
 		PostgresDSN:   firstNonEmpty(os.Getenv("LOGSERVE_POSTGRES_DSN"), os.Getenv("DATABASE_URL")),
+		APIToken:      os.Getenv(rpcauth.EnvAPIToken),
 	})
 }
 
 func StartWithOptions(addr, logAddr string, opts Options) (*Server, error) {
-	conn, err := grpc.NewClient(logAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	apiToken := firstNonEmpty(opts.APIToken, os.Getenv(rpcauth.EnvAPIToken))
+	conn, err := grpc.NewClient(logAddr, rpcauth.InsecureDialOptions(apiToken)...)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +63,7 @@ func StartWithOptions(addr, logAddr string, opts Options) (*Server, error) {
 		_ = lis.Close()
 		return nil, err
 	}
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(rpcauth.ServerOptions(apiToken)...)
 	service := control.NewServiceWithResultStore(meta, logservepb.NewLogServiceClient(conn), store, 0)
 	if err := service.LogBootstrapResult(service.BootstrapFromLog(context.Background())); err != nil {
 		if closer != nil {

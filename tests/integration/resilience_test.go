@@ -27,8 +27,9 @@ func TestRunningTaskIsRedeliveredAfterWorkerLeaseExpires(t *testing.T) {
 		t.Fatalf("first poll = %v, want task %s", firstPoll, submitted.GetTaskId())
 	}
 	if _, err := env.controlClient.StartTask(context.Background(), &logservepb.StartTaskRequest{
-		TaskId:   submitted.GetTaskId(),
-		WorkerId: "redelivery-worker-1",
+		TaskId:         submitted.GetTaskId(),
+		WorkerId:       "redelivery-worker-1",
+		TaskLeaseEpoch: firstPoll.GetTask().GetTaskLeaseEpoch(),
 	}); err != nil {
 		t.Fatal(err)
 	}

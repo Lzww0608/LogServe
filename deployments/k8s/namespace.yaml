@@ -2,3 +2,12 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: logserve
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: logserve-secrets
+  namespace: logserve
+type: Opaque
+stringData:
+  api-token: "replace-with-a-random-token"

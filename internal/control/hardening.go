@@ -55,9 +55,14 @@ func (s *Service) SetBackpressure(ctx context.Context, req *logservepb.SetBackpr
 }
 
 func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetDashboardSnapshotRequest) (*logservepb.DashboardSnapshot, error) {
-	s.queueMu.Lock()
-	queueDepth := uint32(len(s.queue))
-	s.queueMu.Unlock()
+	var queueDepth uint32
+	if s.useSchedulerV2() {
+		queueDepth = uint32(s.scheduler.QueueDepth())
+	} else {
+		s.queueMu.Lock()
+		queueDepth = uint32(len(s.queue))
+		s.queueMu.Unlock()
+	}
 
 	tasks := s.meta.ListTasks()
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].CreatedAtMs < tasks[j].CreatedAtMs })
@@ -152,15 +157,30 @@ func (s *Service) compactableLogStats(ctx context.Context) (uint64, uint64) {
 	return records, bytes
 }
 
+type taskStatusLister interface {
+	ListTasksByStatus(status logservepb.TaskStatus) []metadata.Task
+}
+
 func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
+	if s.useSchedulerV2() {
+		return s.redeliverExpiredTasksIndexed(ctx)
+	}
+	return s.redeliverExpiredTasksLegacy(ctx)
+}
+
+func (s *Service) redeliverExpiredTasksLegacy(ctx context.Context) error {
 	_, redeliveryTimeout, _ := s.getBackpressureConfig()
 	if redeliveryTimeout <= 0 {
 		return nil
 	}
 
 	now := time.Now()
+	runningTasks := s.meta.ListTasks()
+	if lister, ok := s.meta.(taskStatusLister); ok {
+		runningTasks = lister.ListTasksByStatus(logservepb.TaskStatus_TASK_STATUS_RUNNING)
+	}
 	expired := make([]metadata.Task, 0)
-	for _, task := range s.meta.ListTasks() {
+	for _, task := range runningTasks {
 		if task.Status != logservepb.TaskStatus_TASK_STATUS_RUNNING {
 			continue
 		}
@@ -173,18 +193,7 @@ func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
 		return nil
 	}
 	for _, task := range expired {
-		payload, _ := json.Marshal(map[string]any{
-			"task_id":          task.TaskID,
-			"task_name":        task.TaskName,
-			"task_lease_epoch": task.TaskLeaseEpoch,
-			"timestamp_ms":     time.Now().UnixMilli(),
-		})
-		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
-			StreamId:       taskStream(task.TaskID),
-			EventType:      "TaskRedelivered",
-			IdempotencyKey: task.TaskID + ":redelivered:" + time.Now().Format("150405.000000000"),
-			Payload:        payload,
-		}); err != nil {
+		if err := s.appendTaskRedelivered(ctx, task); err != nil {
 			return err
 		}
 	}
@@ -198,6 +207,99 @@ func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
 	}
 	s.queueMu.Unlock()
 	return nil
+}
+
+func (s *Service) redeliverExpiredTasksIndexed(ctx context.Context) error {
+	_, redeliveryTimeout, _ := s.getBackpressureConfig()
+	if redeliveryTimeout <= 0 || s.scheduler == nil {
+		return nil
+	}
+	expired := s.scheduler.PopExpiredRunning(time.Now().UnixMilli())
+	if len(expired) == 0 {
+		return nil
+	}
+	valid := make([]runningLease, 0, len(expired))
+	for _, lease := range expired {
+		task, ok := s.meta.GetTask(lease.taskID)
+		if !ok {
+			s.scheduler.Forget(lease.taskID)
+			continue
+		}
+		if task.Status != logservepb.TaskStatus_TASK_STATUS_RUNNING || task.TaskLeaseEpoch != lease.leaseEpoch {
+			s.resyncSchedulerTask(task, redeliveryTimeout)
+			continue
+		}
+		if task.UpdatedAtMs == 0 || time.Since(time.UnixMilli(task.UpdatedAtMs)) < redeliveryTimeout {
+			s.scheduler.TrackRunning(task.TaskID, schedulerLeaseDeadlineMs(task, redeliveryTimeout), task.TaskLeaseEpoch)
+			continue
+		}
+		valid = append(valid, lease)
+	}
+	if len(valid) == 0 {
+		return nil
+	}
+	for _, lease := range valid {
+		task, ok := s.meta.GetTask(lease.taskID)
+		if !ok {
+			s.scheduler.Forget(lease.taskID)
+			continue
+		}
+		if err := s.appendTaskRedelivered(ctx, task); err != nil {
+			for _, pending := range valid {
+				if current, ok := s.meta.GetTask(pending.taskID); ok && current.Status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
+					s.scheduler.TrackRunning(current.TaskID, schedulerLeaseDeadlineMs(current, redeliveryTimeout), current.TaskLeaseEpoch)
+				}
+			}
+			return err
+		}
+	}
+	for _, lease := range valid {
+		task, requeued := s.meta.RequeueTaskIfLeaseExpired(lease.taskID, lease.leaseEpoch, redeliveryTimeout)
+		if !requeued {
+			if current, ok := s.meta.GetTask(lease.taskID); ok {
+				s.resyncSchedulerTask(current, redeliveryTimeout)
+			} else {
+				s.scheduler.Forget(lease.taskID)
+			}
+			continue
+		}
+		s.scheduler.Enqueue(s.schedulerMetaFromTask(task))
+		if task.WorkerID != "" {
+			s.meta.DecrementWorkerLoad(task.WorkerID)
+			s.updateSchedulerWorker(task.WorkerID)
+		}
+	}
+	return nil
+}
+
+func (s *Service) appendTaskRedelivered(ctx context.Context, task metadata.Task) error {
+	payload, _ := json.Marshal(map[string]any{
+		"task_id":          task.TaskID,
+		"task_name":        task.TaskName,
+		"task_lease_epoch": task.TaskLeaseEpoch,
+		"timestamp_ms":     time.Now().UnixMilli(),
+	})
+	_, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+		StreamId:       taskStream(task.TaskID),
+		EventType:      "TaskRedelivered",
+		IdempotencyKey: task.TaskID + ":redelivered:" + time.Now().Format("150405.000000000"),
+		Payload:        payload,
+	})
+	return err
+}
+
+func (s *Service) resyncSchedulerTask(task metadata.Task, redeliveryTimeout time.Duration) {
+	if s.scheduler == nil {
+		return
+	}
+	switch task.Status {
+	case logservepb.TaskStatus_TASK_STATUS_QUEUED:
+		s.scheduler.Enqueue(s.schedulerMetaFromTask(task))
+	case logservepb.TaskStatus_TASK_STATUS_RUNNING:
+		s.scheduler.TrackRunning(task.TaskID, schedulerLeaseDeadlineMs(task, redeliveryTimeout), task.TaskLeaseEpoch)
+	default:
+		s.scheduler.Forget(task.TaskID)
+	}
 }
 
 func cacheEntries(worker metadata.Worker) []*logservepb.ModelCacheEntry {

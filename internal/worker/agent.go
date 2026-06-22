@@ -18,14 +18,15 @@ import (
 
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/observability"
+	"github.com/logserve/logserve/internal/rpcauth"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 type Config struct {
 	WorkerID                 string
 	ControlAddr              string
 	LogAddr                  string
+	APIToken                 string
 	PythonPath               string
 	ExecutorPath             string
 	PollInterval             time.Duration
@@ -211,13 +212,16 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.VLLMBaseURL == "" {
 		cfg.VLLMBaseURL = os.Getenv("LOGSERVE_VLLM_BASE_URL")
 	}
+	if cfg.APIToken == "" {
+		cfg.APIToken = os.Getenv(rpcauth.EnvAPIToken)
+	}
 
-	controlConn, err := grpc.NewClient(cfg.ControlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	controlConn, err := grpc.NewClient(cfg.ControlAddr, rpcauth.InsecureDialOptions(cfg.APIToken)...)
 	if err != nil {
 		return err
 	}
 	defer controlConn.Close()
-	logConn, err := grpc.NewClient(cfg.LogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	logConn, err := grpc.NewClient(cfg.LogAddr, rpcauth.InsecureDialOptions(cfg.APIToken)...)
 	if err != nil {
 		return err
 	}
@@ -469,28 +473,8 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 	if task == nil {
 		return errors.New("task is nil")
 	}
+	_ = enqueuedAt
 
-	localQueueWaitMs := int64(0)
-	if !enqueuedAt.IsZero() {
-		localQueueWaitMs = time.Since(enqueuedAt).Milliseconds()
-		if localQueueWaitMs < 0 {
-			localQueueWaitMs = 0
-		}
-	}
-	startPayload, _ := json.Marshal(map[string]any{
-		"task_id":             task.GetTaskId(),
-		"worker_id":           cfg.WorkerID,
-		"task_lease_epoch":    task.GetTaskLeaseEpoch(),
-		"local_queue_wait_ms": localQueueWaitMs,
-	})
-	if _, err := logClient.AppendLog(ctx, &logservepb.AppendLogRequest{
-		StreamId:       taskStream(task.GetTaskId()),
-		EventType:      "TaskStarted",
-		IdempotencyKey: fmt.Sprintf("%s:started:%s:%d", task.GetTaskId(), cfg.WorkerID, task.GetTaskLeaseEpoch()),
-		Payload:        startPayload,
-	}); err != nil {
-		return err
-	}
 	if _, err := controlClient.StartTask(ctx, &logservepb.StartTaskRequest{
 		TaskId:         task.GetTaskId(),
 		WorkerId:       cfg.WorkerID,
@@ -513,7 +497,6 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 	}
 	status := logservepb.TaskStatus_TASK_STATUS_SUCCEEDED
 	errText := ""
-	eventType := "TaskCompleted"
 	if execErr != nil {
 		status = logservepb.TaskStatus_TASK_STATUS_FAILED
 		if errors.Is(execErr, context.DeadlineExceeded) && task.GetTimeoutMs() > 0 {
@@ -521,17 +504,6 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 		} else {
 			errText = execErr.Error()
 		}
-		eventType = "TaskFailed"
-	}
-	payload := taskTerminalLogPayload(task, cfg.WorkerID, status, result, errText)
-
-	if _, err := logClient.AppendLog(ctx, &logservepb.AppendLogRequest{
-		StreamId:       taskStream(task.GetTaskId()),
-		EventType:      eventType,
-		IdempotencyKey: task.GetTaskId() + ":completed",
-		Payload:        payload,
-	}); err != nil {
-		return err
 	}
 	if _, err := controlClient.CompleteTask(ctx, &logservepb.CompleteTaskRequest{
 		TaskId:         task.GetTaskId(),
@@ -547,25 +519,6 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 	}
 	return execErr
 }
-
-func taskTerminalLogPayload(task *logservepb.TaskSpec, workerID string, status logservepb.TaskStatus, result []byte, errText string) []byte {
-	payload := map[string]any{
-		"task_id":          task.GetTaskId(),
-		"worker_id":        workerID,
-		"status":           status.String(),
-		"task_lease_epoch": task.GetTaskLeaseEpoch(),
-		"timestamp_ms":     time.Now().UnixMilli(),
-	}
-	if len(result) > 0 {
-		payload["result_json"] = json.RawMessage(result)
-	}
-	if errText != "" {
-		payload["error"] = errText
-	}
-	data, _ := json.Marshal(payload)
-	return data
-}
-
 func runExecutor(ctx context.Context, cfg Config, runner *pythonRunner, cache *modelCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient, task *logservepb.TaskSpec) ([]byte, []byte, error) {
 	if task.GetLlmModelName() != "" {
 		result, err := runLLMExecutor(ctx, cfg, cache, controlClient, logClient, task)

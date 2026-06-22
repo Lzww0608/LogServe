@@ -207,6 +207,7 @@ func TestCompleteTaskDoesNotDoubleCountLLMStatsForDuplicateCompletion(t *testing
 		WorkerID:        "worker-1",
 		LLMModelName:    "model-A",
 		LLMModelVersion: "v1",
+		TaskLeaseEpoch:  1,
 	}, "")
 	if duplicate {
 		t.Fatal("unexpected duplicate task")
@@ -219,10 +220,11 @@ func TestCompleteTaskDoesNotDoubleCountLLMStatsForDuplicateCompletion(t *testing
 		},
 	}, nil, 0)
 	req := &logservepb.CompleteTaskRequest{
-		TaskId:     "task-llm-duplicate",
-		WorkerId:   "worker-1",
-		Status:     logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
-		ResultJson: []byte(`"ok"`),
+		TaskId:         "task-llm-duplicate",
+		WorkerId:       "worker-1",
+		TaskLeaseEpoch: 1,
+		Status:         logservepb.TaskStatus_TASK_STATUS_SUCCEEDED,
+		ResultJson:     []byte(`"ok"`),
 	}
 	if _, err := service.CompleteTask(context.Background(), req); err != nil {
 		t.Fatal(err)

@@ -79,6 +79,7 @@ message GetStreamStatsResponse {
 service LogService {
   rpc AppendLog(AppendLogRequest) returns (AppendLogResponse);
   rpc ReadLog(ReadLogRequest) returns (ReadLogResponse);
+  rpc ReadLogStream(ReadLogRequest) returns (stream LogRecord);
   rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
   rpc TrimStream(TrimStreamRequest) returns (TrimStreamResponse);
   rpc GetStreamStats(GetStreamStatsRequest) returns (GetStreamStatsResponse);

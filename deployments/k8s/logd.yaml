@@ -13,20 +13,59 @@ spec:
       labels:
         app: logserve-logd
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: logd
           image: logserve:local
           imagePullPolicy: IfNotPresent
           args: ["logserve-logd", "--addr", "0.0.0.0:50051", "--data-dir", "/var/lib/logserve/logstore"]
+          env:
+            - name: LOGSERVE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: logserve-secrets
+                  key: api-token
           ports:
             - containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: logstore
               mountPath: /var/lib/logserve/logstore
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: logstore
           persistentVolumeClaim:
             claimName: logserve-logstore
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -34,6 +73,7 @@ metadata:
   name: logserve-logd
   namespace: logserve
 spec:
+  type: ClusterIP
   selector:
     app: logserve-logd
   ports:
