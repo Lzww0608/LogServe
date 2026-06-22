@@ -1,11 +1,21 @@
+# syntax=docker/dockerfile:1.7
+
 FROM golang:1.25-bookworm AS build
 
 WORKDIR /src
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOSUMDB=sum.golang.org
+ENV GOPROXY=$GOPROXY
+ENV GOSUMDB=$GOSUMDB
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
 COPY . .
-RUN go build -o /out/logserve-logd ./cmd/logserve-logd
-RUN go build -o /out/logserve-control ./cmd/logserve-control
-RUN go build -o /out/logserve-worker ./cmd/logserve-worker
-RUN go build -o /out/logservectl ./cmd/logservectl
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go build -o /out/logserve-logd ./cmd/logserve-logd
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go build -o /out/logserve-control ./cmd/logserve-control
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go build -o /out/logserve-worker ./cmd/logserve-worker
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go build -o /out/logservectl ./cmd/logservectl
 
 FROM python:3.11-slim
 

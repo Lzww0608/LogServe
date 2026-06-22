@@ -3,7 +3,6 @@ import json
 import os
 import subprocess
 import textwrap
-from pathlib import Path
 
 from .decorators import StepRef, current_trace_context, trace_workflow
 
@@ -57,7 +56,7 @@ class LogServeClient:
         return output.get("result")
 
     def create_actor(self, cls, *args, snapshot_every=None, idempotency_key=None, **kwargs):
-        source = _module_source(cls) or textwrap.dedent(inspect.getsource(cls))
+        source = textwrap.dedent(inspect.getsource(cls))
         if snapshot_every is None:
             snapshot_every = getattr(cls, "_logserve_snapshot_every", 25)
         payload = {
@@ -296,19 +295,15 @@ def _build_workflow_definition(fn, args, kwargs):
     if not isinstance(result, StepRef):
         raise TypeError("workflows must return the result of a @task call")
 
-    module_source = _module_source(fn)
     steps = []
     for step in ctx.steps:
         step = dict(step)
-        if module_source:
-            step["function_source"] = module_source
-        else:
-            step["function_source"] = textwrap.dedent(step["function_source"])
+        step["function_source"] = textwrap.dedent(step["function_source"])
         steps.append(step)
 
     return {
         "workflow_name": getattr(fn, "__name__", "workflow"),
-        "function_source": module_source or textwrap.dedent(inspect.getsource(inspect.unwrap(fn))),
+        "function_source": textwrap.dedent(inspect.getsource(inspect.unwrap(fn))),
         "args_json": {"args": list(args), "kwargs": kwargs},
         "steps": steps,
         "result_step_id": result.step_id,
@@ -317,15 +312,6 @@ def _build_workflow_definition(fn, args, kwargs):
     }
 
 
-def _module_source(fn):
-    module = inspect.getmodule(inspect.unwrap(fn))
-    path = getattr(module, "__file__", None)
-    if not path:
-        return ""
-    try:
-        return Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return ""
 
 
 def _default_client():

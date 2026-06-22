@@ -25,6 +25,9 @@ services:
     build:
       context: ..
       dockerfile: deployments/Dockerfile
+      args:
+        GOPROXY: ${LOGSERVE_DOCKER_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
     command:
       - logserve-worker
       - --worker-id
@@ -70,6 +73,9 @@ services:
     build:
       context: ..
       dockerfile: deployments/Dockerfile
+      args:
+        GOPROXY: ${LOGSERVE_DOCKER_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
     command:
       - logserve-worker
       - --worker-id
@@ -115,6 +121,9 @@ services:
     build:
       context: ..
       dockerfile: deployments/Dockerfile
+      args:
+        GOPROXY: ${LOGSERVE_DOCKER_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
     command:
       - logserve-worker
       - --worker-id

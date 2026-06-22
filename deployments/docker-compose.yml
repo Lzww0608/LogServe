@@ -43,6 +43,9 @@ services:
     build:
       context: ..
       dockerfile: deployments/Dockerfile
+      args:
+        GOPROXY: ${LOGSERVE_DOCKER_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
     command: ["logserve-logd", "--addr", "0.0.0.0:50051", "--data-dir", "/var/lib/logserve/logstore"]
     environment:
       LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
@@ -64,6 +67,9 @@ services:
     build:
       context: ..
       dockerfile: deployments/Dockerfile
+      args:
+        GOPROXY: ${LOGSERVE_DOCKER_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
     command: ["logserve-control", "--addr", "0.0.0.0:50052", "--log-addr", "logd:50051"]
     environment:
       LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
@@ -96,6 +102,9 @@ services:
     build:
       context: ..
       dockerfile: deployments/Dockerfile
+      args:
+        GOPROXY: ${LOGSERVE_DOCKER_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
     command: ["logserve-worker", "--worker-id", "worker-1", "--control-addr", "control:50052", "--log-addr", "logd:50051", "--executor", "/app/executor/python/server.py"]
     environment:
       LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
