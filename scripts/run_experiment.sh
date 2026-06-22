@@ -12,7 +12,8 @@ PYTHON="$PYTHON_BOOTSTRAP"
 CLI_BIN="$RUN_DIR/bin/logservectl"
 PACKAGE_PATH="$RUN_DIR/experiment-package.tar.gz"
 COMPOSE_ENV="$RUN_DIR/compose.env"
-COMPOSE_PROJECT="logserve-exp-${RUN_ID//[^a-zA-Z0-9]/}"
+COMPOSE_PROJECT="logserve-exp-$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+SCHEDULER_V2="${LOGSERVE_SCHEDULER_V2:-1}"
 
 PORTS="$("$PYTHON_BOOTSTRAP" - <<'PY'
 import socket
@@ -51,8 +52,8 @@ export GOCACHE="${GOCACHE:-"$ROOT/.gocache"}"
 export PYTHONPATH="${PYTHONPATH:-"$ROOT/sdk/python"}"
 export LOGSERVE_SDK_TRANSPORT="${LOGSERVE_SDK_TRANSPORT:-grpc}"
 export LOGSERVE_CONTROL_ADDR="$CONTROL_ADDR"
-export LOGSERVE_API_TOKEN="$API_TOKEN"
-export LOGSERVE_SCHEDULER_V2="${LOGSERVE_SCHEDULER_V2:-1}"
+
+
 
 PIDS=()
 LAST_BG_PID=""
@@ -233,7 +234,7 @@ prepare_runtime_dirs() {
 write_compose_env() {
   cat > "$COMPOSE_ENV" <<EOF
 LOGSERVE_API_TOKEN=$API_TOKEN
-LOGSERVE_SCHEDULER_V2=1
+LOGSERVE_SCHEDULER_V2=$SCHEDULER_V2
 LOGSERVE_POSTGRES_USER=logserve
 LOGSERVE_POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 LOGSERVE_POSTGRES_DB=logserve
@@ -344,7 +345,7 @@ PY
 
 start_native_runtime() {
   prepare_runtime_dirs
-  start_bg logd go run ./cmd/logserve-logd --addr "$LOG_ADDR" --data-dir "$DATA_DIR/logstore" --segment-size-bytes 67108864 --fsync-policy always
+  start_bg logd env LOGSERVE_API_TOKEN="$API_TOKEN" go run ./cmd/logserve-logd --addr "$LOG_ADDR" --data-dir "$DATA_DIR/logstore" --segment-size-bytes 67108864 --fsync-policy always
   local logd_pid="$LAST_BG_PID"
   if ! wait_tcp 127.0.0.1 "${LOG_ADDR##*:}" 30 || ! ensure_bg_alive logd "$logd_pid"; then
     record_status runtime_logd_start 1 30 logd.log
@@ -352,7 +353,7 @@ start_native_runtime() {
   fi
   record_status runtime_logd_start 0 0 logd.log
 
-  start_bg control go run ./cmd/logserve-control --addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR"
+  start_bg control env LOGSERVE_API_TOKEN="$API_TOKEN" LOGSERVE_SCHEDULER_V2="$SCHEDULER_V2" go run ./cmd/logserve-control --addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR"
   local control_pid="$LAST_BG_PID"
   if ! wait_tcp 127.0.0.1 "${CONTROL_ADDR##*:}" 30 || ! ensure_bg_alive control "$control_pid"; then
     record_status runtime_control_start 1 30 control.log
@@ -360,11 +361,11 @@ start_native_runtime() {
   fi
   record_status runtime_control_start 0 0 control.log
 
-  start_bg worker_a go run ./cmd/logserve-worker --worker-id worker-a --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-a" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  start_bg worker_a env LOGSERVE_API_TOKEN="$API_TOKEN" go run ./cmd/logserve-worker --worker-id worker-a --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-a" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
   local worker_a_pid="$LAST_BG_PID"
-  start_bg worker_b go run ./cmd/logserve-worker --worker-id worker-b --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-b" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  start_bg worker_b env LOGSERVE_API_TOKEN="$API_TOKEN" go run ./cmd/logserve-worker --worker-id worker-b --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-b" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
   local worker_b_pid="$LAST_BG_PID"
-  start_bg worker_c go run ./cmd/logserve-worker --worker-id worker-c --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-c" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
+  start_bg worker_c env LOGSERVE_API_TOKEN="$API_TOKEN" go run ./cmd/logserve-worker --worker-id worker-c --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-c" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
   local worker_c_pid="$LAST_BG_PID"
   sleep 4
   local worker_start_code=0
@@ -479,11 +480,19 @@ setup_python() {
 
 package_results() {
   local tar_excludes=(--exclude ./experiment-package.tar.gz --exclude ./venv)
+  local tmp_package="$RUN_DIR/../.$(basename "$RUN_DIR").package.tmp.tar.gz"
   if [ "${LOGSERVE_EXPERIMENT_KEEP_RUNTIME:-0}" != "1" ]; then
     tar_excludes+=(--exclude ./runtime)
   fi
-  tar "${tar_excludes[@]}" -czf "$PACKAGE_PATH" -C "$RUN_DIR" . > "$RUN_DIR/package.log" 2>&1
+  rm -f "$tmp_package" "$PACKAGE_PATH"
+  tar "${tar_excludes[@]}" -czf "$tmp_package" -C "$RUN_DIR" . > "$RUN_DIR/package.log" 2>&1
   local code=$?
+  if [ "$code" -eq 0 ]; then
+    mv "$tmp_package" "$PACKAGE_PATH" >> "$RUN_DIR/package.log" 2>&1
+    code=$?
+  else
+    rm -f "$tmp_package"
+  fi
   record_status package_results "$code" 0 package.log
   return "$code"
 }
@@ -491,14 +500,15 @@ package_results() {
 write_environment
 : > "$STATUS_FILE"
 setup_python
+HOST_GO_ENV=(env -u LOGSERVE_API_TOKEN -u LOGSERVE_SCHEDULER_V2)
 
 if [ "${LOGSERVE_RUN_FULL_TESTS:-1}" = "1" ]; then
-  run_step go_test_all "$RUN_DIR/go_test_all.log" go test -count=1 ./...
-  run_step go_vet "$RUN_DIR/go_vet.log" go vet ./...
+  run_step go_test_all "$RUN_DIR/go_test_all.log" "${HOST_GO_ENV[@]}" go test -count=1 ./...
+  run_step go_vet "$RUN_DIR/go_vet.log" "${HOST_GO_ENV[@]}" go vet ./...
 fi
 
 if [ "${LOGSERVE_RUN_RACE:-1}" = "1" ]; then
-  run_step go_race_control_metadata_worker "$RUN_DIR/go_race_control_metadata_worker.log" go test -race -count=1 ./internal/control ./internal/metadata ./internal/worker
+  run_step go_race_control_metadata_worker "$RUN_DIR/go_race_control_metadata_worker.log" "${HOST_GO_ENV[@]}" go test -race -count=1 ./internal/control ./internal/metadata ./internal/worker
 fi
 
 run_step python_unittest "$RUN_DIR/python_unittest.log" "$PYTHON" -m unittest discover sdk/python/tests
@@ -508,8 +518,8 @@ run_step python_grpc_deps "$RUN_DIR/python_grpc_deps.log" "$PYTHON" -c "import g
 run_step build_logservectl "$RUN_DIR/build_logservectl.log" go build -o "$CLI_BIN" ./cmd/logservectl
 
 if [ "${LOGSERVE_RUN_GO_BENCH:-1}" = "1" ]; then
-  run_step scheduler_benchmark "$RUN_DIR/scheduler_benchmark.log" go test ./internal/control -run '^$' -bench BenchmarkSchedulerAssignMixedBacklog -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}"
-  run_step metadata_benchmark "$RUN_DIR/metadata_benchmark.log" go test ./internal/metadata -run '^$' -bench BenchmarkMemoryStore -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}" -memprofile "$RUN_DIR/metadata_heap.pprof" -mutexprofile "$RUN_DIR/metadata_mutex.pprof"
+  run_step scheduler_benchmark "$RUN_DIR/scheduler_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/control -run '^$' -bench BenchmarkSchedulerAssignMixedBacklog -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}"
+  run_step metadata_benchmark "$RUN_DIR/metadata_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/metadata -run '^$' -bench BenchmarkMemoryStore -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}" -memprofile "$RUN_DIR/metadata_heap.pprof" -mutexprofile "$RUN_DIR/metadata_mutex.pprof"
 fi
 
 if [ "${LOGSERVE_RUN_LOGSTORE_BENCH:-1}" = "1" ]; then
@@ -517,11 +527,13 @@ if [ "${LOGSERVE_RUN_LOGSTORE_BENCH:-1}" = "1" ]; then
 fi
 
 if [ "${LOGSERVE_RUN_FAULT:-1}" = "1" ]; then
-  run_step fault_injection_go_tests "$RUN_DIR/fault_injection_go_tests.log" go test ./tests/integration -run "Test(WorkflowWorkerRecoveryContinuesAfterCompletedStep|ActorCounterRecoverySnapshotAndReplay|RunningTaskIsRedeliveredAfterWorkerLeaseExpires|PolledTaskIsRedeliveredWhenWorkerDiesBeforeStart|StaleTaskCompletionRejectedAfterRedelivery|OrdinaryTaskSurvivesControlRestartFromTaskSpecLog|ControlRestartBootstrapsWorkflowAndModelStateFromLog)" -count=1
+  run_step fault_injection_go_tests "$RUN_DIR/fault_injection_go_tests.log" "${HOST_GO_ENV[@]}" go test ./tests/integration -run "Test(WorkflowWorkerRecoveryContinuesAfterCompletedStep|ActorCounterRecoverySnapshotAndReplay|RunningTaskIsRedeliveredAfterWorkerLeaseExpires|PolledTaskIsRedeliveredWhenWorkerDiesBeforeStart|StaleTaskCompletionRejectedAfterRedelivery|OrdinaryTaskSurvivesControlRestartFromTaskSpecLog|ControlRestartBootstrapsWorkflowAndModelStateFromLog)" -count=1
   write_fault_report
 fi
 
 if [ "${LOGSERVE_RUN_BENCHMARK:-1}" = "1" ]; then
+  export LOGSERVE_API_TOKEN="$API_TOKEN"
+  export LOGSERVE_SCHEDULER_V2="$SCHEDULER_V2"
   if start_runtime; then
     run_json_step benchmark "$RUN_DIR/benchmark.json" "$RUN_DIR/benchmark.stderr.log" "$PYTHON" examples/evaluation/benchmark.py
     run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" "$PYTHON" examples/evaluation/checkpoint_cache.py
