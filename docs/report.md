@@ -76,97 +76,109 @@ predicted_latency =
 
 ## 实验环境
 
-实验在用户单机 Ubuntu 环境完成：
+实验在用户单机 Ubuntu 服务器上完成，使用 Docker Compose 在一台机器上模拟多 worker 部署：
 
 ```text
-Linux lab2439 6.8.0-111-generic x86_64 GNU/Linux
-Ubuntu 22.04 single-node environment
 Project path: /home/lab2439/Work/lzww/LogServe
-Mode: single node, 3 workers, mock LLM, file-backed checkpoint cache
+Run directory: reports/experiment-exp1782144454
+Package: reports/experiment-exp1782144454/experiment-package.tar.gz
+Mode: compose
+Runtime: PostgreSQL, MinIO, logd, control, 3 workers
+LLM: mock LLM, worker-local file-backed checkpoint cache
+Scheduler: LOGSERVE_SCHEDULER_V2=1
 ```
 
-这组实验不用于说明多机生产性能，重点检查这些机制是否能在单机环境跑通：log-first、replay、redelivery、actor recovery、snapshot、locality scheduling、checkpoint cache 和 dashboard materialization。
+这组实验用于验证单机多进程环境中的机制正确性和可复现性，覆盖 log-first、replay、redelivery、actor recovery、snapshot、typed/indexed scheduler、LLM locality、checkpoint cache 和 dashboard materialization。它不用于声明多机生产性能，也不等价于真实 GPU/vLLM 压测。
 
 ## 验证结果
 
 ### 基础验证
 
-最新实验运行目录：
+最终实验判定为 `PASS`。自动汇总脚本给出的验收项如下：
 
-```text
-reports/experiment-20260610T013044794327660Z
-```
-
-主要验证命令均通过：
-
-| 验证项 | 结果 |
+| 验收项 | 结果 |
 |---|---:|
-| `go test ./...` | PASS |
-| `go vet ./...` | PASS |
-| `go test -race ./internal/control ./internal/worker` | PASS |
-| Python unittest | PASS |
-| Python compileall | PASS |
-| gRPC dependency check | PASS |
-| logstore benchmark | PASS |
-| fault injection tests | PASS |
-| runtime logd/control/workers start | PASS |
-| Benchmark | PASS |
-| checkpoint cache probe | PASS |
-| checkpoint cache artifact check | PASS |
-| dashboard snapshot | PASS |
+| all recorded commands pass | PASS |
+| logstore relaxed fsync faster than always | PASS |
+| locality cache hit not worse than resource-only | PASS |
+| checkpoint warm cache hit | PASS |
+| actor snapshot replay less than full replay | PASS |
+| dashboard has three workers | PASS |
 
-### Benchmark
+主要命令和探针均通过：
 
-本次单机实验结果如下：
+| 验证项 | 结果 | 用时 |
+|---|---:|---:|
+| Python venv create | PASS | 2 s |
+| Python dependency install | PASS | 3 s |
+| `go test -count=1 ./...` | PASS | 27 s |
+| `go vet ./...` | PASS | 1 s |
+| `go test -race -count=1 ./internal/control ./internal/metadata ./internal/worker` | PASS | 7 s |
+| Python unittest | PASS | 0 s |
+| Python compileall | PASS | 0 s |
+| gRPC dependency check | PASS | 0 s |
+| `logservectl` build | PASS | 1 s |
+| scheduler benchmark | PASS | 7 s |
+| metadata benchmark | PASS | 9 s |
+| logstore benchmark | PASS | 12 s |
+| fault injection tests | PASS | 6 s |
+| compose build | PASS | 2 s |
+| runtime compose start | PASS | 1 s |
+| runtime logd/control/workers ready | PASS | 0 s |
+| runtime benchmark | PASS | 45 s |
+| checkpoint cache probe | PASS | 1 s |
+| checkpoint artifact check | PASS | 0 s |
+| dashboard snapshot | PASS | 0 s |
+| summary and package generation | PASS | 0 s |
+
+### Runtime Benchmark
+
+本次 compose 端到端 benchmark 结果如下：
 
 | 指标 | 结果 |
 |---|---:|
-| Workflow p95 latency | 823 ms |
-| Workflow p99 latency | 823 ms |
-| Task throughput | 5.17 tasks/s |
-| Task p99 latency | 207 ms |
+| Workflow p95 latency | 1244 ms |
+| Workflow p99 latency | 1244 ms |
+| Task throughput | 4.870 tasks/s |
+| Task p99 latency | 521 ms |
 | Actor full replay commands | 21 |
+| Actor no-snapshot replay commands | 21 |
 | Actor snapshot replay commands | 1 |
 | Actor trimmed replay commands | 1 |
-| Actor no-snapshot replay commands | 21 |
+| Actor compactable log records | 45 |
+| Actor compactable log bytes | 18,283 |
 | LLM cold total latency | 98 ms |
-| LLM warm total latency | 17 ms |
+| LLM warm total latency | 18 ms |
+| LLM warm cache hit | true |
+| LLM cold checkpoint fetch | 1 ms |
+| LLM warm checkpoint fetch | 0 ms |
 
-Actor snapshot ablation 显示 snapshot 生效：同样 20 次 command 后，snapshot replay 和 trimmed replay 只需回放 1 条 command，而无 snapshot 需要回放 21 条。Dashboard 和 benchmark 会报告 compactable log records/bytes，用于衡量 snapshot-aware retention 可以释放的日志空间。
+Actor snapshot ablation 显示 snapshot 和 logical trim 生效：同样 20 次 command 后，snapshot replay 和 trimmed replay 只需回放 1 条 command，而无 snapshot 需要回放 21 条。Dashboard 和 benchmark 同时报告 compactable records/bytes，用于衡量 snapshot-aware retention 可以释放的日志空间。
 
 ### Locality Scheduling Ablation
 
-| 策略 | Cache hit rate | Cold start rate | p95 latency | SLO violation |
-|---|---:|---:|---:|---:|
-| Resource-only | 0.833 | 0.167 | 305 ms | 0.167 |
-| Locality-aware | 1.000 | 0.000 | 205 ms | 0.000 |
-| Predicted-latency | 1.000 | 0.000 | 205 ms | 0.000 |
+| 策略 | Cache hit rate | p95 latency |
+|---|---:|---:|
+| Resource-only | 1.000 | 209 ms |
+| Locality-aware | 1.000 | 209 ms |
+| Predicted-latency | 1.000 | 209 ms |
 
-结果说明：在 3 worker、模型缓存不均匀的设置下，locality-aware 和 predicted-latency 避免了额外 cold start，cache hit rate 更高，p95 latency 更低。
+这次 workload 中三种策略都命中缓存，因此 locality-aware 和 predicted-latency 没有表现出额外 latency 差距。验收意义是：在 typed scheduler 和模型缓存索引开启后，locality-aware 的 cache hit 不低于 resource-only，且不会破坏 LLM 任务调度。若要证明 locality 策略在冷/热缓存不均衡场景下的收益，需要增加更强的冷启动扰动、模型分布差异或更大的 checkpoint。
 
 ### Checkpoint Cache Probe
 
-最新 checkpoint cache 实验结果：
+checkpoint cache 探针结果如下：
 
 | 指标 | Cold | Warm |
 |---|---:|---:|
 | cache hit | false | true |
 | checkpoint fetch | 1 ms | 0 ms |
-| cache used | 3,145,728 bytes | 3,145,728 bytes |
+| worker | worker-a | worker-a |
+| cache used | 2,097,152 bytes | 2,097,152 bytes |
 | cache capacity | 16,777,216 bytes | 16,777,216 bytes |
-| model load | 1 ms | 1 ms |
-| first token | 15 ms | 15 ms |
-| total latency | 18 ms | 18 ms |
-| worker | bench-worker-1 | bench-worker-1 |
+| validation errors | none | none |
 
-Artifact check 也通过：
-
-```text
-runtime/model-cache/worker-1/model-D-v1.checkpoint
-runtime/model-cache/worker-1/model-D-v1.checkpoint.manifest.json
-```
-
-这说明 file-backed checkpoint cache 写到了 worker-local cache，而不是只创建 source checkpoint。由于 checkpoint 文件默认 1 MiB，fetch/load 延迟较小；这组数据主要用于确认功能路径。
+Artifact check 也通过，说明 file-backed checkpoint cache 写到了 worker-local cache，而不是只创建 source checkpoint。由于测试 checkpoint 较小，fetch/load 延迟主要用于确认功能路径，不用于推断大模型真实冷启动时间。
 
 ### Logstore Benchmark
 
@@ -174,11 +186,43 @@ runtime/model-cache/worker-1/model-D-v1.checkpoint.manifest.json
 
 | fsync policy | Append records/s | Read records/s | Recover ms | Segments |
 |---|---:|---:|---:|---:|
-| always | 1,685.74 | 529,000.62 | 63 | 7 |
-| batch | 239,518.24 | 825,535.97 | 80 | 7 |
-| interval | 266,441.10 | 738,468.94 | 63 | 7 |
+| always | 1,734.660 | 448,881.025 | 42 | 7 |
+| batch | 285,940.289 | 656,219.478 | 44 | 7 |
+| interval | 334,596.961 | 700,969.374 | 41 | 7 |
 
 结果和写入策略一致：`always` 强同步写入最慢；`batch` 和 `interval` 的 append throughput 明显更高。恢复时间保持在几十毫秒量级。
+
+### Scheduler And Metadata Microbenchmarks
+
+Scheduler mixed backlog microbenchmark 覆盖 `queue_depth = 1k/10k/100k` 和 `worker = 1/10/100`：
+
+| queue depth | workers | ns/op | B/op | allocs/op |
+|---:|---:|---:|---:|---:|
+| 1,000 | 1 | 537.1 | 105 | 2 |
+| 1,000 | 10 | 2,305 | 367 | 4 |
+| 1,000 | 100 | 16,946 | 2,480 | 6 |
+| 10,000 | 1 | 534.2 | 128 | 2 |
+| 10,000 | 10 | 1,759 | 344 | 3 |
+| 10,000 | 100 | 16,121 | 2,500 | 6 |
+| 100,000 | 1 | 487.4 | 151 | 2 |
+| 100,000 | 10 | 1,501 | 346 | 3 |
+| 100,000 | 100 | 3,910 | 2,464 | 5 |
+
+结果说明 Assign 路径没有随 backlog 深度线性恶化，主要成本来自 worker 维度和可用队列/索引判断，这符合 typed/indexed scheduler 的优化目标。
+
+Metadata microbenchmark 的结果是混合的：
+
+| 指标 | Legacy | V2 |
+|---|---:|---:|
+| GetTask | 69.44 ns/op | 27.54 ns/op |
+| LeaseComplete | 1,400 ns/op | 4,243 ns/op |
+| Heartbeat | 1,487 ns/op | 195 ns/op |
+| HeartbeatUnderCompleteP99 heartbeat p99 | 5,505,106 ns | 26,323 ns |
+| HeartbeatUnderCompleteP99 ns/op | 10,079 | 7,040 |
+| ActiveWorkers | 59,624 ns/op | 67,272 ns/op |
+| UpdateWorkflow | 15,336 ns/op | 21,143 ns/op |
+
+V2 明显改善了 heartbeat 路径，尤其是 complete 并发下的 heartbeat p99；GetTask 也更快。但 LeaseComplete、ActiveWorkers 和 UpdateWorkflow 在当前实现中更慢，后续优化应继续关注这些写路径和 view 更新成本。
 
 ### Fault Injection
 
@@ -197,24 +241,25 @@ Dashboard snapshot 包含：
 
 | 项 | 数量 |
 |---|---:|
-| tasks | 82 |
+| tasks | 218 |
 | workflows | 3 |
 | actors | 2 |
 | workers | 3 |
-| models | 2 |
-| compactable log bytes | dashboard snapshot reports |
+| models | 3 |
+| compactable log records | 45 |
+| compactable log bytes | 18,283 |
 
-Dashboard 用来查看 materialized view 中的 workflow DAG、task 状态、actor 状态、worker 和 model cache。
+Dashboard 用来查看 materialized view 中的 workflow DAG、task 状态、actor 状态、worker 和 model cache。Compose 实验中 dashboard 至少观测到 3 个 worker，满足多 worker 模拟验收条件。
 
 ## 结论
 
-LogServe 现在具备以下能力：
+当前 Ubuntu 单机 Compose 实验已经完成，自动汇总结果为 `PASS`。这说明 LogServe 的核心机制能在可复现的单机多进程环境中稳定跑通：
 
 - shared log 是系统状态源，metadata 是可重建视图。
 - Workflow 支持 DAG、retry、timeout、replay 和 exactly-once-ish 结果提交。
-- Actor 支持 mailbox 串行化、command sequence、snapshot replay 和 epoch fencing。
-- Shared log 支持 per-stream logical trim 和 compactable bytes 统计，actor snapshot 后可从 snapshot + tail log replay。
+- Actor 支持 mailbox 串行化、command sequence、snapshot replay、logical trim 和 epoch fencing。
+- Typed/indexed scheduler 能避免按 backlog 深度线性扫描，普通 task、target worker task、actor task 和 LLM task 可以通过不同队列/索引调度。
 - LLM serving 支持模型注册、mock/vLLM adapter、worker cache 上报、checkpoint cache 和 locality-aware scheduling。
-- Benchmark、fault injection、dashboard 和实验报告脚本已经能在单机 Ubuntu 环境复现实验。
+- Benchmark、fault injection、dashboard 和实验报告脚本已经能在单机 Ubuntu 环境复现实验并自动打包结果。
 
-这些结果说明当前机制能在单机实验中稳定跑通，并给出几个对比基线；它们不代表生产级多机性能。下一步可以补多节点部署实验、真实 vLLM/GPU 负载、持久化 PostgreSQL/MinIO 端到端压测，以及更大 checkpoint 下的 cold-start 曲线。
+实验边界也需要明确：这组结果验证的是单机机制和回归门禁，不代表生产级多机性能；mock LLM 不能替代真实 GPU/vLLM 延迟；小 checkpoint 只能证明 cache 路径正确，不能反映大模型真实冷启动曲线。下一步更有价值的实验是多节点部署、真实 vLLM/GPU 负载、更大 checkpoint 下的 cold-start 曲线，以及针对 metadata V2 写路径的进一步优化。

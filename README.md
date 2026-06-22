@@ -554,41 +554,47 @@ LOGSERVE_RUN_RACE=0 LOGSERVE_RUN_LOGSTORE_BENCH=0 bash scripts/run_experiment.sh
 
 ### Single-Node Experiment Snapshot
 
-The latest Ubuntu single-node run used 3 workers, mock LLM serving, and a
-file-backed checkpoint cache:
+The latest Ubuntu single-node acceptance run used Docker Compose to launch
+PostgreSQL, MinIO, logd, control, and 3 workers with mock LLM serving and a
+worker-local file-backed checkpoint cache:
 
 ```text
-reports/experiment-20260610T013044794327660Z
-Linux lab2439 6.8.0-111-generic x86_64 GNU/Linux
+reports/experiment-exp1782144454
+verdict: PASS
+mode: compose
+scheduler: LOGSERVE_SCHEDULER_V2=1
+package: reports/experiment-exp1782144454/experiment-package.tar.gz
 ```
 
-The run passed Go tests, `go vet`, race tests for control and worker packages,
-Python unittest/compile checks, gRPC dependency check, logstore benchmark,
-fault-injection tests, benchmark, checkpoint cache probe, checkpoint artifact
-check, and dashboard snapshot.
+The run passed Go tests, `go vet`, race tests for control/metadata/worker,
+Python unittest/compile checks, gRPC dependency check, scheduler and metadata
+microbenchmarks, logstore benchmark, fault-injection tests, compose runtime
+startup, benchmark, checkpoint cache probe, checkpoint artifact check, dashboard
+snapshot, and automatic result packaging.
 
 Selected results:
 
 | Metric | Result |
 |---|---:|
-| Workflow p95 / p99 latency | 823 ms / 823 ms |
-| Task throughput | 5.17 tasks/s |
-| Task p99 latency | 207 ms |
+| Workflow p95 / p99 latency | 1244 ms / 1244 ms |
+| Task throughput | 4.870 tasks/s |
+| Task p99 latency | 521 ms |
 | Actor snapshot replay commands | 1 vs 21 full replay |
 | Actor trimmed replay commands | 1 |
-| Resource-only cache hit rate | 0.833 |
+| Actor compactable log records / bytes | 45 / 18,283 |
+| Resource-only cache hit rate | 1.000 |
 | Locality-aware cache hit rate | 1.000 |
-| Resource-only p95 latency | 305 ms |
-| Locality-aware p95 latency | 205 ms |
-| Checkpoint cold fetch | 1 ms |
-| Checkpoint warm fetch | 0 ms |
-| Checkpoint cache used / capacity | 3,145,728 / 16,777,216 bytes |
+| Predicted-latency cache hit rate | 1.000 |
+| Locality-aware p95 latency | 209 ms |
+| LLM cold / warm total latency | 98 ms / 18 ms |
+| Checkpoint cold / warm fetch | 1 ms / 0 ms |
+| Checkpoint cache used / capacity | 2,097,152 / 16,777,216 bytes |
+| Dashboard workers / models | 3 / 3 |
 
-The checkpoint probe also verified the worker-local artifact:
-
-```text
-runtime/model-cache/worker-1/model-D-v1.checkpoint
-```
+The locality benchmark in this run proves the indexed scheduler does not degrade
+cache placement relative to resource-only scheduling under the mixed workload.
+Because all strategies reached a 1.000 cache hit rate, this run should be read as
+a correctness and regression gate, not as a strong latency-differentiation claim.
 
 See `docs/report.md` for the full written experiment summary and
 `docs/resume.md` for resume-ready project wording.
