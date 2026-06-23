@@ -211,9 +211,34 @@ def checkpoint_highlights(data):
     }
 
 
+def postgres_highlights(data):
+    if not isinstance(data, dict) or not data.get("available"):
+        return {}
+    return {
+        "postgres_mode": data.get("mode"),
+        "postgres_elapsed_ms": data.get("elapsed_ms"),
+        "postgres_transactions_delta": data.get("transactions_delta"),
+        "postgres_row_writes_delta": data.get("row_writes_delta"),
+        "postgres_transactions_per_sec": data.get("transactions_per_sec"),
+        "postgres_row_writes_per_sec": data.get("row_writes_per_sec"),
+    }
+
+
+def dashboard_replay_highlights(data):
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "dashboard_replay_consistent": data.get("consistent"),
+        "dashboard_replay_workflows": data.get("workflow_count"),
+        "dashboard_replay_actors": data.get("actor_count"),
+        "dashboard_replay_checked": data.get("checked_count"),
+        "dashboard_replay_failures": data.get("failures") or [],
+    }
+
 def dashboard_highlights(data):
     if not isinstance(data, dict):
         return {}
+    materializer = pick_present(data, "metadata_materializer", "metadataMaterializer") or {}
     return {
         "dashboard_queue_depth": pick_present(data, "queue_depth", "queueDepth"),
         "dashboard_tasks": len(data.get("tasks") or []),
@@ -223,10 +248,15 @@ def dashboard_highlights(data):
         "dashboard_models": len(data.get("models") or []),
         "dashboard_compactable_log_records": pick_present(data, "compactable_log_records", "compactableLogRecords"),
         "dashboard_compactable_log_bytes": pick_present(data, "compactable_log_bytes", "compactableLogBytes"),
+        "metadata_materializer_mode": pick_present(materializer, "mode", "mode"),
+        "metadata_materializer_pending_deltas": pick_present(materializer, "pending_deltas", "pendingDeltas"),
+        "metadata_materializer_flush_count": pick_present(materializer, "flush_count", "flushCount"),
+        "metadata_materializer_flush_errors": pick_present(materializer, "flush_error_count", "flushErrorCount"),
+        "metadata_materializer_lag_ms": pick_present(materializer, "eventual_lag_estimate_ms", "eventualLagEstimateMs"),
     }
 
 
-def build_checks(statuses, benchmark, logstore, checkpoint, dashboard):
+def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard_replay):
     checks = []
     failed_commands = [item.get("name") for item in statuses if int(item.get("exit_code", 1)) != 0]
     if failed_commands:
@@ -294,6 +324,16 @@ def build_checks(statuses, benchmark, logstore, checkpoint, dashboard):
     else:
         checks.append(check("dashboard_has_three_workers", "fail", "dashboard has fewer than three workers", workers, ">= 3"))
 
+    if isinstance(dashboard_replay, dict) and dashboard_replay:
+        consistent = dashboard_replay.get("consistent")
+        checked = dashboard_replay.get("checked_count")
+        if consistent is True:
+            checks.append(check("dashboard_replay_consistent", "pass", "dashboard workflow/actor entries match replay state", checked, "all checked entries consistent"))
+        else:
+            checks.append(check("dashboard_replay_consistent", "fail", "one or more dashboard entries differed from replay state", dashboard_replay.get("failures") or [], "no replay mismatches"))
+    else:
+        checks.append(check("dashboard_replay_consistent", "warn", "dashboard replay consistency check did not run"))
+
     return checks
 
 
@@ -305,12 +345,14 @@ def verdict_from_checks(checks):
     return "pass"
 
 
-def write_summary(run_dir, environment, statuses, benchmark, logstore, fault, dashboard, checkpoint, go_benchmarks):
+def write_summary(run_dir, environment, statuses, benchmark, logstore, fault, dashboard, checkpoint, postgres, dashboard_replay, go_benchmarks):
     benchmark_summary, notes = benchmark_highlights(benchmark)
     logstore_summary = logstore_highlights(logstore)
     checkpoint_summary = checkpoint_highlights(checkpoint)
     dashboard_summary = dashboard_highlights(dashboard)
-    checks = build_checks(statuses, benchmark or {}, logstore or {}, checkpoint or {}, dashboard or {})
+    postgres_summary = postgres_highlights(postgres)
+    dashboard_replay_summary = dashboard_replay_highlights(dashboard_replay)
+    checks = build_checks(statuses, benchmark or {}, logstore or {}, checkpoint or {}, dashboard or {}, dashboard_replay or {})
     verdict = verdict_from_checks(checks)
     if verdict != "pass":
         notes.append("verdict is not pass; inspect checks and failed command logs before using the numbers in a report.")
@@ -328,6 +370,8 @@ def write_summary(run_dir, environment, statuses, benchmark, logstore, fault, da
         "checkpoint_cache": checkpoint_summary,
         "fault_injection": fault or {},
         "dashboard": dashboard_summary,
+        "postgres": postgres_summary,
+        "dashboard_replay": dashboard_replay_summary,
         "go_benchmarks": go_benchmarks,
         "notes": notes,
     }
@@ -365,6 +409,8 @@ def write_summary(run_dir, environment, statuses, benchmark, logstore, fault, da
         ("Checkpoint Cache Probe", checkpoint_summary),
         ("Fault Injection", fault or {}),
         ("Dashboard Snapshot", dashboard_summary),
+        ("PostgreSQL Benchmark Stats", postgres_summary),
+        ("Dashboard Replay Consistency", dashboard_replay_summary),
     ]
     for title, values in sections:
         if not values:
@@ -417,12 +463,14 @@ def main():
     fault = read_json(run_dir / "fault_injection.json")
     dashboard = read_json(run_dir / "dashboard_snapshot.json")
     checkpoint = read_json(run_dir / "checkpoint_cache_probe.json")
+    postgres = read_json(run_dir / "postgres_benchmark_stats.json")
+    dashboard_replay = read_json(run_dir / "dashboard_replay_consistency.json")
     go_benchmarks = {
         "scheduler_benchmark.log": parse_go_benchmarks(run_dir / "scheduler_benchmark.log"),
         "metadata_benchmark.log": parse_go_benchmarks(run_dir / "metadata_benchmark.log"),
     }
     go_benchmarks = {key: value for key, value in go_benchmarks.items() if value}
-    write_summary(run_dir, environment, statuses, benchmark, logstore, fault, dashboard, checkpoint, go_benchmarks)
+    write_summary(run_dir, environment, statuses, benchmark, logstore, fault, dashboard, checkpoint, postgres, dashboard_replay, go_benchmarks)
     print(run_dir / "summary.md")
     return 0
 

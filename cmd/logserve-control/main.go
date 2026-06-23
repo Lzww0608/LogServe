@@ -14,18 +14,20 @@ func main() {
 	logAddr := flag.String("log-addr", "127.0.0.1:50051", "log service address")
 	metadataStore := flag.String("metadata-store", getenv("LOGSERVE_METADATA_STORE", "memory"), "metadata store: memory or postgres")
 	postgresDSN := flag.String("postgres-dsn", getenv("LOGSERVE_POSTGRES_DSN", getenv("DATABASE_URL", "")), "PostgreSQL DSN when --metadata-store=postgres")
+	postgresMode := flag.String("postgres-mode", getenv("LOGSERVE_POSTGRES_MODE", "sync"), "PostgreSQL write mode: sync or async")
 	apiToken := flag.String("api-token", getenv("LOGSERVE_API_TOKEN", ""), "API token required for gRPC calls when set")
 	flag.Parse()
 
 	srv, err := controlplane.StartWithOptions(*addr, *logAddr, controlplane.Options{
 		MetadataStore: *metadataStore,
 		PostgresDSN:   *postgresDSN,
+		PostgresMode:  *postgresMode,
 		APIToken:      *apiToken,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	observability.Info("control_started", map[string]any{"addr": srv.Addr(), "log_addr": *logAddr, "metadata_store": *metadataStore})
+	observability.Info("control_started", map[string]any{"addr": srv.Addr(), "log_addr": *logAddr, "metadata_store": *metadataStore, "postgres_mode": *postgresMode})
 	select {}
 }
 

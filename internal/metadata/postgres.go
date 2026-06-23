@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -21,13 +22,34 @@ import (
 var migrationsFS embed.FS
 
 type PostgresStore struct {
-	memory Store
-	db     *sql.DB
-	mu     sync.Mutex
-	last   error
+	memory       Store
+	db           *sql.DB
+	mode         PostgresWriteMode
+	materializer *Materializer
+	deltaSeq     atomic.Int64
+	mu           sync.Mutex
+	last         error
+}
+
+type PostgresWriteMode string
+
+const (
+	PostgresWriteModeSync  PostgresWriteMode = "sync"
+	PostgresWriteModeAsync PostgresWriteMode = "async"
+)
+
+type PostgresOptions struct {
+	Mode          PostgresWriteMode
+	BatchMax      int
+	FlushInterval time.Duration
+	QueueSize     int
 }
 
 func OpenPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
+	return OpenPostgresStoreWithOptions(ctx, dsn, PostgresOptions{})
+}
+
+func OpenPostgresStoreWithOptions(ctx context.Context, dsn string, opts PostgresOptions) (*PostgresStore, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("postgres dsn is required")
 	}
@@ -39,7 +61,7 @@ func OpenPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) 
 		_ = db.Close()
 		return nil, err
 	}
-	store := NewPostgresStore(db)
+	store := NewPostgresStoreWithOptions(db, opts)
 	if err := store.ApplyMigrations(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -68,7 +90,36 @@ func pingPostgres(ctx context.Context, db *sql.DB, timeout time.Duration) error 
 }
 
 func NewPostgresStore(db *sql.DB) *PostgresStore {
-	return &PostgresStore{memory: NewMemoryStore(), db: db}
+	return NewPostgresStoreWithOptions(db, PostgresOptions{})
+}
+
+func NewPostgresStoreWithOptions(db *sql.DB, opts PostgresOptions) *PostgresStore {
+	opts = normalizePostgresOptions(opts)
+	store := &PostgresStore{memory: NewMemoryStore(), db: db, mode: opts.Mode}
+	if opts.Mode == PostgresWriteModeAsync {
+		store.materializer = NewMaterializer(db, opts.BatchMax, opts.FlushInterval, opts.QueueSize, store.persistDeltas, store.remember)
+		store.materializer.Start()
+	}
+	return store
+}
+
+func normalizePostgresOptions(opts PostgresOptions) PostgresOptions {
+	switch PostgresWriteMode(strings.ToLower(strings.TrimSpace(string(opts.Mode)))) {
+	case PostgresWriteModeAsync:
+		opts.Mode = PostgresWriteModeAsync
+	default:
+		opts.Mode = PostgresWriteModeSync
+	}
+	if opts.BatchMax <= 0 {
+		opts.BatchMax = 256
+	}
+	if opts.FlushInterval <= 0 {
+		opts.FlushInterval = time.Second
+	}
+	if opts.QueueSize <= 0 {
+		opts.QueueSize = opts.BatchMax * 4
+	}
+	return opts
 }
 
 func (s *PostgresStore) ApplyMigrations(ctx context.Context) error {
@@ -81,10 +132,21 @@ func (s *PostgresStore) ApplyMigrations(ctx context.Context) error {
 }
 
 func (s *PostgresStore) Close() error {
-	if s.db == nil {
-		return nil
+	var firstErr error
+	if s.materializer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := s.materializer.Close(ctx); err != nil {
+			firstErr = err
+		}
+		cancel()
 	}
-	return s.db.Close()
+	if s.db == nil {
+		return firstErr
+	}
+	if err := s.db.Close(); firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 func (s *PostgresStore) LastError() error {
@@ -93,15 +155,43 @@ func (s *PostgresStore) LastError() error {
 	return s.last
 }
 
+func (s *PostgresStore) NonBlockingPersistence() bool {
+	return s != nil && s.mode == PostgresWriteModeAsync
+}
+
+func (s *PostgresStore) MaterializerStats() MaterializerStats {
+	mode := string(PostgresWriteModeSync)
+	if s != nil && s.mode != "" {
+		mode = string(s.mode)
+	}
+	if s == nil || s.materializer == nil {
+		return MaterializerStats{Mode: mode}
+	}
+	return s.materializer.Stats(mode)
+}
+
+func (s *PostgresStore) Flush(ctx context.Context) error {
+	if s == nil || s.materializer == nil {
+		return nil
+	}
+	return s.materializer.Flush(ctx)
+}
+
 func (s *PostgresStore) remember(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.last = err
 }
+
+func (s *PostgresStore) recordPersist(err error) {
+	if err != nil || !s.NonBlockingPersistence() {
+		s.remember(err)
+	}
+}
 func (s *PostgresStore) CreateTask(task Task, idempotencyKey string) (Task, bool) {
 	created, duplicate := s.memory.CreateTask(task, idempotencyKey)
 	if !duplicate {
-		s.remember(s.persistTask(context.Background(), created))
+		s.recordPersist(s.persistTaskOrEnqueue(created))
 	}
 	return created, duplicate
 }
@@ -123,11 +213,13 @@ func (s *PostgresStore) LeaseTask(taskID, workerID string) (Task, error) {
 	if err != nil {
 		return task, err
 	}
-	if persistErr := s.persistTask(context.Background(), task); persistErr != nil {
-		s.remember(persistErr)
-		return task, persistErr
+	if persistErr := s.persistTaskOrEnqueue(task); persistErr != nil {
+		s.recordPersist(persistErr)
+		if !s.NonBlockingPersistence() {
+			return task, persistErr
+		}
 	}
-	s.remember(nil)
+	s.recordPersist(nil)
 	return task, nil
 }
 func (s *PostgresStore) ValidateTaskLease(taskID, workerID string, leaseEpoch uint64) (Task, error) {
@@ -137,7 +229,7 @@ func (s *PostgresStore) ValidateTaskLease(taskID, workerID string, leaseEpoch ui
 func (s *PostgresStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task {
 	tasks := s.memory.RequeueExpiredRunningTasks(maxAge)
 	for _, task := range tasks {
-		s.remember(s.persistTask(context.Background(), task))
+		s.recordPersist(s.persistTaskOrEnqueue(task))
 	}
 	return tasks
 }
@@ -145,7 +237,7 @@ func (s *PostgresStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task 
 func (s *PostgresStore) RequeueTaskIfLeaseExpired(taskID string, leaseEpoch uint64, maxAge time.Duration) (Task, bool) {
 	task, requeued := s.memory.RequeueTaskIfLeaseExpired(taskID, leaseEpoch, maxAge)
 	if requeued {
-		s.remember(s.persistTask(context.Background(), task))
+		s.recordPersist(s.persistTaskOrEnqueue(task))
 	}
 	return task, requeued
 }
@@ -155,16 +247,18 @@ func (s *PostgresStore) CompleteTask(taskID, workerID string, leaseEpoch uint64,
 	if err != nil {
 		return task, err
 	}
-	if persistErr := s.persistTask(context.Background(), task); persistErr != nil {
-		s.remember(persistErr)
-		return task, persistErr
+	if persistErr := s.persistTaskOrEnqueue(task); persistErr != nil {
+		s.recordPersist(persistErr)
+		if !s.NonBlockingPersistence() {
+			return task, persistErr
+		}
 	}
-	s.remember(nil)
+	s.recordPersist(nil)
 	return task, nil
 }
 func (s *PostgresStore) RegisterModel(model *logservepb.ModelInfo) *logservepb.ModelInfo {
 	registered := s.memory.RegisterModel(model)
-	s.remember(s.persistModel(context.Background(), registered))
+	s.recordPersist(s.persistModelOrEnqueue(registered))
 	return registered
 }
 
@@ -179,7 +273,7 @@ func (s *PostgresStore) ListModels() []*logservepb.ModelInfo {
 func (s *PostgresStore) CreateWorkflow(state workflow.State, idempotencyKey string) (workflow.State, bool) {
 	created, duplicate := s.memory.CreateWorkflow(state, idempotencyKey)
 	if !duplicate {
-		s.remember(s.persistWorkflow(context.Background(), created))
+		s.recordPersist(s.persistWorkflowOrEnqueue(created))
 	}
 	return created, duplicate
 }
@@ -201,22 +295,24 @@ func (s *PostgresStore) UpdateWorkflow(workflowID string, fn func(*workflow.Stat
 	if err != nil {
 		return state, err
 	}
-	if persistErr := s.persistWorkflow(context.Background(), state); persistErr != nil {
-		s.remember(persistErr)
-		return state, persistErr
+	if persistErr := s.persistWorkflowOrEnqueue(state); persistErr != nil {
+		s.recordPersist(persistErr)
+		if !s.NonBlockingPersistence() {
+			return state, persistErr
+		}
 	}
-	s.remember(nil)
+	s.recordPersist(nil)
 	return state, nil
 }
 func (s *PostgresStore) UpsertWorkflow(state workflow.State) {
 	s.memory.UpsertWorkflow(state)
-	s.remember(s.persistWorkflow(context.Background(), state))
+	s.recordPersist(s.persistWorkflowOrEnqueue(state))
 }
 
 func (s *PostgresStore) UpsertWorker(worker Worker) {
 	s.memory.UpsertWorker(worker)
 	current, _ := s.memory.GetWorker(worker.WorkerID)
-	s.remember(s.persistWorker(context.Background(), current))
+	s.recordPersist(s.persistWorkerOrEnqueue(current))
 }
 
 func (s *PostgresStore) GetWorker(workerID string) (Worker, bool) {
@@ -233,28 +329,28 @@ func (s *PostgresStore) ListWorkers() []Worker {
 
 func (s *PostgresStore) Heartbeat(workerID string, cachedModels map[string]bool) (Worker, bool) {
 	worker, existed := s.memory.Heartbeat(workerID, cachedModels)
-	s.remember(s.persistWorker(context.Background(), worker))
+	s.recordPersist(s.persistWorkerOrEnqueue(worker))
 	return worker, existed
 }
 
 func (s *PostgresStore) IncrementWorkerLoad(workerID string) {
 	s.memory.IncrementWorkerLoad(workerID)
 	if worker, ok := s.memory.GetWorker(workerID); ok {
-		s.remember(s.persistWorker(context.Background(), worker))
+		s.recordPersist(s.persistWorkerOrEnqueue(worker))
 	}
 }
 
 func (s *PostgresStore) DecrementWorkerLoad(workerID string) {
 	s.memory.DecrementWorkerLoad(workerID)
 	if worker, ok := s.memory.GetWorker(workerID); ok {
-		s.remember(s.persistWorker(context.Background(), worker))
+		s.recordPersist(s.persistWorkerOrEnqueue(worker))
 	}
 }
 
 func (s *PostgresStore) CreateActor(state actor.State, idempotencyKey string) (actor.State, bool) {
 	created, duplicate := s.memory.CreateActor(state, idempotencyKey)
 	if !duplicate {
-		s.remember(s.persistActor(context.Background(), created))
+		s.recordPersist(s.persistActorOrEnqueue(created))
 	}
 	return created, duplicate
 }
@@ -276,20 +372,130 @@ func (s *PostgresStore) UpdateActor(actorID string, fn func(*actor.State) error)
 	if err != nil {
 		return state, err
 	}
-	if persistErr := s.persistActor(context.Background(), state); persistErr != nil {
-		s.remember(persistErr)
-		return state, persistErr
+	if persistErr := s.persistActorOrEnqueue(state); persistErr != nil {
+		s.recordPersist(persistErr)
+		if !s.NonBlockingPersistence() {
+			return state, persistErr
+		}
 	}
-	s.remember(nil)
+	s.recordPersist(nil)
 	return state, nil
 }
 func (s *PostgresStore) UpsertActor(state actor.State) {
 	s.memory.UpsertActor(state)
-	s.remember(s.persistActor(context.Background(), state))
+	s.recordPersist(s.persistActorOrEnqueue(state))
 }
 
+type sqlExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (s *PostgresStore) persistTaskOrEnqueue(task Task) error {
+	if !s.NonBlockingPersistence() {
+		return s.persistTask(context.Background(), task)
+	}
+	return s.enqueueDelta(DeltaTask, task.TaskID, cloneTask(task))
+}
+
+func (s *PostgresStore) persistModelOrEnqueue(model *logservepb.ModelInfo) error {
+	if !s.NonBlockingPersistence() {
+		return s.persistModel(context.Background(), model)
+	}
+	return s.enqueueDelta(DeltaModel, ModelKey(model.GetName(), model.GetVersion()), cloneModel(model))
+}
+
+func (s *PostgresStore) persistWorkflowOrEnqueue(state workflow.State) error {
+	if !s.NonBlockingPersistence() {
+		return s.persistWorkflow(context.Background(), state)
+	}
+	return s.enqueueDelta(DeltaWorkflow, state.WorkflowID, cloneWorkflow(state))
+}
+
+func (s *PostgresStore) persistWorkerOrEnqueue(worker Worker) error {
+	if !s.NonBlockingPersistence() {
+		return s.persistWorker(context.Background(), worker)
+	}
+	return s.enqueueDelta(DeltaWorker, worker.WorkerID, cloneWorker(worker))
+}
+
+func (s *PostgresStore) persistActorOrEnqueue(state actor.State) error {
+	if !s.NonBlockingPersistence() {
+		return s.persistActor(context.Background(), state)
+	}
+	return s.enqueueDelta(DeltaActor, state.ActorID, cloneActor(state))
+}
+
+func (s *PostgresStore) enqueueDelta(kind DeltaKind, key string, payload any) error {
+	if s.materializer == nil {
+		return errors.New("metadata materializer is not configured")
+	}
+	return s.materializer.Enqueue(metadataDelta{
+		kind:    kind,
+		key:     key,
+		payload: payload,
+		version: s.deltaSeq.Add(1),
+	})
+}
+
+func (s *PostgresStore) persistDeltas(ctx context.Context, deltas []metadataDelta) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, delta := range deltas {
+		if err := s.persistDeltaWith(ctx, tx, delta); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresStore) persistDeltaWith(ctx context.Context, exec sqlExecutor, delta metadataDelta) error {
+	switch delta.kind {
+	case DeltaTask:
+		task, ok := delta.payload.(Task)
+		if !ok {
+			return errors.New("invalid task delta payload")
+		}
+		return s.persistTaskWith(ctx, exec, task)
+	case DeltaWorker:
+		worker, ok := delta.payload.(Worker)
+		if !ok {
+			return errors.New("invalid worker delta payload")
+		}
+		return s.persistWorkerWith(ctx, exec, worker)
+	case DeltaModel:
+		model, ok := delta.payload.(*logservepb.ModelInfo)
+		if !ok {
+			return errors.New("invalid model delta payload")
+		}
+		return s.persistModelWith(ctx, exec, model)
+	case DeltaWorkflow:
+		state, ok := delta.payload.(workflow.State)
+		if !ok {
+			return errors.New("invalid workflow delta payload")
+		}
+		return s.persistWorkflowWith(ctx, exec, state)
+	case DeltaActor:
+		state, ok := delta.payload.(actor.State)
+		if !ok {
+			return errors.New("invalid actor delta payload")
+		}
+		return s.persistActorWith(ctx, exec, state)
+	default:
+		return errors.New("unknown metadata delta kind")
+	}
+}
 func (s *PostgresStore) persistTask(ctx context.Context, task Task) error {
-	_, err := s.db.ExecContext(ctx, `
+	return s.persistTaskWith(ctx, s.db, task)
+}
+
+func (s *PostgresStore) persistTaskWith(ctx context.Context, exec sqlExecutor, task Task) error {
+	_, err := exec.ExecContext(ctx, `
 INSERT INTO task_instances (
   task_id, task_name, status, worker_id, workflow_id, step_id, target_worker_id,
   actor_id, actor_call_id, actor_epoch, actor_command_seq, task_lease_epoch, llm_model_name,
@@ -342,7 +548,7 @@ INSERT INTO task_instances (
 		return err
 	}
 	if task.LLMModelName != "" {
-		_, err = s.db.ExecContext(ctx, `
+		_, err = exec.ExecContext(ctx, `
 INSERT INTO llm_requests (task_id, model_name, model_version, worker_id)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (task_id) DO UPDATE SET
@@ -359,10 +565,14 @@ ON CONFLICT (task_id) DO UPDATE SET
 }
 
 func (s *PostgresStore) persistModel(ctx context.Context, model *logservepb.ModelInfo) error {
+	return s.persistModelWith(ctx, s.db, model)
+}
+
+func (s *PostgresStore) persistModelWith(ctx context.Context, exec sqlExecutor, model *logservepb.ModelInfo) error {
 	if model == nil {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := exec.ExecContext(ctx, `
 INSERT INTO model_registry (name, version, size_bytes, path, adapter, updated_at)
 VALUES ($1, $2, $3, $4, $5, now())
 ON CONFLICT (name, version) DO UPDATE SET
@@ -380,16 +590,23 @@ ON CONFLICT (name, version) DO UPDATE SET
 }
 
 func (s *PostgresStore) persistWorkflow(ctx context.Context, state workflow.State) error {
-	definitionJSON, err := json.Marshal(state.Definition)
-	if err != nil {
-		return err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `
+	if err := s.persistWorkflowWith(ctx, tx, state); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresStore) persistWorkflowWith(ctx context.Context, exec sqlExecutor, state workflow.State) error {
+	definitionJSON, err := json.Marshal(state.Definition)
+	if err != nil {
+		return err
+	}
+	if _, err := exec.ExecContext(ctx, `
 INSERT INTO workflow_instances (
   workflow_id, workflow_name, status, input_json, definition_json, output_json,
   output_ref, error, idempotency_key, idempotency_fingerprint, created_at, updated_at, completed_at
@@ -432,7 +649,7 @@ ON CONFLICT (workflow_id) DO UPDATE SET
 	}
 	for _, stepID := range stepIDs {
 		step := state.Steps[stepID]
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := exec.ExecContext(ctx, `
 INSERT INTO workflow_steps (
   workflow_id, step_id, task_name, status, attempts, task_id, result_json,
   result_ref, error, started_at, completed_at, latency_ms
@@ -464,20 +681,27 @@ ON CONFLICT (workflow_id, step_id) DO UPDATE SET
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *PostgresStore) persistWorker(ctx context.Context, worker Worker) error {
-	labelsJSON, err := json.Marshal(worker.Labels)
-	if err != nil {
-		return err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `
+	if err := s.persistWorkerWith(ctx, tx, worker); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresStore) persistWorkerWith(ctx context.Context, exec sqlExecutor, worker Worker) error {
+	labelsJSON, err := json.Marshal(worker.Labels)
+	if err != nil {
+		return err
+	}
+	if _, err := exec.ExecContext(ctx, `
 INSERT INTO workers (worker_id, address, labels, capacity, running_tasks, last_heartbeat_at)
 VALUES ($1, $2, $3::jsonb, $4, $5, $6)
 ON CONFLICT (worker_id) DO UPDATE SET
@@ -495,7 +719,7 @@ ON CONFLICT (worker_id) DO UPDATE SET
 	); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM worker_model_cache WHERE worker_id = $1`, worker.WorkerID); err != nil {
+	if _, err := exec.ExecContext(ctx, `DELETE FROM worker_model_cache WHERE worker_id = $1`, worker.WorkerID); err != nil {
 		return err
 	}
 	keys := make([]string, 0, len(worker.CachedModels))
@@ -507,7 +731,7 @@ ON CONFLICT (worker_id) DO UPDATE SET
 	sort.Strings(keys)
 	for _, key := range keys {
 		name, version := splitModelKey(key)
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := exec.ExecContext(ctx, `
 INSERT INTO worker_model_cache (worker_id, model_name, model_version, updated_at)
 VALUES ($1, $2, $3, now())
 ON CONFLICT (worker_id, model_name, model_version) DO UPDATE SET updated_at = now()`,
@@ -518,11 +742,15 @@ ON CONFLICT (worker_id, model_name, model_version) DO UPDATE SET updated_at = no
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *PostgresStore) persistActor(ctx context.Context, state actor.State) error {
-	_, err := s.db.ExecContext(ctx, `
+	return s.persistActorWith(ctx, s.db, state)
+}
+
+func (s *PostgresStore) persistActorWith(ctx context.Context, exec sqlExecutor, state actor.State) error {
+	_, err := exec.ExecContext(ctx, `
 INSERT INTO actor_instances (
   actor_id, class_name, class_source, status, owner_worker_id, epoch,
   command_count, submitted_command_count, snapshot_ref, snapshot_command_count, state_json,

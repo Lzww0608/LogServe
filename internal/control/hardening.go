@@ -139,7 +139,41 @@ func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetD
 		LogAppendSlowMs:       logAppendSlowLimit.Milliseconds(),
 		CompactableLogRecords: compactableRecords,
 		CompactableLogBytes:   compactableBytes,
+		MetadataMaterializer:  metadataMaterializerSnapshot(s.meta),
 	}, nil
+}
+
+func metadataMaterializerSnapshot(store metadata.Store) *logservepb.MetadataMaterializerStats {
+	reporter, ok := store.(interface {
+		MaterializerStats() metadata.MaterializerStats
+	})
+	if !ok {
+		return nil
+	}
+	stats := reporter.MaterializerStats()
+	return &logservepb.MetadataMaterializerStats{
+		Mode:                  stats.Mode,
+		PendingDeltas:         uint64(stats.PendingDeltas),
+		QueuedDeltas:          uint64(stats.QueuedDeltas),
+		BatchMax:              uint32(stats.BatchMax),
+		FlushIntervalMs:       stats.FlushInterval.Milliseconds(),
+		FlushCount:            stats.FlushCount,
+		FlushErrorCount:       stats.FlushErrorCount,
+		LastFlushAtMs:         unixMilliOrZero(stats.LastFlushAt),
+		LastSuccessAtMs:       unixMilliOrZero(stats.LastSuccessAt),
+		LastErrorAtMs:         unixMilliOrZero(stats.LastErrorAt),
+		LastFlushDurationMs:   stats.LastFlushDuration.Milliseconds(),
+		LastFlushDeltas:       uint64(stats.LastFlushDeltas),
+		LastError:             stats.LastError,
+		EventualLagEstimateMs: stats.EventualLagEstimate.Milliseconds(),
+	}
+}
+
+func unixMilliOrZero(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.UnixMilli()
 }
 
 func (s *Service) compactableLogStats(ctx context.Context) (uint64, uint64) {

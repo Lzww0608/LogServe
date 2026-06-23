@@ -105,6 +105,10 @@ func (s *Service) metadataPersisted() error {
 		return nil
 	}
 	if err := reporter.LastError(); err != nil {
+		if nonBlocking, ok := s.meta.(interface{ NonBlockingPersistence() bool }); ok && nonBlocking.NonBlockingPersistence() {
+			observability.Error("metadata_persistence_async_error", err, nil)
+			return nil
+		}
 		return fmt.Errorf("metadata persistence failed: %w", err)
 	}
 	return nil

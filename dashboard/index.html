@@ -148,7 +148,9 @@
     const status = (value) => `<span class="status ${statusClass(value)}">${cell(value)}</span>`;
 
     const render = (data) => {
-      document.getElementById("metrics").innerHTML = [
+      const materializer = pick(data, "metadataMaterializer", "metadata_materializer") || {};
+      const materializerMode = pick(materializer, "mode", "mode");
+      const metricRows = [
         ["Queue Depth", pick(data, "queueDepth", "queue_depth") || 0],
         ["High Watermark", pick(data, "queueHighWatermark", "queue_high_watermark") || 0],
         ["Redelivery Timeout", `${pick(data, "redeliveryTimeoutMs", "redelivery_timeout_ms") || 0} ms`],
@@ -157,7 +159,16 @@
         ["Compactable Records", pick(data, "compactableLogRecords", "compactable_log_records") || 0],
         ["Compactable Bytes", pick(data, "compactableLogBytes", "compactable_log_bytes") || 0],
         ["Scheduling Policy", pick(data, "schedulingPolicy", "scheduling_policy") || "-"],
-      ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
+      ];
+      if (materializerMode) {
+        metricRows.push(
+          ["Metadata Mode", materializerMode],
+          ["Metadata Pending", pick(materializer, "pendingDeltas", "pending_deltas") || 0],
+          ["Metadata Lag", `${pick(materializer, "eventualLagEstimateMs", "eventual_lag_estimate_ms") || 0} ms`],
+          ["Metadata Flush Errors", pick(materializer, "flushErrorCount", "flush_error_count") || 0],
+        );
+      }
+      document.getElementById("metrics").innerHTML = metricRows.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
 
       document.getElementById("workflows").innerHTML = (data.workflows || []).map((wf) => {
         const nodes = (wf.steps || []).map((step, i) => `${i ? '<span class="arrow">-></span>' : ''}<span class="node">${pick(step, "stepId", "step_id")}<br>${status(step.status)}</span>`).join("");

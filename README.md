@@ -195,8 +195,13 @@ materialized metadata view. Control startup bootstraps workflow, actor, model,
 plain ad-hoc task specs, and backpressure state from the shared log. PostgreSQL
 migrations are included under `internal/metadata/migrations`; Compose mode runs
 the control plane with `LOGSERVE_METADATA_STORE=postgres` and writes the
-materialized dashboard/task/workflow/actor/model view to PostgreSQL. If the
-PostgreSQL tables are dropped, restart control after logd and `BootstrapFromLog`
+materialized dashboard/task/workflow/actor/model view to PostgreSQL. PostgreSQL
+writes default to `LOGSERVE_POSTGRES_MODE=sync`; set
+`LOGSERVE_POSTGRES_MODE=async` to enqueue metadata deltas and flush them in
+coalesced background batches. To compare sync and async Compose runs, use
+`bash scripts/postgres_async_compare.sh`; it records task throughput, p99, and
+PostgreSQL transaction/write rates under `reports/postgres-async-compare-*`.
+If the PostgreSQL tables are dropped, restart control after logd and `BootstrapFromLog`
 will recreate the tables and rebuild the view from shared log streams.
 
 ## Tests
@@ -506,6 +511,20 @@ On the Ubuntu single-node experiment machine, use the Linux experiment runner:
 ```bash
 bash scripts/run_experiment.sh
 ```
+
+For the PostgreSQL async materialized-view acceptance run on one Ubuntu server,
+use the server wrapper:
+
+```bash
+bash scripts/ubuntu_postgres_async_acceptance.sh
+```
+
+It runs baseline Go/Python checks, executes sync and async Docker Compose
+PostgreSQL metadata runs, writes `acceptance_summary.md` /
+`acceptance_summary.json`, and packages logs under
+`reports/ubuntu-postgres-async-*`. See
+`docs/ubuntu-postgres-async-test.md` for the full procedure and the files to
+send back for result review.
 
 By default the runner chooses fresh local ports for logd/control on each run.
 Set `LOGSERVE_EXPERIMENT_LOG_ADDR` and `LOGSERVE_EXPERIMENT_CONTROL_ADDR` only

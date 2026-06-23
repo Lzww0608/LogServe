@@ -14,6 +14,7 @@ PACKAGE_PATH="$RUN_DIR/experiment-package.tar.gz"
 COMPOSE_ENV="$RUN_DIR/compose.env"
 COMPOSE_PROJECT="logserve-exp-$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
 SCHEDULER_V2="${LOGSERVE_SCHEDULER_V2:-1}"
+POSTGRES_MODE="${LOGSERVE_POSTGRES_MODE:-sync}"
 
 PORTS="$("$PYTHON_BOOTSTRAP" - <<'PY'
 import socket
@@ -235,6 +236,7 @@ write_compose_env() {
   cat > "$COMPOSE_ENV" <<EOF
 LOGSERVE_API_TOKEN=$API_TOKEN
 LOGSERVE_SCHEDULER_V2=$SCHEDULER_V2
+LOGSERVE_POSTGRES_MODE=$POSTGRES_MODE
 LOGSERVE_DOCKER_GOPROXY=${LOGSERVE_DOCKER_GOPROXY:-https://goproxy.cn,direct}
 LOGSERVE_DOCKER_GOSUMDB=${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
 LOGSERVE_POSTGRES_USER=logserve
@@ -265,6 +267,7 @@ write_environment() {
   {
     echo "run_id=$RUN_ID"
     echo "mode=$EXPERIMENT_MODE"
+    echo "postgres_mode=$POSTGRES_MODE"
     echo "root=$ROOT"
     echo "run_dir=$RUN_DIR"
     echo "data_dir=$DATA_DIR"
@@ -345,6 +348,103 @@ PY
   done
 }
 
+postgres_stats_json() {
+  if [ "$EXPERIMENT_MODE" != "compose" ] || [ "$COMPOSE_STARTED" -ne 1 ] || [ "$COMPOSE_AVAILABLE" -ne 1 ]; then
+    printf '{"available":false,"reason":"postgres stats require compose runtime","mode":"%s"}\n' "$POSTGRES_MODE"
+    return 0
+  fi
+  compose exec -T postgres env PGPASSWORD="$POSTGRES_PASSWORD" psql -U logserve -d logserve -tAc "select json_build_object('available', true, 'mode', '$POSTGRES_MODE', 'captured_at_ms', floor(extract(epoch from clock_timestamp()) * 1000)::bigint, 'datname', datname, 'xact_commit', xact_commit, 'xact_rollback', xact_rollback, 'tup_inserted', tup_inserted, 'tup_updated', tup_updated, 'tup_deleted', tup_deleted, 'tup_returned', tup_returned, 'tup_fetched', tup_fetched) from pg_stat_database where datname = current_database();"
+}
+
+postgres_benchmark_delta_json() {
+  "$PYTHON_BOOTSTRAP" - "$RUN_DIR/postgres_before_benchmark.json" "$RUN_DIR/postgres_after_benchmark.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+before = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig"))
+after = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8-sig"))
+if not before.get("available") or not after.get("available"):
+    print(json.dumps({"available": False, "reason": "postgres stats unavailable", "before": before, "after": after}, indent=2))
+    sys.exit(0)
+
+def num(data, key):
+    value = data.get(key, 0)
+    return float(value or 0)
+
+elapsed_ms = max(1.0, num(after, "captured_at_ms") - num(before, "captured_at_ms"))
+elapsed_sec = elapsed_ms / 1000.0
+xact_delta = (num(after, "xact_commit") + num(after, "xact_rollback")) - (num(before, "xact_commit") + num(before, "xact_rollback"))
+row_writes_delta = sum(num(after, key) - num(before, key) for key in ("tup_inserted", "tup_updated", "tup_deleted"))
+print(json.dumps({
+    "available": True,
+    "mode": after.get("mode") or before.get("mode"),
+    "elapsed_ms": int(elapsed_ms),
+    "transactions_delta": int(xact_delta),
+    "row_writes_delta": int(row_writes_delta),
+    "transactions_per_sec": round(xact_delta / elapsed_sec, 3),
+    "row_writes_per_sec": round(row_writes_delta / elapsed_sec, 3),
+    "before": before,
+    "after": after,
+}, indent=2))
+PY
+}
+
+verify_dashboard_replay_consistency() {
+  "$PYTHON_BOOTSTRAP" - "$CLI_BIN" "$CONTROL_ADDR" "$RUN_DIR/dashboard_snapshot.json" <<'PY'
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+cli, control_addr, dashboard_path = sys.argv[1:4]
+dashboard = json.loads(Path(dashboard_path).read_text(encoding="utf-8-sig"))
+failures = []
+workflow_count = 0
+actor_count = 0
+
+def pick(data, snake, camel):
+    return data.get(snake) if snake in data else data.get(camel)
+
+def run_json(args):
+    proc = subprocess.run(args, text=True, capture_output=True, env=os.environ)
+    if proc.returncode != 0:
+        return None, proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+    try:
+        return json.loads(proc.stdout), ""
+    except json.JSONDecodeError as exc:
+        return None, f"invalid json: {exc}"
+
+for workflow in dashboard.get("workflows") or []:
+    workflow_id = pick(workflow, "workflow_id", "workflowId")
+    if not workflow_id:
+        continue
+    workflow_count += 1
+    data, err = run_json([cli, "workflow-replay", "--control-addr", control_addr, "--workflow-id", workflow_id])
+    if err or not data or not data.get("consistent_with_metadata"):
+        failures.append({"kind": "workflow", "id": workflow_id, "error": err, "consistent": bool(data and data.get("consistent_with_metadata"))})
+
+for actor in dashboard.get("actors") or []:
+    actor_id = pick(actor, "actor_id", "actorId")
+    if not actor_id:
+        continue
+    actor_count += 1
+    data, err = run_json([cli, "actor-replay", "--control-addr", control_addr, "--actor-id", actor_id])
+    if err or not data or not data.get("consistent_with_metadata"):
+        failures.append({"kind": "actor", "id": actor_id, "error": err, "consistent": bool(data and data.get("consistent_with_metadata"))})
+
+out = {
+    "consistent": not failures,
+    "workflow_count": workflow_count,
+    "actor_count": actor_count,
+    "checked_count": workflow_count + actor_count,
+    "failures": failures,
+}
+print(json.dumps(out, indent=2))
+sys.exit(0 if not failures else 1)
+PY
+}
 start_native_runtime() {
   prepare_runtime_dirs
   start_bg logd env LOGSERVE_API_TOKEN="$API_TOKEN" go run ./cmd/logserve-logd --addr "$LOG_ADDR" --data-dir "$DATA_DIR/logstore" --segment-size-bytes 67108864 --fsync-policy always
@@ -536,11 +636,16 @@ fi
 if [ "${LOGSERVE_RUN_BENCHMARK:-1}" = "1" ]; then
   export LOGSERVE_API_TOKEN="$API_TOKEN"
   export LOGSERVE_SCHEDULER_V2="$SCHEDULER_V2"
+  export LOGSERVE_POSTGRES_MODE="$POSTGRES_MODE"
   if start_runtime; then
+    run_json_step postgres_before_benchmark "$RUN_DIR/postgres_before_benchmark.json" "$RUN_DIR/postgres_before_benchmark.stderr.log" postgres_stats_json
     run_json_step benchmark "$RUN_DIR/benchmark.json" "$RUN_DIR/benchmark.stderr.log" "$PYTHON" examples/evaluation/benchmark.py
+    run_json_step postgres_after_benchmark "$RUN_DIR/postgres_after_benchmark.json" "$RUN_DIR/postgres_after_benchmark.stderr.log" postgres_stats_json
+    run_json_step postgres_benchmark_stats "$RUN_DIR/postgres_benchmark_stats.json" "$RUN_DIR/postgres_benchmark_stats.stderr.log" postgres_benchmark_delta_json
     run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" "$PYTHON" examples/evaluation/checkpoint_cache.py
     run_step checkpoint_cache_artifact "$RUN_DIR/checkpoint_cache_artifact.log" verify_checkpoint_cache_artifact
     run_json_step dashboard_snapshot "$RUN_DIR/dashboard_snapshot.json" "$RUN_DIR/dashboard_snapshot.stderr.log" "$CLI_BIN" dashboard-snapshot --control-addr "$CONTROL_ADDR"
+    run_json_step dashboard_replay_consistency "$RUN_DIR/dashboard_replay_consistency.json" "$RUN_DIR/dashboard_replay_consistency.stderr.log" verify_dashboard_replay_consistency
   fi
 fi
 

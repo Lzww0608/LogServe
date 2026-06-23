@@ -382,6 +382,23 @@ message DashboardWorker {
   int64 last_heartbeat_ms = 5;
 }
 
+message MetadataMaterializerStats {
+  string mode = 1;
+  uint64 pending_deltas = 2;
+  uint64 queued_deltas = 3;
+  uint32 batch_max = 4;
+  int64 flush_interval_ms = 5;
+  uint64 flush_count = 6;
+  uint64 flush_error_count = 7;
+  int64 last_flush_at_ms = 8;
+  int64 last_success_at_ms = 9;
+  int64 last_error_at_ms = 10;
+  int64 last_flush_duration_ms = 11;
+  uint64 last_flush_deltas = 12;
+  string last_error = 13;
+  int64 eventual_lag_estimate_ms = 14;
+}
+
 message DashboardSnapshot {
   uint32 queue_depth = 1;
   uint32 queue_high_watermark = 2;
@@ -396,6 +413,7 @@ message DashboardSnapshot {
   int64 log_append_slow_ms = 11;
   uint64 compactable_log_records = 12;
   uint64 compactable_log_bytes = 13;
+  MetadataMaterializerStats metadata_materializer = 14;
 }
 
 message GetDashboardSnapshotRequest {}

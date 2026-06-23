@@ -26,6 +26,7 @@ type Server struct {
 type Options struct {
 	MetadataStore string
 	PostgresDSN   string
+	PostgresMode  string
 	APIToken      string
 }
 
@@ -33,6 +34,7 @@ func Start(addr, logAddr string) (*Server, error) {
 	return StartWithOptions(addr, logAddr, Options{
 		MetadataStore: os.Getenv("LOGSERVE_METADATA_STORE"),
 		PostgresDSN:   firstNonEmpty(os.Getenv("LOGSERVE_POSTGRES_DSN"), os.Getenv("DATABASE_URL")),
+		PostgresMode:  os.Getenv("LOGSERVE_POSTGRES_MODE"),
 		APIToken:      os.Getenv(rpcauth.EnvAPIToken),
 	})
 }
@@ -98,7 +100,7 @@ func openMetadataStore(ctx context.Context, opts Options) (metadata.Store, io.Cl
 	case "", "memory":
 		return metadata.NewMemoryStore(), nil, nil
 	case "postgres", "postgresql":
-		store, err := metadata.OpenPostgresStore(ctx, opts.PostgresDSN)
+		store, err := metadata.OpenPostgresStoreWithOptions(ctx, opts.PostgresDSN, metadata.PostgresOptions{Mode: metadata.PostgresWriteMode(opts.PostgresMode)})
 		if err != nil {
 			return nil, nil, err
 		}
