@@ -1,0 +1,122 @@
+{
+  "verdict": "fail",
+  "result_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z",
+  "package": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/ubuntu-acceptance-package.tar.gz",
+  "compare_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/postgres_async_compare",
+  "failed_commands": [
+    "postgres_async_compare"
+  ],
+  "commands": [
+    {
+      "name": "prerequisite_check",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "prerequisite_check.log"
+    },
+    {
+      "name": "python_venv_create",
+      "exit_code": 0,
+      "duration_sec": 2,
+      "log": "python_venv_create.log"
+    },
+    {
+      "name": "python_pip_install",
+      "exit_code": 0,
+      "duration_sec": 3,
+      "log": "python_pip_install.log"
+    },
+    {
+      "name": "go_test_all",
+      "exit_code": 0,
+      "duration_sec": 29,
+      "log": "go_test_all.log"
+    },
+    {
+      "name": "go_race_metadata_control",
+      "exit_code": 0,
+      "duration_sec": 14,
+      "log": "go_race_metadata_control.log"
+    },
+    {
+      "name": "python_unittest",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_unittest.log"
+    },
+    {
+      "name": "python_compileall",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_compileall.log"
+    },
+    {
+      "name": "postgres_async_compare",
+      "exit_code": 1,
+      "duration_sec": 124,
+      "log": "postgres_async_compare.log"
+    },
+    {
+      "name": "package_results",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "package.log"
+    }
+  ],
+  "comparison": {
+    "modes": {
+      "sync": {
+        "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/postgres_async_compare/sync",
+        "verdict": "fail",
+        "task_throughput_tps": 5.16,
+        "task_p99_latency_ms": 210,
+        "postgres_transactions_per_sec": 72.528,
+        "postgres_row_writes_per_sec": 99.942,
+        "postgres_transactions_delta": 2860,
+        "postgres_row_writes_delta": 3941,
+        "metadata_materializer_mode": "sync",
+        "metadata_materializer_pending_deltas": null,
+        "metadata_materializer_flush_errors": null,
+        "metadata_materializer_lag_ms": null
+      },
+      "async": {
+        "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/postgres_async_compare/async",
+        "verdict": "fail",
+        "task_throughput_tps": 4.98,
+        "task_p99_latency_ms": 208,
+        "postgres_transactions_per_sec": 1.329,
+        "postgres_row_writes_per_sec": 17.078,
+        "postgres_transactions_delta": 53,
+        "postgres_row_writes_delta": 681,
+        "metadata_materializer_mode": "async",
+        "metadata_materializer_pending_deltas": 6,
+        "metadata_materializer_flush_errors": null,
+        "metadata_materializer_lag_ms": 845
+      }
+    },
+    "ratios": {
+      "task_throughput_async_over_sync": 0.9651,
+      "task_p99_async_over_sync": 0.9905,
+      "postgres_transactions_per_sec_async_over_sync": 0.0183,
+      "postgres_row_writes_per_sec_async_over_sync": 0.1709
+    },
+    "acceptance": {
+      "pass": false,
+      "require_improvement": true,
+      "checks": {
+        "task_throughput_improved": false,
+        "task_submit_p99_improved": true,
+        "postgres_transactions_per_sec_reduced": true,
+        "postgres_row_writes_per_sec_reduced": true,
+        "async_materializer_mode_observed": true,
+        "async_materializer_flush_errors_zero": false
+      }
+    }
+  },
+  "send_back": [
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/acceptance_summary.md",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/acceptance_summary.json",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/postgres_async_compare/summary.md",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/postgres_async_compare/comparison.json",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-postgres-async-20260623T115656Z/ubuntu-acceptance-package.tar.gz"
+  ]
+}
