@@ -1,0 +1,44 @@
+{
+  "generated_at": "2026-06-09T19:11:15+08:00",
+  "records": 20000,
+  "streams": 16,
+  "payload_bytes": 256,
+  "policies": [
+    {
+      "policy": "always",
+      "data_dir": "/tmp/logserve-logbench-always-3038893843",
+      "segment_size_bytes": 1048576,
+      "segment_count": 7,
+      "append_duration_ms": 11767,
+      "read_duration_ms": 38,
+      "recover_ms": 79,
+      "append_records_sec": 1699.6449916068432,
+      "read_records_sec": 523715.04810872616,
+      "read_records": 20000
+    },
+    {
+      "policy": "batch",
+      "data_dir": "/tmp/logserve-logbench-batch-3547525857",
+      "segment_size_bytes": 1048576,
+      "segment_count": 7,
+      "append_duration_ms": 99,
+      "read_duration_ms": 25,
+      "recover_ms": 54,
+      "append_records_sec": 201945.60045959588,
+      "read_records_sec": 779603.4835334297,
+      "read_records": 20000
+    },
+    {
+      "policy": "interval",
+      "data_dir": "/tmp/logserve-logbench-interval-411933741",
+      "segment_size_bytes": 1048576,
+      "segment_count": 7,
+      "append_duration_ms": 52,
+      "read_duration_ms": 36,
+      "recover_ms": 69,
+      "append_records_sec": 380702.3066714691,
+      "read_records_sec": 545020.4911354053,
+      "read_records": 20000
+    }
+  ]
+}

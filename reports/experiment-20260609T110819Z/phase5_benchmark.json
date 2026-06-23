@@ -1,0 +1,92 @@
+{
+  "workflow_latency": {
+    "requests": 3,
+    "median_ms": 821,
+    "p95_ms": 823,
+    "p99_ms": 823
+  },
+  "task_throughput": {
+    "requests": 8,
+    "throughput_tps": 5.17,
+    "p95_latency_ms": 207,
+    "p99_latency_ms": 207
+  },
+  "actor_recovery_snapshot_ablation": {
+    "commands": 20,
+    "snapshot_enabled": {
+      "full_replay_commands": 21,
+      "snapshot_replay_commands": 1
+    },
+    "snapshot_disabled": {
+      "full_replay_commands": 21,
+      "snapshot_replay_commands": 21
+    }
+  },
+  "llm_cold_start": {
+    "cold": {
+      "cache_hit": false,
+      "model_load_ms": 80,
+      "checkpoint_fetch_ms": 0,
+      "first_token_ms": 15,
+      "total_latency_ms": 98,
+      "cache_used_bytes": 0,
+      "cache_capacity_bytes": 0,
+      "eviction_count": 0
+    },
+    "warm": {
+      "cache_hit": true,
+      "model_load_ms": 0,
+      "checkpoint_fetch_ms": 0,
+      "first_token_ms": 15,
+      "total_latency_ms": 17,
+      "cache_used_bytes": 0,
+      "cache_capacity_bytes": 0,
+      "eviction_count": 0
+    }
+  },
+  "locality_ablation": {
+    "resource_only": {
+      "requests": 6,
+      "cache_hit_rate": 0.833,
+      "cold_starts": 1,
+      "cold_start_rate": 0.167,
+      "p50_latency_ms": 205,
+      "p95_latency_ms": 305,
+      "p99_latency_ms": 305,
+      "p95_queue_wait_ms": 206,
+      "p99_queue_wait_ms": 206,
+      "slo_ms": 250,
+      "slo_violation_rate": 0.167
+    },
+    "locality_aware": {
+      "requests": 6,
+      "cache_hit_rate": 1.0,
+      "cold_starts": 0,
+      "cold_start_rate": 0.0,
+      "p50_latency_ms": 203,
+      "p95_latency_ms": 205,
+      "p99_latency_ms": 205,
+      "p95_queue_wait_ms": 188,
+      "p99_queue_wait_ms": 188,
+      "slo_ms": 250,
+      "slo_violation_rate": 0.0
+    },
+    "predicted_latency": {
+      "requests": 6,
+      "cache_hit_rate": 1.0,
+      "cold_starts": 0,
+      "cold_start_rate": 0.0,
+      "p50_latency_ms": 205,
+      "p95_latency_ms": 205,
+      "p99_latency_ms": 205,
+      "p95_queue_wait_ms": 189,
+      "p99_queue_wait_ms": 189,
+      "slo_ms": 250,
+      "slo_violation_rate": 0.0
+    }
+  },
+  "replay_ablation": {
+    "enabled": "workflow/actor/llm state can be reconstructed from log streams",
+    "disabled": "no independent recovery validation; dashboard marks this as analysis-only baseline"
+  }
+}

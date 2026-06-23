@@ -1,0 +1,26 @@
+{
+  "model": "model-D",
+  "version": "v1",
+  "cold_task_id": "task-b72b9ced47035079",
+  "warm_task_id": "task-3926fc4a68c003d3",
+  "cold": {
+    "cache_hit": false,
+    "checkpoint_fetch_ms": 0,
+    "cache_used_bytes": 0,
+    "cache_capacity_bytes": 0,
+    "eviction_count": 0,
+    "model_load_ms": 80,
+    "first_token_ms": 15,
+    "total_latency_ms": 99
+  },
+  "warm": {
+    "cache_hit": true,
+    "checkpoint_fetch_ms": 0,
+    "cache_used_bytes": 0,
+    "cache_capacity_bytes": 0,
+    "eviction_count": 0,
+    "model_load_ms": 0,
+    "first_token_ms": 15,
+    "total_latency_ms": 16
+  }
+}

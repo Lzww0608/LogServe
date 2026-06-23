@@ -1,0 +1,140 @@
+{
+  "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/experiment-20260609T110819Z",
+  "commands": [
+    {
+      "name": "go_test_all",
+      "exit_code": 0,
+      "duration_sec": 32,
+      "log": "go_test_all.log"
+    },
+    {
+      "name": "go_vet",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "go_vet.log"
+    },
+    {
+      "name": "go_race_control_worker",
+      "exit_code": 0,
+      "duration_sec": 14,
+      "log": "go_race_control_worker.log"
+    },
+    {
+      "name": "python_unittest",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "python_unittest.log"
+    },
+    {
+      "name": "python_compileall",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_compileall.log"
+    },
+    {
+      "name": "python_grpc_deps",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_grpc_deps.log"
+    },
+    {
+      "name": "logstore_v1_benchmark",
+      "exit_code": 0,
+      "duration_sec": 12,
+      "log": "logstore_v1_benchmark.log"
+    },
+    {
+      "name": "fault_injection_go_tests",
+      "exit_code": 0,
+      "duration_sec": 5,
+      "log": "fault_injection_go_tests.log"
+    },
+    {
+      "name": "runtime_logd_start",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "logd.log"
+    },
+    {
+      "name": "runtime_control_start",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "control.log"
+    },
+    {
+      "name": "runtime_workers_start",
+      "exit_code": 0,
+      "duration_sec": 4,
+      "log": "worker_1.log"
+    },
+    {
+      "name": "phase5_benchmark",
+      "exit_code": 0,
+      "duration_sec": 17,
+      "log": "phase5_benchmark.stderr.log"
+    },
+    {
+      "name": "dashboard_snapshot",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "dashboard_snapshot.stderr.log"
+    },
+    {
+      "name": "summarize_experiment",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "summarize_experiment.log"
+    }
+  ],
+  "phase5": {
+    "workflow_p95_ms": 823,
+    "workflow_p99_ms": 823,
+    "task_throughput_tps": 5.17,
+    "task_p99_latency_ms": 207,
+    "actor_snapshot_replay_commands": 1,
+    "actor_full_replay_commands": 21,
+    "actor_no_snapshot_replay_commands": 21,
+    "llm_cold_total_latency_ms": 98,
+    "llm_warm_total_latency_ms": 17,
+    "llm_warm_cache_hit": true,
+    "llm_cold_checkpoint_fetch_ms": 0,
+    "llm_warm_checkpoint_fetch_ms": 0,
+    "resource_only_cache_hit_rate": 0.833,
+    "locality_aware_cache_hit_rate": 1.0,
+    "predicted_latency_cache_hit_rate": 1.0,
+    "resource_only_p95_latency_ms": 305,
+    "locality_aware_p95_latency_ms": 205,
+    "predicted_latency_p95_latency_ms": 205
+  },
+  "logstore": {
+    "logstore_always_append_tps": 1685.7404633347126,
+    "logstore_always_read_tps": 529000.6207557785,
+    "logstore_always_recover_ms": 63,
+    "logstore_always_segments": 7,
+    "logstore_batch_append_tps": 239518.24449988865,
+    "logstore_batch_read_tps": 825535.9740715661,
+    "logstore_batch_recover_ms": 80,
+    "logstore_batch_segments": 7,
+    "logstore_interval_append_tps": 266441.1011829532,
+    "logstore_interval_read_tps": 738468.936784179,
+    "logstore_interval_recover_ms": 63,
+    "logstore_interval_segments": 7
+  },
+  "checkpoint_cache": {},
+  "fault_injection": {
+    "worker_kill_recovery": "passed",
+    "queue_redelivery": "passed",
+    "control_restart_probe": "passed",
+    "logd_restart_probe": "covered_by_logstore_recovery_and_process_logs",
+    "source": "go test ./tests/integration fault and recovery subset"
+  },
+  "dashboard": {
+    "dashboard_queue_depth": null,
+    "dashboard_tasks": 82,
+    "dashboard_workflows": 3,
+    "dashboard_actors": 2,
+    "dashboard_workers": 3,
+    "dashboard_models": 2
+  },
+  "notes": []
+}

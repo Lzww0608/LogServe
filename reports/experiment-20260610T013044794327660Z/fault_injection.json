@@ -1,0 +1,7 @@
+{
+  "worker_kill_recovery": "passed",
+  "queue_redelivery": "passed",
+  "control_restart_probe": "passed",
+  "logd_restart_probe": "covered_by_logstore_recovery_and_process_logs",
+  "source": "go test ./tests/integration fault and recovery subset"
+}
