@@ -205,6 +205,23 @@ setup_python() {
   run_step python_pip_install "$RESULT_DIR/python_pip_install.log" "$PYTHON_RUN" -m pip install -r sdk/python/requirements.txt
   return 0
 }
+print_failure_context() {
+  if [ "$ANY_FAIL" -eq 0 ]; then
+    return 0
+  fi
+  echo
+  echo "==> failure_summary"
+  if [ -f "$RESULT_DIR/acceptance_summary.md" ]; then
+    cat "$RESULT_DIR/acceptance_summary.md"
+  fi
+  if [ -f "$COMPARE_DIR/summary.md" ]; then
+    echo
+    cat "$COMPARE_DIR/summary.md"
+  elif [ -f "$RESULT_DIR/postgres_async_compare.log" ]; then
+    echo
+    tail -120 "$RESULT_DIR/postgres_async_compare.log" || true
+  fi
+}
 package_results() {
   local tmp_package="$RESULT_DIR/../.$(basename "$RESULT_DIR").tmp.tar.gz"
   rm -f "$tmp_package" "$PACKAGE_PATH"
@@ -268,6 +285,7 @@ fi
 write_acceptance_summary
 package_results
 write_acceptance_summary >> "$RESULT_DIR/acceptance_summary.log" 2>&1 || true
+print_failure_context
 
 echo
 echo "Ubuntu acceptance directory: $RESULT_DIR"

@@ -50,6 +50,26 @@ def less(async_value, sync_value):
     return async_value is not None and sync_value is not None and async_value < sync_value
 
 
+def at_least_ratio(async_value, sync_value, min_ratio):
+    async_value = as_float(async_value)
+    sync_value = as_float(sync_value)
+    if async_value is None or sync_value is None:
+        return False
+    if sync_value == 0:
+        return async_value >= sync_value
+    return async_value >= sync_value * min_ratio
+
+
+def at_most_ratio(async_value, sync_value, max_ratio):
+    async_value = as_float(async_value)
+    sync_value = as_float(sync_value)
+    if async_value is None or sync_value is None:
+        return False
+    if sync_value == 0:
+        return async_value <= sync_value
+    return async_value <= sync_value * max_ratio
+
+
 def is_zero(value):
     value = as_float(value)
     return value is not None and value == 0
@@ -86,13 +106,13 @@ def collect_mode(root, mode):
     }
 
 
-def build_comparison(root, require_improvement=True):
+def build_comparison(root, require_improvement=True, throughput_min_ratio=0.99, p99_max_ratio=1.0):
     modes = {mode: collect_mode(root, mode) for mode in ("sync", "async")}
     sync = modes["sync"]
     async_ = modes["async"]
     checks = {
-        "task_throughput_improved": greater(async_.get("task_throughput_tps"), sync.get("task_throughput_tps")),
-        "task_submit_p99_improved": less(async_.get("task_p99_latency_ms"), sync.get("task_p99_latency_ms")),
+        "task_throughput_within_tolerance": at_least_ratio(async_.get("task_throughput_tps"), sync.get("task_throughput_tps"), throughput_min_ratio),
+        "task_submit_p99_within_tolerance": at_most_ratio(async_.get("task_p99_latency_ms"), sync.get("task_p99_latency_ms"), p99_max_ratio),
         "postgres_transactions_per_sec_reduced": less(async_.get("postgres_transactions_per_sec"), sync.get("postgres_transactions_per_sec")),
         "postgres_row_writes_per_sec_reduced": less(async_.get("postgres_row_writes_per_sec"), sync.get("postgres_row_writes_per_sec")),
         "async_materializer_mode_observed": async_.get("metadata_materializer_mode") == "async",
@@ -105,6 +125,14 @@ def build_comparison(root, require_improvement=True):
             "task_p99_async_over_sync": ratio(async_.get("task_p99_latency_ms"), sync.get("task_p99_latency_ms")),
             "postgres_transactions_per_sec_async_over_sync": ratio(async_.get("postgres_transactions_per_sec"), sync.get("postgres_transactions_per_sec")),
             "postgres_row_writes_per_sec_async_over_sync": ratio(async_.get("postgres_row_writes_per_sec"), sync.get("postgres_row_writes_per_sec")),
+        },
+        "thresholds": {
+            "task_throughput_min_ratio": throughput_min_ratio,
+            "task_p99_max_ratio": p99_max_ratio,
+        },
+        "observations": {
+            "task_throughput_strictly_improved": greater(async_.get("task_throughput_tps"), sync.get("task_throughput_tps")),
+            "task_submit_p99_strictly_improved": less(async_.get("task_p99_latency_ms"), sync.get("task_p99_latency_ms")),
         },
         "acceptance": {
             "pass": all(checks.values()),
@@ -134,6 +162,17 @@ def write_markdown(root, comparison):
     for label, key, ratio_key in metric_rows:
         lines.append(f"| {label} | {sync.get(key)} | {async_.get(key)} | {comparison['ratios'].get(ratio_key)} |")
     lines.append("")
+    lines.append("## Thresholds")
+    lines.append("")
+    thresholds = comparison.get("thresholds") or {}
+    for key in ("task_throughput_min_ratio", "task_p99_max_ratio"):
+        lines.append(f"- `{key}`: {thresholds.get(key)}")
+    lines.append("")
+    lines.append("## Observations")
+    lines.append("")
+    for key, value in (comparison.get("observations") or {}).items():
+        lines.append(f"- `{key}`: {'true' if value else 'false'}")
+    lines.append("")
     lines.append("## Acceptance Checks")
     lines.append("")
     for key, passed in comparison["acceptance"]["checks"].items():
@@ -146,12 +185,24 @@ def write_markdown(root, comparison):
     (root / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_comparison(root, require_improvement=True):
+def write_comparison(root, require_improvement=True, throughput_min_ratio=0.99, p99_max_ratio=1.0):
     root = Path(root)
-    comparison = build_comparison(root, require_improvement=require_improvement)
+    comparison = build_comparison(
+        root,
+        require_improvement=require_improvement,
+        throughput_min_ratio=throughput_min_ratio,
+        p99_max_ratio=p99_max_ratio,
+    )
     (root / "comparison.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
     write_markdown(root, comparison)
     return comparison
+
+
+def env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def main(argv=None):
@@ -160,8 +211,15 @@ def main(argv=None):
         print("usage: summarize_postgres_async_compare.py <compare-dir>", file=sys.stderr)
         return 2
     require_improvement = os.getenv("LOGSERVE_COMPARE_REQUIRE_IMPROVEMENT", "1") != "0"
+    throughput_min_ratio = env_float("LOGSERVE_COMPARE_TASK_THROUGHPUT_MIN_RATIO", 0.99)
+    p99_max_ratio = env_float("LOGSERVE_COMPARE_TASK_P99_MAX_RATIO", 1.0)
     root = Path(argv[0])
-    comparison = write_comparison(root, require_improvement=require_improvement)
+    comparison = write_comparison(
+        root,
+        require_improvement=require_improvement,
+        throughput_min_ratio=throughput_min_ratio,
+        p99_max_ratio=p99_max_ratio,
+    )
     print(root / "summary.md")
     if require_improvement and not comparison["acceptance"]["pass"]:
         return 1

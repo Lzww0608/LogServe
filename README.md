@@ -201,6 +201,10 @@ writes default to `LOGSERVE_POSTGRES_MODE=sync`; set
 coalesced background batches. To compare sync and async Compose runs, use
 `bash scripts/postgres_async_compare.sh`; it records task throughput, p99, and
 PostgreSQL transaction/write rates under `reports/postgres-async-compare-*`.
+The comparison treats task throughput/p99 as non-regression checks by default
+(`LOGSERVE_COMPARE_TASK_THROUGHPUT_MIN_RATIO=0.99`,
+`LOGSERVE_COMPARE_TASK_P99_MAX_RATIO=1.0`) while reporting exact ratios and
+strict-improvement observations.
 If the PostgreSQL tables are dropped, restart control after logd and `BootstrapFromLog`
 will recreate the tables and rebuild the view from shared log streams.
 

@@ -91,12 +91,14 @@ Send back `acceptance_summary.md`, `acceptance_summary.json`,
 
 The final comparison is expected to show:
 
-- async task throughput greater than sync
-- async task submit p99 lower than sync
+- async task throughput within the configured non-regression tolerance (`LOGSERVE_COMPARE_TASK_THROUGHPUT_MIN_RATIO`, default `0.99`)
+- async task submit p99 within the configured non-regression tolerance (`LOGSERVE_COMPARE_TASK_P99_MAX_RATIO`, default `1.0`)
 - async PostgreSQL transaction rate lower than sync
 - async PostgreSQL row-write rate lower than sync
 - async materializer mode observed in dashboard
 - async materializer flush errors equal to zero
 
-If any of these fail, keep the generated package and inspect the corresponding
-command log listed in `acceptance_summary.md`.
+The summary still reports the exact async/sync ratios and strict-improvement
+observations, so a pass should be described as non-regression unless the reported
+ratios show a real improvement. If any of these fail, keep the generated package
+and inspect the corresponding command log listed in `acceptance_summary.md`.

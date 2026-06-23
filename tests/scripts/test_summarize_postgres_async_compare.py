@@ -80,7 +80,34 @@ class PostgresAsyncCompareSummaryTest(unittest.TestCase):
             self.assertEqual(1, code)
             comparison = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
             self.assertFalse(comparison["acceptance"]["pass"])
-            self.assertIn("task_throughput_improved", comparison["acceptance"]["checks"])
+            self.assertIn("task_throughput_within_tolerance", comparison["acceptance"]["checks"])
+
+    def test_near_equal_task_metrics_pass_with_default_tolerance(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            root = Path(tmp)
+            write_run(
+                root,
+                "sync",
+                {"throughput_tps": 100, "p99_latency_ms": 80},
+                {"transactions_per_sec": 1000, "row_writes_per_sec": 800},
+                {"mode": "sync"},
+            )
+            write_run(
+                root,
+                "async",
+                {"throughput_tps": 99.5, "p99_latency_ms": 80},
+                {"transactions_per_sec": 200, "row_writes_per_sec": 100},
+                {"mode": "async", "pending_deltas": 0, "eventual_lag_estimate_ms": 0},
+            )
+
+            comparison = module.write_comparison(root, require_improvement=True)
+
+            self.assertTrue(comparison["acceptance"]["pass"])
+            self.assertTrue(comparison["acceptance"]["checks"]["task_throughput_within_tolerance"])
+            self.assertTrue(comparison["acceptance"]["checks"]["task_submit_p99_within_tolerance"])
+            self.assertFalse(comparison["observations"]["task_throughput_strictly_improved"])
+            self.assertFalse(comparison["observations"]["task_submit_p99_strictly_improved"])
 
     def test_omitted_proto_zero_flush_errors_counts_as_zero(self):
         module = load_module()
