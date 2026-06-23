@@ -207,6 +207,15 @@ The comparison treats task throughput/p99 as non-regression checks by default
 strict-improvement observations.
 If the PostgreSQL tables are dropped, restart control after logd and `BootstrapFromLog`
 will recreate the tables and rebuild the view from shared log streams.
+Metadata checkpoints can shorten replay by writing reducer state to
+`system:checkpoints`; enable the background writer with
+`--metadata-checkpoint-interval-ms` or `LOGSERVE_METADATA_CHECKPOINT_INTERVAL_MS`.
+Each checkpoint records per-stream `last_seq` plus task specs/terminal state,
+workflow state, actor state, and materialized LLM stats. On restart, control
+loads the latest valid checkpoint and reads each covered stream tail from
+`last_seq+1`; if no valid checkpoint is available, it falls back to full replay.
+`--metadata-checkpoint-retention` / `LOGSERVE_METADATA_CHECKPOINT_RETENTION`
+controls how many checkpoint records are retained, defaulting to 3.
 
 ## Tests
 
@@ -453,8 +462,9 @@ The predicted-latency stats are keyed by `(model_name, model_version,
 worker_id)` and maintained from `LLMCompleted` events when LLM tasks finish.
 Each entry tracks request count, cache-hit count, EWMA total latency, EWMA model
 load latency, EWMA checkpoint fetch latency, and last update time. On control
-restart, the stats are rebuilt once from LLM event streams. The runtime
-prediction is:
+restart, the stats are restored from the latest metadata checkpoint plus each
+`llm:*` stream tail when a checkpoint is available; otherwise they are rebuilt
+once from LLM event streams. The runtime prediction is:
 
 ```text
 predicted_latency =
@@ -529,6 +539,19 @@ PostgreSQL metadata runs, writes `acceptance_summary.md` /
 `reports/ubuntu-postgres-async-*`. See
 `docs/ubuntu-postgres-async-test.md` for the full procedure and the files to
 send back for result review.
+
+For the metadata checkpoint bootstrap acceptance run on one Ubuntu server, use:
+
+```bash
+bash scripts/ubuntu_checkpoint_acceptance.sh
+```
+
+It generates task, workflow, actor, and LLM metadata history, creates a
+`system:checkpoints` record, appends log tails, compares full replay with
+checkpoint-plus-tail replay, writes `acceptance_summary.md` /
+`acceptance_summary.json`, and packages logs under `reports/ubuntu-checkpoint-*`.
+See `docs/ubuntu-checkpoint-acceptance.md` for the full procedure and the files
+to send back for result review.
 
 By default the runner chooses fresh local ports for logd/control on each run.
 Set `LOGSERVE_EXPERIMENT_LOG_ADDR` and `LOGSERVE_EXPERIMENT_CONTROL_ADDR` only
@@ -613,6 +636,25 @@ Selected results:
 | Checkpoint cold / warm fetch | 1 ms / 0 ms |
 | Checkpoint cache used / capacity | 2,097,152 / 16,777,216 bytes |
 | Dashboard workers / models | 3 / 3 |
+
+Latest PostgreSQL async materializer comparison:
+
+```text
+reports/ubuntu-postgres-async-20260623T121546Z/postgres_async_compare
+acceptance: PASS
+```
+
+| Metric | Sync | Async | Async/Sync |
+|---|---:|---:|---:|
+| Task throughput | 5.08 tasks/s | 5.03 tasks/s | 0.9902 |
+| Task submit p99 | 209 ms | 209 ms | 1.0000 |
+| PostgreSQL tx/s | 72.629 | 1.329 | 0.0183 |
+| PostgreSQL row writes/s | 101.423 | 17.083 | 0.1684 |
+
+The async run observed `metadata_materializer_mode=async`, `flush_errors=0`,
+and dashboard replay consistency for 5 workflows plus 2 actors in both sync and
+async runs. Task throughput and p99 passed the configured non-regression gates;
+strict throughput/p99 improvement was not observed in this single-node run.
 
 The locality benchmark in this run proves the indexed scheduler does not degrade
 cache placement relative to resource-only scheduling under the mixed workload.

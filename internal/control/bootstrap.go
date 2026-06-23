@@ -30,6 +30,18 @@ func (s *Service) BootstrapFromLog(ctx context.Context) error {
 	if err := s.bootstrapBackpressure(ctx); err != nil {
 		return err
 	}
+	checkpoint, err := s.loadLatestMetadataCheckpoint(ctx)
+	if err != nil {
+		return err
+	}
+	if checkpoint != nil {
+		checkpoint.normalizeStreamKinds()
+		if err := s.bootstrapMetadataFromCheckpoint(ctx, *checkpoint); err != nil {
+			observability.Error("metadata_checkpoint_bootstrap_failed", err, map[string]any{"checkpoint_id": checkpoint.ID})
+		} else {
+			return nil
+		}
+	}
 	if err := s.bootstrapTasks(ctx); err != nil {
 		return err
 	}
@@ -51,48 +63,21 @@ func (s *Service) bootstrapTasks(ctx context.Context) error {
 		return err
 	}
 	for _, streamID := range streams {
-		spec, status, leaseEpoch, ok, err := replayTaskSpecEach(func(emit func(*logservepb.LogRecord) error) error {
+		state, err := replayTaskMetadataEach(func(emit func(*logservepb.LogRecord) error) error {
 			return s.forEachLogRecord(ctx, streamID, emit)
-		})
+		}, nil)
 		if err != nil {
 			return err
 		}
-		if !ok || spec.GetWorkflowId() != "" || spec.GetActorId() != "" {
+		if state == nil || !state.ok || state.spec == nil {
 			continue
 		}
-		task := metadata.Task{
-			TaskID:          spec.GetTaskId(),
-			TaskName:        spec.GetTaskName(),
-			Status:          status,
-			TaskLeaseEpoch:  leaseEpoch,
-			TargetWorkerID:  spec.GetTargetWorkerId(),
-			LLMModelName:    spec.GetLlmModelName(),
-			LLMModelVersion: spec.GetLlmModelVersion(),
-		}
-		if fingerprint, err := taskSpecFingerprint(spec); err == nil {
-			task.IdempotencyFingerprint = fingerprint
-		} else {
+		if err := s.restoreTaskReplayState(state); err != nil {
 			return err
-		}
-		created, _ := s.meta.CreateTask(task, spec.GetIdempotencyKey())
-		s.specMu.Lock()
-		s.specs[spec.GetTaskId()] = cloneSpec(spec)
-		s.specMu.Unlock()
-		if status == logservepb.TaskStatus_TASK_STATUS_QUEUED || status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
-			if s.useSchedulerV2() {
-				s.scheduler.Enqueue(s.schedulerMetaFromTask(created))
-			} else {
-				s.queueMu.Lock()
-				if !containsTaskID(s.queue, spec.GetTaskId()) {
-					s.queue = append(s.queue, spec.GetTaskId())
-				}
-				s.queueMu.Unlock()
-			}
 		}
 	}
 	return nil
 }
-
 func replayTaskSpec(records []*logservepb.LogRecord) (*logservepb.TaskSpec, logservepb.TaskStatus, uint64, bool, error) {
 	return replayTaskSpecEach(func(emit func(*logservepb.LogRecord) error) error {
 		for _, rec := range records {
@@ -313,6 +298,10 @@ func (s *Service) bootstrapBackpressure(ctx context.Context) error {
 }
 
 func (s *Service) bootstrapWorkflows(ctx context.Context) error {
+	return s.bootstrapWorkflowsWithScheduling(ctx, true)
+}
+
+func (s *Service) bootstrapWorkflowsWithScheduling(ctx context.Context, schedule bool) error {
 	streams, err := s.listStreams(ctx, "wf:")
 	if err != nil {
 		return err
@@ -327,6 +316,9 @@ func (s *Service) bootstrapWorkflows(ctx context.Context) error {
 		}
 		s.prepareRetryableFailedSteps(&state)
 		s.meta.UpsertWorkflow(state)
+		if !schedule {
+			continue
+		}
 		if err := s.restoreWorkflowTasks(state); err != nil {
 			return err
 		}
@@ -338,7 +330,6 @@ func (s *Service) bootstrapWorkflows(ctx context.Context) error {
 	}
 	return nil
 }
-
 func (s *Service) prepareRetryableFailedSteps(state *workflow.State) {
 	if state.Status != logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING {
 		return

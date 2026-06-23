@@ -5,7 +5,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/control"
@@ -16,26 +18,31 @@ import (
 )
 
 type Server struct {
-	addr     string
-	listener net.Listener
-	grpc     *grpc.Server
-	conn     *grpc.ClientConn
-	meta     io.Closer
+	addr           string
+	listener       net.Listener
+	grpc           *grpc.Server
+	conn           *grpc.ClientConn
+	meta           io.Closer
+	checkpointStop func()
 }
 
 type Options struct {
-	MetadataStore string
-	PostgresDSN   string
-	PostgresMode  string
-	APIToken      string
+	MetadataStore               string
+	PostgresDSN                 string
+	PostgresMode                string
+	APIToken                    string
+	MetadataCheckpointInterval  time.Duration
+	MetadataCheckpointRetention int
 }
 
 func Start(addr, logAddr string) (*Server, error) {
 	return StartWithOptions(addr, logAddr, Options{
-		MetadataStore: os.Getenv("LOGSERVE_METADATA_STORE"),
-		PostgresDSN:   firstNonEmpty(os.Getenv("LOGSERVE_POSTGRES_DSN"), os.Getenv("DATABASE_URL")),
-		PostgresMode:  os.Getenv("LOGSERVE_POSTGRES_MODE"),
-		APIToken:      os.Getenv(rpcauth.EnvAPIToken),
+		MetadataStore:               os.Getenv("LOGSERVE_METADATA_STORE"),
+		PostgresDSN:                 firstNonEmpty(os.Getenv("LOGSERVE_POSTGRES_DSN"), os.Getenv("DATABASE_URL")),
+		PostgresMode:                os.Getenv("LOGSERVE_POSTGRES_MODE"),
+		APIToken:                    os.Getenv(rpcauth.EnvAPIToken),
+		MetadataCheckpointInterval:  durationFromEnvMs("LOGSERVE_METADATA_CHECKPOINT_INTERVAL_MS", 0),
+		MetadataCheckpointRetention: intFromEnv("LOGSERVE_METADATA_CHECKPOINT_RETENTION", 3),
 	})
 }
 
@@ -67,6 +74,9 @@ func StartWithOptions(addr, logAddr string, opts Options) (*Server, error) {
 	}
 	grpcServer := grpc.NewServer(rpcauth.ServerOptions(apiToken)...)
 	service := control.NewServiceWithResultStore(meta, logservepb.NewLogServiceClient(conn), store, 0)
+	if opts.MetadataCheckpointRetention == 0 {
+		opts.MetadataCheckpointRetention = 3
+	}
 	if err := service.LogBootstrapResult(service.BootstrapFromLog(context.Background())); err != nil {
 		if closer != nil {
 			_ = closer.Close()
@@ -75,8 +85,9 @@ func StartWithOptions(addr, logAddr string, opts Options) (*Server, error) {
 		_ = lis.Close()
 		return nil, err
 	}
+	checkpointStop := service.StartMetadataCheckpointLoop(context.Background(), opts.MetadataCheckpointInterval, opts.MetadataCheckpointRetention)
 	logservepb.RegisterControlServiceServer(grpcServer, service)
-	srv := &Server{addr: lis.Addr().String(), listener: lis, grpc: grpcServer, conn: conn, meta: closer}
+	srv := &Server{addr: lis.Addr().String(), listener: lis, grpc: grpcServer, conn: conn, meta: closer, checkpointStop: checkpointStop}
 	go func() {
 		_ = grpcServer.Serve(lis)
 	}()
@@ -88,6 +99,9 @@ func (s *Server) Addr() string {
 }
 
 func (s *Server) Stop() error {
+	if s.checkpointStop != nil {
+		s.checkpointStop()
+	}
 	s.grpc.GracefulStop()
 	if s.meta != nil {
 		_ = s.meta.Close()
@@ -117,4 +131,24 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func durationFromEnvMs(key string, fallbackMs int) time.Duration {
+	value := intFromEnv(key, fallbackMs)
+	if value <= 0 {
+		return 0
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+func intFromEnv(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }

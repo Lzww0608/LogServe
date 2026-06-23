@@ -289,6 +289,137 @@ func replayEach(actorID string, iterate RecordIterator, loader ResultLoader, use
 	return ReplayResult{State: state, FullReplayCommands: commands}, nil
 }
 
+func ReplayFromStateEach(actorID string, initial State, iterate RecordIterator, loader ResultLoader) (ReplayResult, error) {
+	state := cloneStateForReplay(initial)
+	if state.ActorID == "" {
+		state.ActorID = actorID
+	}
+	var commands uint64
+	if iterate != nil {
+		if err := iterate(func(rec *logservepb.LogRecord) error {
+			var payload EventPayload
+			if len(rec.GetPayload()) > 0 {
+				if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+					return err
+				}
+			}
+			if payload.TimestampMs == 0 {
+				payload.TimestampMs = rec.GetTimestampMs()
+			}
+
+			switch rec.GetEventType() {
+			case "ActorCreated":
+				if state.ActorID == "" {
+					state = NewState(actorID, payload.ClassName, payload.ClassSource, payload.InitArgsJSON, payload.SnapshotEvery, payload.TimestampMs)
+				} else {
+					state.ActorID = actorID
+					state.ClassName = payload.ClassName
+					state.ClassSource = payload.ClassSource
+					state.InitArgsJSON = append([]byte(nil), payload.InitArgsJSON...)
+					state.Status = logservepb.ActorStatus_ACTOR_STATUS_ACTIVE
+					state.SnapshotEvery = payload.SnapshotEvery
+					if state.CreatedAtMs == 0 {
+						state.CreatedAtMs = payload.TimestampMs
+					}
+				}
+				state.IdempotencyKey = payload.IdempotencyKey
+				state.IdempotencyFingerprint = payload.IdempotencyFingerprint
+			case "ActorOwnershipGranted":
+				state.OwnerWorkerID = payload.WorkerID
+				state.Epoch = payload.Epoch
+				state.UpdatedAtMs = payload.TimestampMs
+			case "ActorCommandSubmitted":
+				if payload.CommandSeq > state.SubmittedCommandCount {
+					state.SubmittedCommandCount = payload.CommandSeq
+				}
+				state.UpdatedAtMs = payload.TimestampMs
+			case "ActorCommandApplied":
+				if payload.CommandSeq > 0 {
+					state.CommandCount = payload.CommandSeq
+				} else {
+					state.CommandCount = payload.CommandCount
+				}
+				if state.CommandCount > state.SubmittedCommandCount {
+					state.SubmittedCommandCount = state.CommandCount
+				}
+				if payload.WorkerID != "" {
+					state.OwnerWorkerID = payload.WorkerID
+				}
+				if payload.Epoch != 0 {
+					state.Epoch = payload.Epoch
+				}
+				state.StateJSON = NormalizeJSON(payload.StateJSON)
+				state.UpdatedAtMs = payload.TimestampMs
+				commands++
+			case "ActorCommandFailed":
+				if payload.CommandSeq > 0 {
+					state.CommandCount = payload.CommandSeq
+				} else {
+					state.CommandCount = payload.CommandCount
+				}
+				if state.CommandCount > state.SubmittedCommandCount {
+					state.SubmittedCommandCount = state.CommandCount
+				}
+				if payload.WorkerID != "" {
+					state.OwnerWorkerID = payload.WorkerID
+				}
+				if payload.Epoch != 0 {
+					state.Epoch = payload.Epoch
+				}
+				state.UpdatedAtMs = payload.TimestampMs
+				commands++
+			case "ActorSnapshotCreated":
+				state.ActorID = actorID
+				if payload.ClassName != "" {
+					state.ClassName = payload.ClassName
+				}
+				if payload.ClassSource != "" {
+					state.ClassSource = payload.ClassSource
+				}
+				if len(payload.InitArgsJSON) > 0 {
+					state.InitArgsJSON = append([]byte(nil), payload.InitArgsJSON...)
+				}
+				if payload.SnapshotEvery > 0 {
+					state.SnapshotEvery = payload.SnapshotEvery
+				}
+				state.Status = logservepb.ActorStatus_ACTOR_STATUS_ACTIVE
+				if payload.WorkerID != "" {
+					state.OwnerWorkerID = payload.WorkerID
+				}
+				if payload.Epoch != 0 {
+					state.Epoch = payload.Epoch
+				}
+				state.SnapshotRef = payload.SnapshotRef
+				state.SnapshotCommandCount = payload.SnapshotCommandCount
+				state.UpdatedAtMs = payload.TimestampMs
+				if payload.SnapshotRef != "" {
+					if loader == nil {
+						return errors.New("snapshot loader is required")
+					}
+					data, err := loader.LoadResult(payload.SnapshotRef)
+					if err != nil {
+						return err
+					}
+					state.StateJSON = NormalizeJSON(data)
+				}
+			}
+			return nil
+		}); err != nil {
+			return ReplayResult{}, err
+		}
+	}
+	if state.ActorID == "" {
+		return ReplayResult{}, errActorCreateEventNotFound
+	}
+	return ReplayResult{State: state, SnapshotReplayCommands: commands}, nil
+}
+
+func cloneStateForReplay(state State) State {
+	state.ClassSource = string([]byte(state.ClassSource))
+	state.InitArgsJSON = append([]byte(nil), state.InitArgsJSON...)
+	state.StateJSON = append([]byte(nil), state.StateJSON...)
+	return state
+}
 func Consistent(a, b State) bool {
 	return a.ActorID == b.ActorID &&
 		a.ClassName == b.ClassName &&

@@ -102,3 +102,38 @@ The summary still reports the exact async/sync ratios and strict-improvement
 observations, so a pass should be described as non-regression unless the reported
 ratios show a real improvement. If any of these fail, keep the generated package
 and inspect the corresponding command log listed in `acceptance_summary.md`.
+
+## Accepted Comparison Snapshot
+
+The accepted comparison from the Ubuntu single-server run is:
+
+```text
+reports/ubuntu-postgres-async-20260623T121546Z/postgres_async_compare
+Acceptance: PASS
+```
+
+| Metric | Sync | Async | Async/Sync |
+|---|---:|---:|---:|
+| Task throughput tps | 5.08 | 5.03 | 0.9902 |
+| Task submit p99 ms | 209 | 209 | 1.0000 |
+| PostgreSQL tx/s | 72.629 | 1.329 | 0.0183 |
+| PostgreSQL row writes/s | 101.423 | 17.083 | 0.1684 |
+
+Accepted checks:
+
+- `task_throughput_within_tolerance`: pass
+- `task_submit_p99_within_tolerance`: pass
+- `postgres_transactions_per_sec_reduced`: pass
+- `postgres_row_writes_per_sec_reduced`: pass
+- `async_materializer_mode_observed`: pass
+- `async_materializer_flush_errors_zero`: pass
+
+Dashboard replay consistency passed for both sync and async runs with 5
+workflows, 2 actors, 7 checked objects, and no failures. The async dashboard
+reported `pending_deltas=6`, `flush_errors=0`, and
+`eventual_lag_estimate_ms=840`.
+
+Interpret this as a successful async materialized-view validation: PostgreSQL
+transaction/write rates dropped substantially, while task throughput and p99
+remained within the configured non-regression tolerance. This run does not show
+strict task throughput or p99 improvement.

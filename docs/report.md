@@ -54,7 +54,7 @@ LLM 模块实现：
 - vLLM Adapter：可调用 OpenAI-compatible `/v1/chat/completions`。
 - Model Cache Manager：worker 注册/心跳上报本地模型缓存。
 - Checkpoint Cache：冷启动从 `--model-source-dir` 拷贝 checkpoint 到 worker-local cache，热启动命中本地缓存。
-- Scheduler：实现 `RESOURCE_ONLY`、`LOCALITY_AWARE`、`PREDICTED_LATENCY` 三种策略。`PREDICTED_LATENCY` 使用由 `LLMCompleted` 事件增量维护的 materialized stats，按 `(model_name, model_version, worker_id)` 记录 request count、cache-hit count、EWMA total/model-load/checkpoint-fetch latency 和 last update time，调度时只做 `O(number_of_workers)` 查询，不在热路径扫描 `llm:*` streams。
+- Scheduler：实现 `RESOURCE_ONLY`、`LOCALITY_AWARE`、`PREDICTED_LATENCY` 三种策略。`PREDICTED_LATENCY` 使用由 `LLMCompleted` 事件增量维护的 materialized stats，按 `(model_name, model_version, worker_id)` 记录 request count、cache-hit count、EWMA total/model-load/checkpoint-fetch latency 和 last update time，调度时只做 `O(number_of_workers)` 查询，不在热路径扫描 `llm:*` streams。控制面现在还支持 metadata checkpoint：后台写入 `system:checkpoints` 后，重启优先从 checkpoint 恢复 LLM stats、task specs/terminal state、workflow state 和 actor state，再从各 stream 的 `last_seq+1` 读取 tail；没有可用 checkpoint 时回退 full replay。
 
 LLM 请求写入 `llm:<task_id>` stream：
 
@@ -130,6 +130,42 @@ Scheduler: LOGSERVE_SCHEDULER_V2=1
 | checkpoint artifact check | PASS | 0 s |
 | dashboard snapshot | PASS | 0 s |
 | summary and package generation | PASS | 0 s |
+
+### PostgreSQL Async Materializer Acceptance
+
+PostgreSQL metadata view 的 async materializer 在单机 Ubuntu Docker Compose 环境下完成了 sync/async 对比验收。对比结果来自：
+
+```text
+Run directory: reports/ubuntu-postgres-async-20260623T121546Z/postgres_async_compare
+Summary: reports/ubuntu-postgres-async-20260623T121546Z/postgres_async_compare/summary.md
+Mode: sync vs async PostgreSQL metadata materialization
+Acceptance: PASS
+Thresholds: task throughput ratio >= 0.99, task p99 ratio <= 1.0
+```
+
+核心指标如下：
+
+| Metric | Sync | Async | Async/Sync |
+|---|---:|---:|---:|
+| Task throughput | 5.08 tasks/s | 5.03 tasks/s | 0.9902 |
+| Task submit p99 | 209 ms | 209 ms | 1.0000 |
+| PostgreSQL tx/s | 72.629 | 1.329 | 0.0183 |
+| PostgreSQL row writes/s | 101.423 | 17.083 | 0.1684 |
+
+验收项全部通过：
+
+| Check | Result |
+|---|---:|
+| task throughput within tolerance | PASS |
+| task submit p99 within tolerance | PASS |
+| PostgreSQL transactions per second reduced | PASS |
+| PostgreSQL row writes per second reduced | PASS |
+| async materializer mode observed | PASS |
+| async materializer flush errors zero | PASS |
+
+Dashboard replay consistency 也通过：sync 和 async 两组均检查了 5 个 workflow 与 2 个 actor，共 7 个对象，`failures=[]`。async dashboard snapshot 中 materializer 状态为 `mode=async`、`pending_deltas=6`、`flush_errors=0`、`eventual_lag_estimate_ms=840`。这说明 PostgreSQL view 在 async 模式下保持 eventual consistency，且未出现后台 flush error。
+
+结论是：async materializer 明显降低 PostgreSQL 同步写压力，事务速率降到 sync 的 1.83%，行写入速率降到 16.84%；task throughput 和 p99 在默认非退化容差内保持稳定。本轮没有观察到 task throughput 或 p99 的严格改善，因此应表述为“数据库写入压力显著降低，主路径性能未明显退化”，而不是“任务吞吐显著提升”。
 
 ### Runtime Benchmark
 
@@ -253,6 +289,7 @@ Dashboard 用来查看 materialized view 中的 workflow DAG、task 状态、act
 
 ## 结论
 
+PostgreSQL async materializer 的单机 Compose 对比验收也已经通过。它验证了 metadata view 可以从同步逐条 upsert 路径切换为后台批量 materialization：内存状态和 shared log 仍是主路径，PostgreSQL 作为可重建 view，写入 QPS 明显下降；dashboard replay consistency 证明 workflow/actor view 与 shared-log replay 最终一致。
 当前 Ubuntu 单机 Compose 实验已经完成，自动汇总结果为 `PASS`。这说明 LogServe 的核心机制能在可复现的单机多进程环境中稳定跑通：
 
 - shared log 是系统状态源，metadata 是可重建视图。

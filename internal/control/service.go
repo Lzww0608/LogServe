@@ -34,7 +34,11 @@ type taskSubmittedPayload struct {
 }
 
 type taskLifecyclePayload struct {
-	TaskLeaseEpoch uint64 `json:"task_lease_epoch,omitempty"`
+	TaskLeaseEpoch uint64          `json:"task_lease_epoch,omitempty"`
+	WorkerID       string          `json:"worker_id,omitempty"`
+	ResultJSON     json.RawMessage `json:"result_json,omitempty"`
+	Error          string          `json:"error,omitempty"`
+	TimestampMs    int64           `json:"timestamp_ms,omitempty"`
 }
 
 type Service struct {
