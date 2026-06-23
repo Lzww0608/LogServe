@@ -115,3 +115,58 @@ as supporting evidence, not the only acceptance criterion.
 
 If any check fails, inspect the failed command log listed in
 `acceptance_summary.md` and keep the generated package for review.
+
+## Accepted Checkpoint Snapshot
+
+The accepted Ubuntu run is:
+
+```text
+Run directory: reports/ubuntu-checkpoint-20260623T154803Z
+Summary: reports/ubuntu-checkpoint-20260623T154803Z/checkpoint_acceptance/summary.md
+Acceptance: PASS
+```
+
+Workload:
+
+| Item | Count |
+|---|---:|
+| Tasks | 120 |
+| Workflows | 12 |
+| Actors | 12 |
+| LLM streams | 40 |
+| Tail events | 68 |
+
+Replay work:
+
+| Metric | Full replay | Checkpoint replay | Checkpoint/Full |
+|---|---:|---:|---:|
+| Records read | 614 | 71 | 0.1156 |
+| ReadLog calls | 224 | 201 | 0.8973 |
+| Duration | 3.759 ms | 2.327 ms | 0.6190 |
+
+Checkpoint contents:
+
+| Item | Count |
+|---|---:|
+| Streams | 196 |
+| Tasks | 132 |
+| Workflows | 12 |
+| Actors | 12 |
+| LLM stats entries | 2 |
+| Consistency checked objects | 156 |
+
+Accepted checks:
+
+- `checkpoint_created`: pass
+- `checkpoint_read_records_reduced`: pass
+- `checkpoint_replay_consistent`: pass
+- `checkpoint_tail_only_reads`: pass
+- `corrupt_checkpoint_fallback`: pass
+- `checkpoint_retention`: pass
+
+This run shows that metadata checkpoint bootstrap keeps the replayed metadata
+consistent while reading far fewer historical log records. Full replay read 614
+records; checkpoint-plus-tail replay read 71. The measured duration also dropped
+from 3.759 ms to 2.327 ms in this single-host run, but the stronger claim is the
+record-scan reduction. `ReadLog` calls only dropped modestly because the restart
+path still checks stream tails.

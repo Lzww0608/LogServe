@@ -167,6 +167,29 @@ Dashboard replay consistency 也通过：sync 和 async 两组均检查了 5 个
 
 结论是：async materializer 明显降低 PostgreSQL 同步写压力，事务速率降到 sync 的 1.83%，行写入速率降到 16.84%；task throughput 和 p99 在默认非退化容差内保持稳定。本轮没有观察到 task throughput 或 p99 的严格改善，因此应表述为“数据库写入压力显著降低，主路径性能未明显退化”，而不是“任务吞吐显著提升”。
 
+### Metadata Checkpoint Bootstrap Acceptance
+
+metadata checkpoint 的单机 Ubuntu 验收已经通过。该测试用 in-memory shared-log harness 生成 task、workflow、actor 和 LLM metadata history，写入 `system:checkpoints`，再追加 tail 事件，对比 full replay 与 checkpoint-plus-tail replay。
+
+```text
+Run directory: reports/ubuntu-checkpoint-20260623T154803Z/checkpoint_acceptance
+Summary: reports/ubuntu-checkpoint-20260623T154803Z/checkpoint_acceptance/summary.md
+Acceptance: PASS
+Workload: 120 tasks, 12 workflows, 12 actors, 40 llm streams, 68 tail events
+```
+
+核心结果如下：
+
+| Metric | Full replay | Checkpoint replay | Checkpoint/Full |
+|---|---:|---:|---:|
+| Records read | 614 | 71 | 0.1156 |
+| ReadLog calls | 224 | 201 | 0.8973 |
+| Duration | 3.759 ms | 2.327 ms | 0.6190 |
+
+checkpoint payload 覆盖 196 个 stream、132 个 task、12 个 workflow、12 个 actor 和 2 条 LLM stats entry。一致性检查结果为 `consistent=true`，共检查 156 个对象。`checkpoint_created`、`checkpoint_read_records_reduced`、`checkpoint_replay_consistent`、`checkpoint_tail_only_reads`、`corrupt_checkpoint_fallback` 和 `checkpoint_retention` 全部通过。
+
+结论是：metadata checkpoint 可以把 control restart 从全量历史扫描改为 checkpoint + log tail replay，并保持 metadata view 与 replay snapshot 一致。这次 workload 中读取记录数从 614 降到 71，说明历史记录扫描量明显下降。`ReadLog` 调用数只从 224 降到 201，因为重启路径仍要检查各 stream tail；因此这里的收益应表述为“减少历史 records 读取”，而不是“消除 stream 访问”。duration 从 3.759 ms 降到 2.327 ms，可作为本轮单机结果，但不应外推为多机生产恢复延迟。
+
 ### Runtime Benchmark
 
 本次 compose 端到端 benchmark 结果如下：
@@ -289,8 +312,9 @@ Dashboard 用来查看 materialized view 中的 workflow DAG、task 状态、act
 
 ## 结论
 
-PostgreSQL async materializer 的单机 Compose 对比验收也已经通过。它验证了 metadata view 可以从同步逐条 upsert 路径切换为后台批量 materialization：内存状态和 shared log 仍是主路径，PostgreSQL 作为可重建 view，写入 QPS 明显下降；dashboard replay consistency 证明 workflow/actor view 与 shared-log replay 最终一致。
-当前 Ubuntu 单机 Compose 实验已经完成，自动汇总结果为 `PASS`。这说明 LogServe 的核心机制能在可复现的单机多进程环境中稳定跑通：
+PostgreSQL async materializer 的单机 Compose 对比验收已经通过：内存状态和 shared log 仍是主路径，PostgreSQL 作为可重建 view，写入 QPS 明显下降；dashboard replay consistency 证明 workflow/actor view 与 shared-log replay 最终一致。metadata checkpoint bootstrap 验收也通过了，control restart 可以从 checkpoint + log tail 恢复 metadata view，并明显减少历史 records 读取。
+
+当前 Ubuntu 单机实验的自动汇总结果为 `PASS`。这说明 LogServe 的核心机制能在可复现的单机多进程环境中稳定跑通：
 
 - shared log 是系统状态源，metadata 是可重建视图。
 - Workflow 支持 DAG、retry、timeout、replay 和 exactly-once-ish 结果提交。
