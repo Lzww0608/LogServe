@@ -134,6 +134,57 @@ func TestBootstrapLLMStatsUsesCheckpointAndOnlyReadsTail(t *testing.T) {
 	}
 }
 
+func TestMetadataCheckpointConsistencyUsesCheckpointTailOrderForLLMStats(t *testing.T) {
+	ctx := context.Background()
+	logClient := newCountingReplayableLogClient()
+	first := NewServiceWithResultStore(metadata.NewMemoryStore(), logClient, nil, 0)
+
+	for i, latency := range []int64{10, 20, 30, 40} {
+		taskID := fmt.Sprintf("task-llm-order-%02d", i)
+		appendLLMCompleted(t, logClient, taskID, llmEventPayload{
+			TaskID:         taskID,
+			ModelName:      "model-A",
+			ModelVersion:   "v1",
+			WorkerID:       "worker-1",
+			ModelLoadMs:    latency / 10,
+			TotalLatencyMs: latency,
+			TimestampMs:    int64(1000 + i),
+		})
+	}
+	if err := first.bootstrapLLMStats(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.CreateMetadataCheckpoint(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	appendLLMCompleted(t, logClient, "task-llm-order-02", llmEventPayload{
+		TaskID:         "task-llm-order-02",
+		ModelName:      "model-A",
+		ModelVersion:   "v1",
+		WorkerID:       "worker-1",
+		ModelLoadMs:    10,
+		TotalLatencyMs: 100,
+		TimestampMs:    2000,
+	})
+	appendLLMCompleted(t, logClient, "task-llm-order-03", llmEventPayload{
+		TaskID:         "task-llm-order-03",
+		ModelName:      "model-A",
+		ModelVersion:   "v1",
+		WorkerID:       "worker-1",
+		ModelLoadMs:    20,
+		TotalLatencyMs: 200,
+		TimestampMs:    2001,
+	})
+
+	check, err := first.CheckMetadataCheckpointConsistency(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !check.Consistent {
+		t.Fatalf("checkpoint consistency failed for order-sensitive LLM stats: %+v", check)
+	}
+}
+
 func TestBootstrapFromMetadataCheckpointRestoresTaskTerminalTail(t *testing.T) {
 	ctx := context.Background()
 	logClient := newCountingReplayableLogClient()

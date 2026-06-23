@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
@@ -453,6 +454,7 @@ func (s *Service) bootstrapLLMStats(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	sort.Strings(streams)
 	s.llmStatsMu.Lock()
 	s.llmStats = make(map[llmStatsKey]llmWorkerStats)
 	s.llmStatsMu.Unlock()

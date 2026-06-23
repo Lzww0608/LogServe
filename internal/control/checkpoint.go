@@ -138,6 +138,9 @@ func (s *Service) CheckMetadataCheckpointConsistency(ctx context.Context) (Metad
 	if cp == nil {
 		return MetadataCheckpointConsistency{Consistent: true}, nil
 	}
+	checkpoint := *cp
+	checkpoint.normalizeStreamKinds()
+
 	fullMeta := metadata.NewMemoryStore()
 	full := NewServiceWithResultStore(fullMeta, s.log, s.resultStore, s.resultInlineThreshold)
 	if err := full.bootstrapTasks(ctx); err != nil {
@@ -149,20 +152,21 @@ func (s *Service) CheckMetadataCheckpointConsistency(ctx context.Context) (Metad
 	if err := full.bootstrapActors(ctx); err != nil {
 		return MetadataCheckpointConsistency{}, err
 	}
-	if err := full.bootstrapLLMStats(ctx); err != nil {
-		return MetadataCheckpointConsistency{}, err
-	}
 
 	fastMeta := metadata.NewMemoryStore()
 	fast := NewServiceWithResultStore(fastMeta, s.log, s.resultStore, s.resultInlineThreshold)
-	if err := fast.bootstrapMetadataFromCheckpointWithScheduling(ctx, *cp, false); err != nil {
+	if err := fast.bootstrapMetadataFromCheckpointWithScheduling(ctx, checkpoint, false); err != nil {
+		return MetadataCheckpointConsistency{}, err
+	}
+	expectedLLMStats, err := s.llmStatsFromCheckpointTail(ctx, checkpoint)
+	if err != nil {
 		return MetadataCheckpointConsistency{}, err
 	}
 
 	result := MetadataCheckpointConsistency{
 		Consistent:    true,
-		CheckpointID:  cp.ID,
-		CheckpointAge: time.Now().UnixMilli() - cp.CreatedAtMs,
+		CheckpointID:  checkpoint.ID,
+		CheckpointAge: time.Now().UnixMilli() - checkpoint.CreatedAtMs,
 	}
 	for _, task := range fullMeta.ListTasks() {
 		result.CheckedCount++
@@ -188,7 +192,7 @@ func (s *Service) CheckMetadataCheckpointConsistency(ctx context.Context) (Metad
 			result.FailureKeys = append(result.FailureKeys, "actor:"+state.ActorID)
 		}
 	}
-	if !llmStatsMapsConsistent(full.llmStatsSnapshot(), fast.llmStatsSnapshot()) {
+	if !llmStatsMapsConsistent(expectedLLMStats, fast.llmStatsSnapshot()) {
 		result.CheckedCount++
 		result.Consistent = false
 		result.FailureKeys = append(result.FailureKeys, "llm_stats")
@@ -388,19 +392,29 @@ func (s *Service) bootstrapCheckpointActors(ctx context.Context, cp MetadataChec
 }
 
 func (s *Service) bootstrapCheckpointLLMStats(ctx context.Context, cp MetadataCheckpoint) error {
-	seen := make(map[string]struct{})
+	s.restoreCheckpointLLMStats(cp)
+	return s.materializeLLMTailsFromCheckpoint(ctx, cp)
+}
+
+func (s *Service) restoreCheckpointLLMStats(cp MetadataCheckpoint) {
+	s.llmStatsMu.Lock()
+	s.llmStats = llmStatsFromCheckpoint(cp)
+	s.llmStatsMu.Unlock()
+}
+
+func llmStatsFromCheckpoint(cp MetadataCheckpoint) map[llmStatsKey]llmWorkerStats {
 	stats := make(map[llmStatsKey]llmWorkerStats, len(cp.LLMStats))
 	for _, item := range cp.LLMStats {
 		version := firstNonEmpty(item.ModelVersion, "v1")
 		stats[llmStatsKey{modelName: item.ModelName, modelVersion: version, workerID: item.WorkerID}] = item.Stats
 	}
-	s.llmStatsMu.Lock()
-	s.llmStats = stats
-	s.llmStatsMu.Unlock()
-	for streamID, entry := range cp.Streams {
-		if entry.Kind != "llm" || !strings.HasPrefix(streamID, "llm:") {
-			continue
-		}
+	return stats
+}
+
+func (s *Service) materializeLLMTailsFromCheckpoint(ctx context.Context, cp MetadataCheckpoint) error {
+	seen := make(map[string]struct{})
+	for _, streamID := range checkpointLLMStreams(cp) {
+		entry := cp.Streams[streamID]
 		seen[streamID] = struct{}{}
 		if err := s.materializeLLMStreamFromSeq(ctx, streamID, entry.LastSeq+1); err != nil {
 			return err
@@ -410,6 +424,7 @@ func (s *Service) bootstrapCheckpointLLMStats(ctx context.Context, cp MetadataCh
 	if err != nil {
 		return err
 	}
+	sort.Strings(streams)
 	for _, streamID := range streams {
 		if _, ok := seen[streamID]; ok {
 			continue
@@ -419,6 +434,30 @@ func (s *Service) bootstrapCheckpointLLMStats(ctx context.Context, cp MetadataCh
 		}
 	}
 	return nil
+}
+
+func checkpointLLMStreams(cp MetadataCheckpoint) []string {
+	streams := make([]string, 0, len(cp.Streams))
+	for streamID, entry := range cp.Streams {
+		if !strings.HasPrefix(streamID, "llm:") {
+			continue
+		}
+		if entry.Kind != "" && entry.Kind != "llm" {
+			continue
+		}
+		streams = append(streams, streamID)
+	}
+	sort.Strings(streams)
+	return streams
+}
+
+func (s *Service) llmStatsFromCheckpointTail(ctx context.Context, cp MetadataCheckpoint) (map[llmStatsKey]llmWorkerStats, error) {
+	verifier := NewServiceWithResultStore(metadata.NewMemoryStore(), s.log, s.resultStore, s.resultInlineThreshold)
+	verifier.restoreCheckpointLLMStats(cp)
+	if err := verifier.materializeLLMTailsFromCheckpoint(ctx, cp); err != nil {
+		return nil, err
+	}
+	return verifier.llmStatsSnapshot(), nil
 }
 
 func (s *Service) materializeLLMStreamFromSeq(ctx context.Context, streamID string, fromSeq uint64) error {

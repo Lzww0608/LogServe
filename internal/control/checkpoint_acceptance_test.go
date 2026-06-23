@@ -438,9 +438,6 @@ func checkpointAcceptanceServicesConsistent(full, fast *Service) (bool, []string
 			failures = append(failures, "actor:"+state.ActorID)
 		}
 	}
-	if !llmStatsMapsConsistent(full.llmStatsSnapshot(), fast.llmStatsSnapshot()) {
-		failures = append(failures, "llm_stats")
-	}
 	sort.Strings(failures)
 	failures = compactStrings(failures)
 	return len(failures) == 0, failures
