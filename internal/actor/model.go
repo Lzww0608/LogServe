@@ -146,6 +146,8 @@ func replayEach(actorID string, iterate RecordIterator, loader ResultLoader, use
 			state.ClassSource = payload.ClassSource
 			state.InitArgsJSON = append([]byte(nil), payload.InitArgsJSON...)
 			state.Status = logservepb.ActorStatus_ACTOR_STATUS_ACTIVE
+			state.OwnerWorkerID = payload.WorkerID
+			state.Epoch = payload.Epoch
 			state.StateJSON = NormalizeJSON(data)
 			state.SnapshotRef = payload.SnapshotRef
 			state.SnapshotCommandCount = payload.SnapshotCommandCount
@@ -210,6 +212,12 @@ func replayEach(actorID string, iterate RecordIterator, loader ResultLoader, use
 			if state.CommandCount > state.SubmittedCommandCount {
 				state.SubmittedCommandCount = state.CommandCount
 			}
+			if payload.WorkerID != "" {
+				state.OwnerWorkerID = payload.WorkerID
+			}
+			if payload.Epoch != 0 {
+				state.Epoch = payload.Epoch
+			}
 			state.StateJSON = NormalizeJSON(payload.StateJSON)
 			state.UpdatedAtMs = payload.TimestampMs
 			commands++
@@ -224,6 +232,12 @@ func replayEach(actorID string, iterate RecordIterator, loader ResultLoader, use
 			}
 			if state.CommandCount > state.SubmittedCommandCount {
 				state.SubmittedCommandCount = state.CommandCount
+			}
+			if payload.WorkerID != "" {
+				state.OwnerWorkerID = payload.WorkerID
+			}
+			if payload.Epoch != 0 {
+				state.Epoch = payload.Epoch
 			}
 			state.UpdatedAtMs = payload.TimestampMs
 			commands++
@@ -242,6 +256,12 @@ func replayEach(actorID string, iterate RecordIterator, loader ResultLoader, use
 				state.SnapshotEvery = payload.SnapshotEvery
 			}
 			state.Status = logservepb.ActorStatus_ACTOR_STATUS_ACTIVE
+			if payload.WorkerID != "" {
+				state.OwnerWorkerID = payload.WorkerID
+			}
+			if payload.Epoch != 0 {
+				state.Epoch = payload.Epoch
+			}
 			state.SnapshotRef = payload.SnapshotRef
 			state.SnapshotCommandCount = payload.SnapshotCommandCount
 			state.UpdatedAtMs = payload.TimestampMs

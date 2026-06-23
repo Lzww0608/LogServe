@@ -448,6 +448,8 @@ func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) er
 		ClassName:            state.ClassName,
 		ClassSource:          state.ClassSource,
 		InitArgsJSON:         state.InitArgsJSON,
+		WorkerID:             state.OwnerWorkerID,
+		Epoch:                state.Epoch,
 		SnapshotRef:          ref,
 		SnapshotEvery:        state.SnapshotEvery,
 		SnapshotCommandCount: state.CommandCount,
