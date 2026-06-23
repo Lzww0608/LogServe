@@ -55,6 +55,12 @@ def is_zero(value):
     return value is not None and value == 0
 
 
+def zero_when_omitted(value):
+    if value is None:
+        return 0
+    return value
+
+
 def collect_mode(root, mode):
     run_dir = root / mode
     summary = read_json(run_dir / "summary.json")
@@ -63,6 +69,7 @@ def collect_mode(root, mode):
     dashboard = read_json(run_dir / "dashboard_snapshot.json")
     task = benchmark.get("task_throughput") or {}
     materializer = pick(dashboard, "metadata_materializer", "metadataMaterializer") or {}
+    flush_errors = pick(materializer, "flush_error_count", "flushErrorCount")
     return {
         "run_dir": str(run_dir),
         "verdict": summary.get("verdict"),
@@ -74,7 +81,7 @@ def collect_mode(root, mode):
         "postgres_row_writes_delta": postgres.get("row_writes_delta"),
         "metadata_materializer_mode": pick(materializer, "mode", "mode"),
         "metadata_materializer_pending_deltas": pick(materializer, "pending_deltas", "pendingDeltas"),
-        "metadata_materializer_flush_errors": pick(materializer, "flush_error_count", "flushErrorCount"),
+        "metadata_materializer_flush_errors": zero_when_omitted(flush_errors),
         "metadata_materializer_lag_ms": pick(materializer, "eventual_lag_estimate_ms", "eventualLagEstimateMs"),
     }
 
