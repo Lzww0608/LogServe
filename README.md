@@ -505,6 +505,8 @@ results under `reports/`. README keeps only the entry points; detailed numbers
 belong in the docs:
 
 - `docs/report.md`: project report and accepted experiment results.
+- `docs/ubuntu-project-acceptance.md`: top-level Ubuntu single-server
+  project acceptance procedure and expected handoff files.
 - `docs/ubuntu-postgres-async-test.md`: PostgreSQL async materializer procedure
   and accepted comparison.
 - `docs/ubuntu-checkpoint-acceptance.md`: metadata checkpoint bootstrap
@@ -522,13 +524,16 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\dashboard_snapshot.ps1
 Ubuntu single-node runners:
 
 ```bash
+bash scripts/ubuntu_project_acceptance.sh
 bash scripts/run_experiment.sh
 bash scripts/ubuntu_postgres_async_acceptance.sh
 bash scripts/ubuntu_checkpoint_acceptance.sh
 ```
 
-Use `scripts/run_experiment.sh` for the broader compose benchmark/fault-injection
-suite. Use the two `ubuntu_*_acceptance.sh` wrappers when validating the
-PostgreSQL async materializer or metadata checkpoint bootstrap changes. The
-wrappers generate `acceptance_summary.md`, `acceptance_summary.json`, and a
-packaged tarball in `reports/`.
+Use `scripts/ubuntu_project_acceptance.sh` as the top-level single-server
+project acceptance entry point. Use `scripts/run_experiment.sh` for the broader
+compose benchmark/fault-injection suite, and use the two focused
+`ubuntu_*_acceptance.sh` wrappers when validating the PostgreSQL async
+materializer or metadata checkpoint bootstrap changes. The wrappers generate
+`acceptance_summary.md`, `acceptance_summary.json`, and a packaged tarball in
+`reports/`.

@@ -638,6 +638,308 @@ func TestCorruptBinaryIndexFallsBackToLogAndRebuilds(t *testing.T) {
 	assertSegmentIndexHeader(t, indexPath, 1, 4)
 }
 
+func TestCompactabilityStatsReportsSegmentLiveBytes(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SegmentSizeBytes = 190
+	opts.FsyncPolicy = FsyncAlways
+
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	appendCompactionRecords(t, store, "actor:compact-stats", 6)
+	if _, err := store.Trim("actor:compact-stats", 4); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := store.CompactabilityStats()
+	seg1 := findCompactionStats(t, stats, 1)
+	if !seg1.FullyCompactable {
+		t.Fatalf("segment 1 should be fully compactable: %+v", seg1)
+	}
+	if seg1.TotalRecords != 3 || seg1.LiveRecords != 0 || seg1.CompactableRecords != 3 {
+		t.Fatalf("segment 1 stats = %+v, want 3 compactable records and no live records", seg1)
+	}
+	if seg1.TotalBytes == 0 || seg1.CompactableBytes != seg1.TotalBytes {
+		t.Fatalf("segment 1 bytes = %+v, want all bytes compactable", seg1)
+	}
+
+	seg2 := findCompactionStats(t, stats, 2)
+	if !seg2.Active {
+		t.Fatalf("segment 2 should be active: %+v", seg2)
+	}
+	if seg2.LiveRecords != 3 || seg2.CompactableRecords != 0 {
+		t.Fatalf("segment 2 stats = %+v, want all live", seg2)
+	}
+}
+
+func TestSegmentLevelCompactionDeletesFullyTrimmedSegment(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SegmentSizeBytes = 190
+	opts.FsyncPolicy = FsyncAlways
+
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendCompactionRecords(t, store, "actor:compact-delete", 6)
+	if _, err := store.Trim("actor:compact-delete", 4); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.Compact(context.Background(), CompactionOptions{DeleteFullyTrimmedSegments: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.DeletedSegments) != 1 || result.DeletedSegments[0] != 1 {
+		t.Fatalf("deleted segments = %+v, want [1]", result.DeletedSegments)
+	}
+	if result.ReclaimedBytes == 0 {
+		t.Fatal("expected reclaimed bytes to be reported")
+	}
+	if _, err := os.Stat(segmentPath(dir, 1, ".log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("segment 1 log still exists or stat failed unexpectedly: %v", err)
+	}
+	assertReadSeqs(t, store, "actor:compact-delete", []uint64{4, 5, 6})
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	assertReadSeqs(t, recovered, "actor:compact-delete", []uint64{4, 5, 6})
+}
+
+func TestCompactionDeleteWithoutManifestRecoversTrimmedNextSeq(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendCompactionRecords(t, store, "actor:delete-without-manifest", 3)
+	if _, err := store.Trim("actor:delete-without-manifest", 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeSegmentFilesOnDisk(dir, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	rec, duplicate, err := recovered.Append(AppendRequest{StreamID: "actor:delete-without-manifest", EventType: "E", Payload: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate {
+		t.Fatal("append after manifest-less delete reported duplicate")
+	}
+	if rec.Seq != 4 {
+		t.Fatalf("seq after manifest-less delete = %d, want 4", rec.Seq)
+	}
+	assertReadSeqs(t, recovered, "actor:delete-without-manifest", []uint64{4})
+}
+
+func TestCompactionManifestBeforeDeleteCrashCompletesDelete(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SegmentSizeBytes = 190
+	opts.FsyncPolicy = FsyncAlways
+
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendCompactionRecords(t, store, "actor:manifest-before-delete", 6)
+	if _, err := store.Trim("actor:manifest-before-delete", 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeCompactionManifestForTest(t, dir, compactionManifest{
+		CompactionID:    "test-manifest-before-delete",
+		DeletedSegments: []uint64{1},
+		SafeBefore:      map[string]uint64{"actor:manifest-before-delete": 4},
+		StartedAtMs:     time.Now().UnixMilli(),
+	})
+
+	recovered, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	if _, err := os.Stat(segmentPath(dir, 1, ".log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("segment 1 log should have been reconciled away, stat err = %v", err)
+	}
+	assertReadSeqs(t, recovered, "actor:manifest-before-delete", []uint64{4, 5, 6})
+}
+
+func TestCompactionManifestAfterDeleteCrashRecovers(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SegmentSizeBytes = 190
+	opts.FsyncPolicy = FsyncAlways
+
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendCompactionRecords(t, store, "actor:manifest-after-delete", 6)
+	if _, err := store.Trim("actor:manifest-after-delete", 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeCompactionManifestForTest(t, dir, compactionManifest{
+		CompactionID:    "test-manifest-after-delete",
+		DeletedSegments: []uint64{1},
+		SafeBefore:      map[string]uint64{"actor:manifest-after-delete": 4},
+		StartedAtMs:     time.Now().UnixMilli(),
+	})
+	if err := removeSegmentFilesOnDisk(dir, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	assertReadSeqs(t, recovered, "actor:manifest-after-delete", []uint64{4, 5, 6})
+}
+
+func TestCopyCompactionRewritesPartialLiveSegment(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SegmentSizeBytes = 190
+	opts.FsyncPolicy = FsyncAlways
+
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendCompactionRecords(t, store, "actor:copy-compact", 6)
+	if _, err := store.Trim("actor:copy-compact", 3); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.Compact(context.Background(), CompactionOptions{CopyPartialSegments: true, CopyLiveRatioThreshold: 0.9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.CopiedSegments) != 1 {
+		t.Fatalf("copied segments = %+v, want one copied segment", result.CopiedSegments)
+	}
+	copied := result.CopiedSegments[0]
+	if copied.OldSegmentID != 1 || copied.NewSegmentID == 0 || copied.LiveBytes == 0 || copied.LiveBytes >= copied.TotalBytes {
+		t.Fatalf("copied segment summary = %+v", copied)
+	}
+	if _, err := os.Stat(segmentPath(dir, 1, ".log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old segment still exists or stat failed unexpectedly: %v", err)
+	}
+	if _, err := os.Stat(segmentPath(dir, copied.NewSegmentID, ".log")); err != nil {
+		t.Fatalf("new compacted segment missing: %v", err)
+	}
+	assertReadSeqs(t, store, "actor:copy-compact", []uint64{3, 4, 5, 6})
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	assertReadSeqs(t, recovered, "actor:copy-compact", []uint64{3, 4, 5, 6})
+}
+
+func TestBackgroundCompactorDeletesFullyTrimmedSegment(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.SegmentSizeBytes = 190
+	opts.FsyncPolicy = FsyncAlways
+	opts.CompactionInterval = 10 * time.Millisecond
+
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	appendCompactionRecords(t, store, "actor:background-compact", 6)
+	if _, err := store.Trim("actor:background-compact", 4); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(segmentPath(dir, 1, ".log")); errors.Is(err, os.ErrNotExist) {
+			assertReadSeqs(t, store, "actor:background-compact", []uint64{4, 5, 6})
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("background compactor did not delete fully trimmed segment")
+}
+
+func appendCompactionRecords(t *testing.T, store *Store, streamID string, count int) {
+	t.Helper()
+	for i := 0; i < count; i++ {
+		if _, _, err := store.Append(AppendRequest{StreamID: streamID, EventType: "E", Payload: []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func findCompactionStats(t *testing.T, stats []SegmentCompactionStats, segmentID uint64) SegmentCompactionStats {
+	t.Helper()
+	for _, item := range stats {
+		if item.SegmentID == segmentID {
+			return item
+		}
+	}
+	t.Fatalf("segment %d not found in compaction stats: %+v", segmentID, stats)
+	return SegmentCompactionStats{}
+}
+
+func assertReadSeqs(t *testing.T, store *Store, streamID string, want []uint64) {
+	t.Helper()
+	records, err := store.Read(streamID, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != len(want) {
+		t.Fatalf("records = %d, want %d: %+v", len(records), len(want), records)
+	}
+	for i, rec := range records {
+		if rec.Seq != want[i] {
+			t.Fatalf("record[%d].Seq = %d, want %d", i, rec.Seq, want[i])
+		}
+	}
+}
+
+func writeCompactionManifestForTest(t *testing.T, dir string, manifest compactionManifest) {
+	t.Helper()
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, compactionManifestFileName), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 func rewriteLegacyJSONIndex(t *testing.T, dir string, segmentID uint64) {
 	t.Helper()
 	logFile, err := os.Open(segmentPath(dir, segmentID, ".log"))

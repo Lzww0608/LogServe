@@ -20,20 +20,22 @@ import (
 )
 
 const (
-	magic                         uint32 = 0x4c535647
-	version                       uint16 = 1
-	headerSize                           = 36
-	indexMagic                    uint32 = 0x4c534958
-	indexVersion                  uint16 = 2
-	legacyIndexVersion            uint16 = 1
-	indexFileHeaderSize                  = 40
-	indexDictionaryHeaderSize            = 8
-	indexFixedEntrySize                  = 24
-	legacyIndexRecordHeaderSize          = 36
-	defaultSegmentSizeBytes       int64  = 64 << 20
-	defaultSegmentReaderCacheSize        = 64
-	defaultFsyncInterval                 = 100 * time.Millisecond
-	retentionFileName                    = "retention.json"
+	magic                              uint32 = 0x4c535647
+	version                            uint16 = 1
+	headerSize                                = 36
+	indexMagic                         uint32 = 0x4c534958
+	indexVersion                       uint16 = 2
+	legacyIndexVersion                 uint16 = 1
+	indexFileHeaderSize                       = 40
+	indexDictionaryHeaderSize                 = 8
+	indexFixedEntrySize                       = 24
+	legacyIndexRecordHeaderSize               = 36
+	defaultSegmentSizeBytes            int64  = 64 << 20
+	defaultSegmentReaderCacheSize             = 64
+	defaultFsyncInterval                      = 100 * time.Millisecond
+	defaultCompactionCopyLiveRatio            = 0.5
+	defaultCompactionMaxBytesPerSecond        = 16 << 20
+	retentionFileName                         = "retention.json"
 )
 
 var errCorruptRecord = errors.New("corrupt log record")
@@ -49,18 +51,23 @@ const (
 )
 
 type Options struct {
-	SegmentSizeBytes       int64
-	FsyncPolicy            FsyncPolicy
-	FsyncInterval          time.Duration
-	SegmentReaderCacheSize int
+	SegmentSizeBytes                 int64
+	FsyncPolicy                      FsyncPolicy
+	FsyncInterval                    time.Duration
+	SegmentReaderCacheSize           int
+	CompactionInterval               time.Duration
+	CompactionCopyLiveRatioThreshold float64
+	CompactionMaxBytesPerSecond      int64
 }
 
 func DefaultOptions() Options {
 	return Options{
-		SegmentSizeBytes:       defaultSegmentSizeBytes,
-		FsyncPolicy:            FsyncAlways,
-		FsyncInterval:          defaultFsyncInterval,
-		SegmentReaderCacheSize: defaultSegmentReaderCacheSize,
+		SegmentSizeBytes:                 defaultSegmentSizeBytes,
+		FsyncPolicy:                      FsyncAlways,
+		FsyncInterval:                    defaultFsyncInterval,
+		SegmentReaderCacheSize:           defaultSegmentReaderCacheSize,
+		CompactionCopyLiveRatioThreshold: defaultCompactionCopyLiveRatio,
+		CompactionMaxBytesPerSecond:      defaultCompactionMaxBytesPerSecond,
 	}
 }
 
@@ -76,6 +83,21 @@ func (opts Options) normalize() (Options, error) {
 	}
 	if opts.SegmentReaderCacheSize < 0 {
 		opts.SegmentReaderCacheSize = 0
+	}
+	if opts.CompactionInterval < 0 {
+		return Options{}, errors.New("compaction interval cannot be negative")
+	}
+	if opts.CompactionCopyLiveRatioThreshold == 0 {
+		opts.CompactionCopyLiveRatioThreshold = defaultCompactionCopyLiveRatio
+	}
+	if opts.CompactionCopyLiveRatioThreshold < 0 || opts.CompactionCopyLiveRatioThreshold > 1 {
+		return Options{}, errors.New("compaction copy live-ratio threshold must be between 0 and 1")
+	}
+	if opts.CompactionMaxBytesPerSecond < 0 {
+		return Options{}, errors.New("compaction max bytes per second cannot be negative")
+	}
+	if opts.CompactionMaxBytesPerSecond == 0 {
+		opts.CompactionMaxBytesPerSecond = defaultCompactionMaxBytesPerSecond
 	}
 	switch opts.FsyncPolicy {
 	case FsyncAlways, FsyncBatch, FsyncInterval:
@@ -98,6 +120,8 @@ type Store struct {
 	segmentReaders     map[uint64]*segmentReader
 	segmentReaderLRU   *list.List
 	lastSync           time.Time
+	compactorCancel    func()
+	compactorDone      chan struct{}
 }
 
 type streamState struct {
@@ -148,6 +172,9 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	if err := reconcileCompactionManifestBeforeRecover(dir); err != nil {
+		return nil, err
+	}
 
 	s := &Store{
 		dir:              dir,
@@ -167,10 +194,13 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	if err := s.openActiveFilesLocked(); err != nil {
 		return nil, err
 	}
+	s.startBackgroundCompactor()
 	return s, nil
 }
 
 func (s *Store) Close() error {
+	s.stopBackgroundCompactor()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -772,7 +802,11 @@ func (s *Store) loadRetention() error {
 		if streamID == "" || meta.TrimmedBeforeSeq == 0 {
 			continue
 		}
-		s.streamStateLocked(streamID).trimBefore = meta.TrimmedBeforeSeq
+		state := s.streamStateLocked(streamID)
+		state.trimBefore = meta.TrimmedBeforeSeq
+		if state.nextSeq < meta.TrimmedBeforeSeq {
+			state.nextSeq = meta.TrimmedBeforeSeq
+		}
 	}
 	return nil
 }
