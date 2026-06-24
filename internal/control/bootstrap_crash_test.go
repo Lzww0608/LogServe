@@ -10,6 +10,7 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/metadata"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 type replayableLogClient struct {
@@ -52,9 +53,7 @@ func (c *replayableLogClient) ReadLog(_ context.Context, req *logservepb.ReadLog
 		if req.GetFromSeq() > 0 && record.GetSeq() < req.GetFromSeq() {
 			continue
 		}
-		clone := *record
-		clone.Payload = append([]byte(nil), record.GetPayload()...)
-		out = append(out, &clone)
+		out = append(out, proto.Clone(record).(*logservepb.LogRecord))
 		if limit > 0 && len(out) >= limit {
 			break
 		}
