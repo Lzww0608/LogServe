@@ -11,6 +11,8 @@ import (
 type Definition struct {
 	WorkflowName   string           `json:"workflow_name"`
 	FunctionSource string           `json:"function_source"`
+	FunctionRef    string           `json:"function_ref,omitempty"`
+	FunctionHash   string           `json:"function_hash,omitempty"`
 	ArgsJSON       json.RawMessage  `json:"args_json"`
 	Steps          []StepDefinition `json:"steps"`
 	ResultStepID   string           `json:"result_step_id"`
@@ -23,6 +25,8 @@ type StepDefinition struct {
 	TaskName        string          `json:"task_name"`
 	FunctionName    string          `json:"function_name"`
 	FunctionSource  string          `json:"function_source"`
+	FunctionRef     string          `json:"function_ref,omitempty"`
+	FunctionHash    string          `json:"function_hash,omitempty"`
 	ArgsJSON        json.RawMessage `json:"args_json"`
 	DependsOn       []string        `json:"depends_on"`
 	MaxAttempts     int             `json:"max_attempts"`
@@ -63,6 +67,7 @@ type StepState struct {
 	CompletedAtMs     int64
 	LatencyMs         int64
 	LastInputHash     string
+	ResolvedArgsJSON  []byte
 	LastScheduledAtMs int64
 }
 

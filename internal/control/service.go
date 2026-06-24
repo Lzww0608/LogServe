@@ -15,11 +15,13 @@ import (
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/eventcodec"
 	"github.com/logserve/logserve/internal/metadata"
 	"github.com/logserve/logserve/internal/objectstore"
 	"github.com/logserve/logserve/internal/observability"
 	"github.com/logserve/logserve/internal/workflow"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 const defaultResultInlineThreshold = 4096
@@ -28,6 +30,8 @@ const schedulerWorkerLease = 5 * time.Second
 const localityQueueWait = 250 * time.Millisecond
 const defaultQueueHighWatermark = 1024
 const defaultRedeliveryTimeout = 30 * time.Second
+const defaultPollBatchLimit = 64
+const maxPollWaitTimeout = 5 * time.Second
 
 type taskSubmittedPayload struct {
 	TaskSpec json.RawMessage `json:"task_spec,omitempty"`
@@ -58,12 +62,17 @@ type Service struct {
 	actorLocks            map[string]*sync.Mutex
 	resultStore           objectstore.Store
 	resultInlineThreshold int
+	functionStore         objectstore.Store
+	functionsMu           sync.RWMutex
+	functions             map[string]functionRegisteredPayload
 	configMu              sync.RWMutex
 	schedulingPolicy      logservepb.SchedulingPolicy
 	queueHighWatermark    uint32
 	redeliveryTimeout     time.Duration
 	logAppendSlowLimit    time.Duration
 	lastLogAppendMs       atomic.Int64
+	taskNotifyMu          sync.Mutex
+	taskNotifyCh          chan struct{}
 }
 
 func NewService(meta metadata.Store, logClient logClient) *Service {
@@ -75,6 +84,10 @@ func NewServiceWithResultStore(meta metadata.Store, logClient logClient, store o
 	if threshold <= 0 {
 		threshold = defaultResultInlineThreshold
 	}
+	functionStore := store
+	if functionStore == nil {
+		functionStore, _ = objectstore.OpenLocal(filepath.Join(os.TempDir(), "logserve-objectstore"))
+	}
 	return &Service{
 		meta:                  meta,
 		log:                   logClient,
@@ -84,11 +97,14 @@ func NewServiceWithResultStore(meta metadata.Store, logClient logClient, store o
 		specs:                 make(map[string]*logservepb.TaskSpec),
 		llmStats:              make(map[llmStatsKey]llmWorkerStats),
 		actorLocks:            make(map[string]*sync.Mutex),
+		functions:             make(map[string]functionRegisteredPayload),
 		resultStore:           store,
+		functionStore:         functionStore,
 		resultInlineThreshold: threshold,
 		schedulingPolicy:      logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE,
 		queueHighWatermark:    defaultQueueHighWatermark,
 		redeliveryTimeout:     defaultRedeliveryTimeout,
+		taskNotifyCh:          make(chan struct{}),
 	}
 }
 
@@ -116,6 +132,61 @@ func (s *Service) metadataPersisted() error {
 		return fmt.Errorf("metadata persistence failed: %w", err)
 	}
 	return nil
+}
+
+func pollBatchLimit(requested uint32) int {
+	if requested == 0 {
+		return 1
+	}
+	if requested > defaultPollBatchLimit {
+		return defaultPollBatchLimit
+	}
+	return int(requested)
+}
+
+func pollWaitTimeout(waitMs int64) time.Duration {
+	if waitMs <= 0 {
+		return 0
+	}
+	wait := time.Duration(waitMs) * time.Millisecond
+	if wait > maxPollWaitTimeout {
+		return maxPollWaitTimeout
+	}
+	return wait
+}
+
+func pollTaskResponse(tasks []*logservepb.TaskSpec) *logservepb.PollTaskResponse {
+	resp := &logservepb.PollTaskResponse{}
+	if len(tasks) == 0 {
+		return resp
+	}
+	resp.HasTask = true
+	resp.Task = tasks[0]
+	resp.Tasks = tasks
+	return resp
+}
+
+func (s *Service) taskAvailableSignal() <-chan struct{} {
+	s.taskNotifyMu.Lock()
+	defer s.taskNotifyMu.Unlock()
+	if s.taskNotifyCh == nil {
+		s.taskNotifyCh = make(chan struct{})
+	}
+	return s.taskNotifyCh
+}
+
+func (s *Service) notifyTaskAvailable() {
+	if s == nil {
+		return
+	}
+	s.taskNotifyMu.Lock()
+	defer s.taskNotifyMu.Unlock()
+	if s.taskNotifyCh == nil {
+		s.taskNotifyCh = make(chan struct{})
+		return
+	}
+	close(s.taskNotifyCh)
+	s.taskNotifyCh = make(chan struct{})
 }
 func (s *Service) getBackpressureConfig() (uint32, time.Duration, time.Duration) {
 	s.configMu.RLock()
@@ -206,8 +277,8 @@ func (s *Service) SubmitTask(ctx context.Context, req *logservepb.SubmitTaskRequ
 	if req.GetFunctionName() == "" {
 		return nil, errors.New("function_name is required")
 	}
-	if req.GetFunctionSource() == "" {
-		return nil, errors.New("function_source is required")
+	if req.GetFunctionSource() == "" && req.GetFunctionRef() == "" && req.GetFunctionHash() == "" {
+		return nil, errors.New("function_source or function_hash is required")
 	}
 
 	task, duplicate, err := s.enqueueTask(ctx, &logservepb.TaskSpec{
@@ -215,6 +286,8 @@ func (s *Service) SubmitTask(ctx context.Context, req *logservepb.SubmitTaskRequ
 		TaskName:       req.GetTaskName(),
 		FunctionName:   req.GetFunctionName(),
 		FunctionSource: req.GetFunctionSource(),
+		FunctionRef:    req.GetFunctionRef(),
+		FunctionHash:   req.GetFunctionHash(),
 		ArgsJson:       append([]byte(nil), req.GetArgsJson()...),
 		IdempotencyKey: req.GetIdempotencyKey(),
 	})
@@ -255,6 +328,9 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 	if def.ResultStepID == "" {
 		def.ResultStepID = def.Steps[len(def.Steps)-1].StepID
 	}
+	if err := s.normalizeWorkflowDefinition(ctx, &def); err != nil {
+		return nil, err
+	}
 	fingerprint, err := workflowFingerprint(req.GetWorkflowName(), def)
 	if err != nil {
 		return nil, err
@@ -276,7 +352,7 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 	if err != nil {
 		return nil, err
 	}
-	payload, _ := json.Marshal(workflow.EventPayload{
+	payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
 		WorkflowID:             workflowID,
 		WorkflowName:           def.WorkflowName,
 		DefinitionJSON:         definitionJSON,
@@ -364,6 +440,7 @@ func (s *Service) RegisterWorker(ctx context.Context, req *logservepb.RegisterWo
 	if err := s.metadataPersisted(); err != nil {
 		return nil, err
 	}
+	s.notifyTaskAvailable()
 	return &logservepb.RegisterWorkerResponse{Accepted: true}, nil
 }
 
@@ -376,6 +453,7 @@ func (s *Service) Heartbeat(ctx context.Context, req *logservepb.HeartbeatReques
 	if err := s.metadataPersisted(); err != nil {
 		return nil, err
 	}
+	s.notifyTaskAvailable()
 	return &logservepb.HeartbeatResponse{ServerTimeMs: time.Now().UnixMilli()}, nil
 }
 
@@ -383,19 +461,50 @@ func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest)
 	if req.GetWorkerId() == "" {
 		return nil, errors.New("worker_id is required")
 	}
-	if s.useSchedulerV2() {
-		return s.pollTaskIndexed(ctx, req)
+	maxTasks := pollBatchLimit(req.GetMaxTasks())
+	wait := pollWaitTimeout(req.GetWaitTimeoutMs())
+	signal := s.taskAvailableSignal()
+	resp, err := s.pollTaskNow(ctx, req.GetWorkerId(), maxTasks)
+	if err != nil || resp.GetHasTask() || wait <= 0 {
+		return resp, err
 	}
-	return s.pollTaskLegacy(ctx, req)
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-signal:
+		return s.pollTaskNow(ctx, req.GetWorkerId(), maxTasks)
+	case <-timer.C:
+		return &logservepb.PollTaskResponse{}, nil
+	}
 }
 
-func (s *Service) pollTaskLegacy(ctx context.Context, req *logservepb.PollTaskRequest) (*logservepb.PollTaskResponse, error) {
+func (s *Service) pollTaskNow(ctx context.Context, workerID string, maxTasks int) (*logservepb.PollTaskResponse, error) {
 	if err := s.redeliverExpiredTasks(ctx); err != nil {
 		return nil, err
 	}
+	if s.useSchedulerV2() {
+		tasks, err := s.pollTaskIndexed(workerID, maxTasks)
+		if err != nil {
+			return nil, err
+		}
+		return pollTaskResponse(tasks), nil
+	}
+	tasks, err := s.pollTaskLegacy(workerID, maxTasks)
+	if err != nil {
+		return nil, err
+	}
+	return pollTaskResponse(tasks), nil
+}
+
+func (s *Service) pollTaskLegacy(workerID string, maxTasks int) ([]*logservepb.TaskSpec, error) {
+	tasks := make([]*logservepb.TaskSpec, 0, maxTasks)
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
-	for i, taskID := range s.queue {
+	for i := 0; i < len(s.queue) && len(tasks) < maxTasks; {
+		taskID := s.queue[i]
 		s.specMu.RLock()
 		spec, ok := s.specs[taskID]
 		s.specMu.RUnlock()
@@ -408,57 +517,56 @@ func (s *Service) pollTaskLegacy(ctx context.Context, req *logservepb.PollTaskRe
 			s.queue = append(s.queue[:i], s.queue[i+1:]...)
 			continue
 		}
-		if !s.actorMailboxReady(before, req.GetWorkerId()) {
+		if !s.actorMailboxReady(before, workerID) {
+			i++
 			continue
 		}
-		if !s.canAssignTaskToWorker(taskID, spec, req.GetWorkerId()) {
+		if !s.canAssignTaskToWorker(taskID, spec, workerID) {
+			i++
 			continue
 		}
-		leased, err := s.meta.LeaseTask(taskID, req.GetWorkerId())
+		leased, err := s.meta.LeaseTask(taskID, workerID)
 		if err != nil {
 			return nil, err
 		}
 		if before.Status == logservepb.TaskStatus_TASK_STATUS_QUEUED {
-			s.meta.IncrementWorkerLoad(req.GetWorkerId())
+			s.meta.IncrementWorkerLoad(workerID)
 		}
 		s.queue = append(s.queue[:i], s.queue[i+1:]...)
-		leasedSpec := s.leasedTaskSpec(spec, leased)
-		return &logservepb.PollTaskResponse{HasTask: true, Task: leasedSpec}, nil
+		tasks = append(tasks, s.leasedTaskSpec(spec, leased))
 	}
-	return &logservepb.PollTaskResponse{HasTask: false}, nil
+	return tasks, nil
 }
 
-func (s *Service) pollTaskIndexed(ctx context.Context, req *logservepb.PollTaskRequest) (*logservepb.PollTaskResponse, error) {
-	if err := s.redeliverExpiredTasks(ctx); err != nil {
-		return nil, err
-	}
-	workerID := req.GetWorkerId()
+func (s *Service) pollTaskIndexed(workerID string, maxTasks int) ([]*logservepb.TaskSpec, error) {
 	s.syncSchedulerWorkers()
-	snapshot := s.schedulerSnapshot(workerID)
-	check := func(meta SchedMeta) schedulerDecision {
-		spec := s.specForTask(meta.TaskID)
-		if spec == nil {
-			return schedulerDrop
+	tasks := make([]*logservepb.TaskSpec, 0, maxTasks)
+	_, redeliveryTimeout, _ := s.getBackpressureConfig()
+	for len(tasks) < maxTasks {
+		snapshot := s.schedulerSnapshot(workerID)
+		check := func(meta SchedMeta) schedulerDecision {
+			spec := s.specForTask(meta.TaskID)
+			if spec == nil {
+				return schedulerDrop
+			}
+			task, ok := s.meta.GetTask(meta.TaskID)
+			if !ok || isTerminalTaskStatus(task.Status) {
+				return schedulerDrop
+			}
+			if task.Status != logservepb.TaskStatus_TASK_STATUS_QUEUED {
+				return schedulerDrop
+			}
+			if !s.actorMailboxReady(task, workerID) {
+				return schedulerSkip
+			}
+			if !s.canAssignTaskToWorker(meta.TaskID, spec, workerID) {
+				return schedulerSkip
+			}
+			return schedulerAssign
 		}
-		task, ok := s.meta.GetTask(meta.TaskID)
-		if !ok || isTerminalTaskStatus(task.Status) {
-			return schedulerDrop
-		}
-		if task.Status != logservepb.TaskStatus_TASK_STATUS_QUEUED {
-			return schedulerDrop
-		}
-		if !s.actorMailboxReady(task, workerID) {
-			return schedulerSkip
-		}
-		if !s.canAssignTaskToWorker(meta.TaskID, spec, workerID) {
-			return schedulerSkip
-		}
-		return schedulerAssign
-	}
-	for {
 		meta, ok := s.scheduler.Assign(snapshot, time.Now().UnixMilli(), check)
 		if !ok {
-			return &logservepb.PollTaskResponse{HasTask: false}, nil
+			break
 		}
 		spec := s.specForTask(meta.TaskID)
 		if spec == nil {
@@ -478,11 +586,10 @@ func (s *Service) pollTaskIndexed(ctx context.Context, req *logservepb.PollTaskR
 			s.meta.IncrementWorkerLoad(workerID)
 			s.updateSchedulerWorker(workerID)
 		}
-		_, redeliveryTimeout, _ := s.getBackpressureConfig()
 		s.scheduler.TrackRunning(leased.TaskID, schedulerLeaseDeadlineMs(leased, redeliveryTimeout), leased.TaskLeaseEpoch)
-		leasedSpec := s.leasedTaskSpec(spec, leased)
-		return &logservepb.PollTaskResponse{HasTask: true, Task: leasedSpec}, nil
+		tasks = append(tasks, s.leasedTaskSpec(spec, leased))
 	}
+	return tasks, nil
 }
 
 func (s *Service) actorMailboxReady(task metadata.Task, workerID string) bool {
@@ -565,6 +672,7 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 		}
 		s.completeSchedulerRunning(req.GetTaskId())
 		s.updateSchedulerWorker(req.GetWorkerId())
+		s.notifyTaskAvailable()
 		return &logservepb.CompleteTaskResponse{Accepted: true}, nil
 	}
 	if err := s.appendTaskTerminal(ctx, validated, req.GetStatus(), req.GetResultJson(), req.GetError()); err != nil {
@@ -596,8 +704,39 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 			}
 		}
 	}
+	s.notifyTaskAvailable()
 	return &logservepb.CompleteTaskResponse{Accepted: true}, nil
 }
+
+func (s *Service) CompleteTasks(ctx context.Context, req *logservepb.CompleteTaskBatchRequest) (*logservepb.CompleteTaskBatchResponse, error) {
+	resp := &logservepb.CompleteTaskBatchResponse{Accepted: true}
+	if req == nil {
+		return resp, nil
+	}
+	resp.Results = make([]*logservepb.CompleteTaskBatchResult, 0, len(req.GetTasks()))
+	for _, taskReq := range req.GetTasks() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result := &logservepb.CompleteTaskBatchResult{}
+		if taskReq == nil {
+			result.Error = "completion request is nil"
+			resp.Accepted = false
+			resp.Results = append(resp.Results, result)
+			continue
+		}
+		result.TaskId = taskReq.GetTaskId()
+		if _, err := s.CompleteTask(ctx, taskReq); err != nil {
+			result.Error = err.Error()
+			resp.Accepted = false
+		} else {
+			result.Accepted = true
+		}
+		resp.Results = append(resp.Results, result)
+	}
+	return resp, nil
+}
+
 func (s *Service) appendTaskStarted(ctx context.Context, task metadata.Task, workerID string) error {
 	payload, _ := json.Marshal(map[string]any{
 		"task_id":          task.TaskID,
@@ -656,6 +795,9 @@ func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (m
 func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.TaskSpec, mutate func(*metadata.Task)) (metadata.Task, bool, error) {
 	if spec.GetTaskId() == "" {
 		spec.TaskId = newTaskID()
+	}
+	if err := s.normalizeTaskFunction(ctx, spec); err != nil {
+		return metadata.Task{}, false, err
 	}
 	fingerprint, err := taskSpecFingerprint(spec)
 	if err != nil {
@@ -744,17 +886,48 @@ func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.
 		s.queue = append(s.queue, task.TaskID)
 		s.queueMu.Unlock()
 	}
+	s.notifyTaskAvailable()
 	return task, false, nil
 }
 
 func marshalTaskSubmittedPayload(spec *logservepb.TaskSpec) ([]byte, error) {
-	specJSON, err := protojson.Marshal(cloneSpec(spec))
+	specData, err := proto.Marshal(cloneSpec(spec))
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(taskSubmittedPayload{TaskSpec: specJSON})
+	return eventcodec.Marshal(eventcodec.KindTaskSubmitted, map[string]any{"task_spec": specData})
 }
 
+func unmarshalTaskSubmittedSpec(data []byte) (*logservepb.TaskSpec, error) {
+	var fields map[string]any
+	encoded, err := eventcodec.Unmarshal(eventcodec.KindTaskSubmitted, data, &fields)
+	if err != nil {
+		return nil, err
+	}
+	decoded := &logservepb.TaskSpec{}
+	if encoded {
+		specData := eventcodec.BytesValue(fields["task_spec"])
+		if len(specData) == 0 {
+			return decoded, nil
+		}
+		if err := proto.Unmarshal(specData, decoded); err != nil {
+			return nil, err
+		}
+		return decoded, nil
+	}
+
+	var payload taskSubmittedPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, err
+	}
+	if len(payload.TaskSpec) == 0 {
+		return decoded, nil
+	}
+	if err := protojson.Unmarshal(payload.TaskSpec, decoded); err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}
 func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) error {
 	s.workflowMu.Lock()
 	defer s.workflowMu.Unlock()
@@ -776,7 +949,7 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			continue
 		}
 
-		argsJSON, inputHash, err := workflow.ResolveArgs(stepDef, state, s)
+		argsJSON, inputHash, err := workflow.ResolveCachedArgs(stepDef, step, state, s)
 		if err != nil {
 			return err
 		}
@@ -788,6 +961,8 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			TaskName:        stepDef.TaskName,
 			FunctionName:    stepDef.FunctionName,
 			FunctionSource:  stepDef.FunctionSource,
+			FunctionRef:     stepDef.FunctionRef,
+			FunctionHash:    stepDef.FunctionHash,
 			ArgsJson:        argsJSON,
 			IdempotencyKey:  taskIdem,
 			WorkflowId:      workflowID,
@@ -803,7 +978,7 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 		if err != nil {
 			return err
 		}
-		payload, _ := json.Marshal(workflow.EventPayload{
+		payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
 			WorkflowID:  workflowID,
 			StepID:      stepDef.StepID,
 			TaskID:      task.TaskID,
@@ -855,7 +1030,7 @@ func (s *Service) markWorkflowStepStarted(ctx context.Context, task metadata.Tas
 		return nil
 	}
 	now := workflow.NowMs()
-	payload, _ := json.Marshal(workflow.EventPayload{
+	payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
 		WorkflowID:  task.WorkflowID,
 		StepID:      task.StepID,
 		TaskID:      task.TaskID,
@@ -907,7 +1082,7 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 		if err != nil {
 			return false, err
 		}
-		payload, _ := json.Marshal(workflow.EventPayload{
+		payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
 			WorkflowID:  task.WorkflowID,
 			StepID:      task.StepID,
 			TaskID:      task.TaskID,
@@ -953,7 +1128,7 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 		return true, nil
 	}
 
-	payload, _ := json.Marshal(workflow.EventPayload{
+	payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
 		WorkflowID:  task.WorkflowID,
 		StepID:      task.StepID,
 		TaskID:      task.TaskID,
@@ -1020,7 +1195,7 @@ func (s *Service) completeWorkflow(ctx context.Context, state workflow.State) er
 	}
 	now := workflow.NowMs()
 	latencyMs := now - state.CreatedAtMs
-	payload, _ := json.Marshal(workflow.EventPayload{
+	payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
 		WorkflowID:  state.WorkflowID,
 		ResultJSON:  inline,
 		ResultRef:   ref,
@@ -1054,7 +1229,7 @@ func (s *Service) completeWorkflow(ctx context.Context, state workflow.State) er
 
 func (s *Service) failWorkflow(ctx context.Context, state workflow.State, taskErr string) error {
 	now := workflow.NowMs()
-	payload, _ := json.Marshal(workflow.EventPayload{
+	payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
 		WorkflowID:  state.WorkflowID,
 		Error:       taskErr,
 		TimestampMs: now,
@@ -1078,7 +1253,7 @@ func (s *Service) failWorkflow(ctx context.Context, state workflow.State, taskEr
 
 func (s *Service) materializeResult(ctx context.Context, namespace string, resultJSON []byte) (json.RawMessage, string, error) {
 	if len(resultJSON) > s.resultInlineThreshold && s.resultStore != nil {
-		ref, err := s.resultStore.Put(ctx, namespace, resultJSON)
+		ref, err := objectstore.PutBytes(ctx, s.resultStore, namespace, resultJSON)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1091,7 +1266,7 @@ func (s *Service) LoadResult(ref string) ([]byte, error) {
 	if s.resultStore == nil {
 		return nil, errors.New("result store is not configured")
 	}
-	return s.resultStore.Get(context.Background(), ref)
+	return objectstore.GetBytes(context.Background(), s.resultStore, ref, -1)
 }
 
 func workflowDone(state workflow.State) bool {
@@ -1161,6 +1336,8 @@ func cloneSpec(spec *logservepb.TaskSpec) *logservepb.TaskSpec {
 		TaskName:          spec.GetTaskName(),
 		FunctionName:      spec.GetFunctionName(),
 		FunctionSource:    spec.GetFunctionSource(),
+		FunctionRef:       spec.GetFunctionRef(),
+		FunctionHash:      spec.GetFunctionHash(),
 		ArgsJson:          append([]byte(nil), spec.GetArgsJson()...),
 		IdempotencyKey:    spec.GetIdempotencyKey(),
 		WorkflowId:        spec.GetWorkflowId(),

@@ -19,7 +19,7 @@ func taskSpecFingerprint(spec *logservepb.TaskSpec) (string, error) {
 	return stableFingerprint(map[string]any{
 		"task_name":          spec.GetTaskName(),
 		"function_name":      spec.GetFunctionName(),
-		"function_source":    spec.GetFunctionSource(),
+		"function_hash":      taskFunctionIdentity(spec),
 		"args_json":          args,
 		"workflow_id":        spec.GetWorkflowId(),
 		"step_id":            spec.GetStepId(),

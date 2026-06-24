@@ -2,10 +2,9 @@ package control
 
 import (
 	"encoding/json"
-
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/logrecord"
 	"github.com/logserve/logserve/internal/metadata"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 type taskReplayState struct {
@@ -18,6 +17,17 @@ type taskReplayState struct {
 }
 
 func replayTaskMetadataEach(iterate func(func(*logservepb.LogRecord) error) error, initial *taskReplayState) (*taskReplayState, error) {
+	if iterate == nil {
+		return replayTaskMetadataRawEach(nil, initial)
+	}
+	return replayTaskMetadataRawEach(func(emit func(logrecord.RawRecord) error) error {
+		return iterate(func(rec *logservepb.LogRecord) error {
+			return emit(logrecord.FromProto(rec))
+		})
+	}, initial)
+}
+
+func replayTaskMetadataRawEach(iterate func(func(logrecord.RawRecord) error) error, initial *taskReplayState) (*taskReplayState, error) {
 	state := &taskReplayState{status: logservepb.TaskStatus_TASK_STATUS_QUEUED}
 	if initial != nil {
 		clone := *initial
@@ -28,14 +38,13 @@ func replayTaskMetadataEach(iterate func(func(*logservepb.LogRecord) error) erro
 	if iterate == nil {
 		return state, nil
 	}
-	if err := iterate(func(rec *logservepb.LogRecord) error {
-		return state.apply(rec)
+	if err := iterate(func(rec logrecord.RawRecord) error {
+		return state.applyRaw(rec)
 	}); err != nil {
 		return nil, err
 	}
 	return state, nil
 }
-
 func taskReplayStateFromCheckpoint(task metadata.Task, spec *logservepb.TaskSpec) *taskReplayState {
 	if task.Status == logservepb.TaskStatus_TASK_STATUS_UNSPECIFIED {
 		task.Status = logservepb.TaskStatus_TASK_STATUS_QUEUED
@@ -50,18 +59,18 @@ func taskReplayStateFromCheckpoint(task metadata.Task, spec *logservepb.TaskSpec
 }
 
 func (s *taskReplayState) apply(rec *logservepb.LogRecord) error {
-	switch rec.GetEventType() {
+	return s.applyRaw(logrecord.FromProto(rec))
+}
+
+func (s *taskReplayState) applyRaw(rec logrecord.RawRecord) error {
+	switch rec.EventType {
 	case "TaskSubmitted":
-		var payload taskSubmittedPayload
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		decoded, err := unmarshalTaskSubmittedSpec(rec.Payload)
+		if err != nil {
 			return err
 		}
-		if len(payload.TaskSpec) == 0 {
+		if decoded.GetTaskId() == "" {
 			return nil
-		}
-		decoded := &logservepb.TaskSpec{}
-		if err := protojson.Unmarshal(payload.TaskSpec, decoded); err != nil {
-			return err
 		}
 		fingerprint, err := taskSpecFingerprint(decoded)
 		if err != nil {
@@ -92,7 +101,7 @@ func (s *taskReplayState) apply(rec *logservepb.LogRecord) error {
 		if isTerminalTaskStatus(s.status) {
 			return nil
 		}
-		payload := decodeTaskLifecyclePayload(rec.GetPayload())
+		payload := decodeTaskLifecyclePayload(rec.Payload)
 		if payload.TaskLeaseEpoch == 0 {
 			if s.leaseEpoch == 0 && s.redeliveredLeaseEpoch == 0 {
 				s.status = logservepb.TaskStatus_TASK_STATUS_RUNNING
@@ -115,7 +124,7 @@ func (s *taskReplayState) apply(rec *logservepb.LogRecord) error {
 		if isTerminalTaskStatus(s.status) {
 			return nil
 		}
-		payload := decodeTaskLifecyclePayload(rec.GetPayload())
+		payload := decodeTaskLifecyclePayload(rec.Payload)
 		if payload.TaskLeaseEpoch > s.redeliveredLeaseEpoch {
 			s.redeliveredLeaseEpoch = payload.TaskLeaseEpoch
 		}
@@ -125,8 +134,8 @@ func (s *taskReplayState) apply(rec *logservepb.LogRecord) error {
 			s.task.WorkerID = ""
 		}
 	case "TaskCompleted":
-		if s.terminalEventApplies(rec.GetPayload()) {
-			payload := decodeTaskLifecyclePayload(rec.GetPayload())
+		if s.terminalEventApplies(rec.Payload) {
+			payload := decodeTaskLifecyclePayload(rec.Payload)
 			s.status = logservepb.TaskStatus_TASK_STATUS_SUCCEEDED
 			s.task.Status = s.status
 			s.task.WorkerID = payload.WorkerID
@@ -134,8 +143,8 @@ func (s *taskReplayState) apply(rec *logservepb.LogRecord) error {
 			s.task.Error = ""
 		}
 	case "TaskFailed":
-		if s.terminalEventApplies(rec.GetPayload()) {
-			payload := decodeTaskLifecyclePayload(rec.GetPayload())
+		if s.terminalEventApplies(rec.Payload) {
+			payload := decodeTaskLifecyclePayload(rec.Payload)
 			s.status = logservepb.TaskStatus_TASK_STATUS_FAILED
 			s.task.Status = s.status
 			s.task.WorkerID = payload.WorkerID
@@ -145,7 +154,6 @@ func (s *taskReplayState) apply(rec *logservepb.LogRecord) error {
 	}
 	return nil
 }
-
 func (s *taskReplayState) terminalEventApplies(payload []byte) bool {
 	return taskTerminalEventApplies(s.status, s.leaseEpoch, s.redeliveredLeaseEpoch, payload)
 }

@@ -3,10 +3,13 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
 )
@@ -83,6 +86,251 @@ func TestModelCheckpointCacheEvictsLRUWhenCapacityExceeded(t *testing.T) {
 	}
 }
 
+func TestModelCheckpointCacheAccessPromotesLRU(t *testing.T) {
+	sourceDir := t.TempDir()
+	cacheDir := t.TempDir()
+	writeCheckpoint(t, sourceDir, "model-A", "v1", bytes.Repeat([]byte("a"), 8))
+	writeCheckpoint(t, sourceDir, "model-B", "v1", bytes.Repeat([]byte("b"), 8))
+	writeCheckpoint(t, sourceDir, "model-C", "v1", bytes.Repeat([]byte("c"), 8))
+
+	cache := newModelCache(Config{
+		ModelCheckpointSourceDir: sourceDir,
+		ModelCacheDir:            cacheDir,
+		ModelCacheCapacityBytes:  16,
+	})
+	if _, err := cache.ensureCheckpoint(context.Background(), "model-A", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.ensureCheckpoint(context.Background(), "model-B", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if cache.lru.Front().Value.(*cacheEntry).key != modelKey("model-B", "v1") {
+		t.Fatalf("front LRU entry = %s, want model-B:v1", cache.lru.Front().Value.(*cacheEntry).key)
+	}
+
+	hit, err := cache.ensureCheckpoint(context.Background(), "model-A", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hit.CacheHit {
+		t.Fatal("reloading model-A should be a cache hit")
+	}
+	if cache.lru.Front().Value.(*cacheEntry).key != modelKey("model-A", "v1") {
+		t.Fatalf("front LRU entry after access = %s, want model-A:v1", cache.lru.Front().Value.(*cacheEntry).key)
+	}
+
+	evict, err := cache.ensureCheckpoint(context.Background(), "model-C", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evict.EvictionCount != 1 {
+		t.Fatalf("eviction count = %d, want 1", evict.EvictionCount)
+	}
+	if !cache.has("model-A", "v1") {
+		t.Fatal("recently accessed model-A should remain cached")
+	}
+	if cache.has("model-B", "v1") {
+		t.Fatal("least recently used model-B should have been evicted")
+	}
+}
+
+func TestModelCheckpointCacheUsesO1LRUIndex(t *testing.T) {
+	cache := newModelCache(Config{ModelCacheDir: t.TempDir(), ModelCacheCapacityBytes: 1024})
+	if cache.lru == nil {
+		t.Fatal("model cache LRU list is nil")
+	}
+	if cache.entries == nil {
+		t.Fatal("model cache entries map is nil")
+	}
+	if cache.inflight == nil {
+		t.Fatal("model cache inflight map is nil")
+	}
+}
+
+func TestModelCheckpointCacheAllowsDifferentModelsToLoadConcurrently(t *testing.T) {
+	sourceDir := t.TempDir()
+	cacheDir := t.TempDir()
+	writeCheckpoint(t, sourceDir, "model-A", "v1", bytes.Repeat([]byte("a"), 8))
+	writeCheckpoint(t, sourceDir, "model-B", "v1", bytes.Repeat([]byte("b"), 8))
+
+	cache := newModelCache(Config{
+		ModelCheckpointSourceDir: sourceDir,
+		ModelCacheDir:            cacheDir,
+		ModelCacheCapacityBytes:  32,
+	})
+
+	originalCopy := copyCheckpointFunc
+	originalRead := readCheckpointFunc
+	copyStarted := make(chan string, 2)
+	releaseCopies := make(chan struct{})
+	var activeCopies atomic.Int32
+	copyCheckpointFunc = func(ctx context.Context, sourcePath, targetPath string) (int64, error) {
+		activeCopies.Add(1)
+		copyStarted <- filepath.Base(targetPath)
+		select {
+		case <-releaseCopies:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			return 0, err
+		}
+		if err := os.WriteFile(targetPath, []byte(filepath.Base(sourcePath)), 0o644); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	readCheckpointFunc = func(context.Context, string) (int64, error) {
+		return 1, nil
+	}
+	defer func() {
+		copyCheckpointFunc = originalCopy
+		readCheckpointFunc = originalRead
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, name := range []string{"model-A", "model-B"} {
+		name := name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := cache.ensureCheckpoint(ctx, name, "v1")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if result.CacheHit {
+				errs <- errUnexpectedCacheHit(name)
+			}
+		}()
+	}
+
+	started := map[string]bool{}
+	timeout := time.After(500 * time.Millisecond)
+	for len(started) < 2 {
+		select {
+		case checkpoint := <-copyStarted:
+			started[checkpoint] = true
+		case <-timeout:
+			close(releaseCopies)
+			wg.Wait()
+			t.Fatalf("only %d checkpoint copy started with %d active copies; different model loads should not wait on one global lock", len(started), activeCopies.Load())
+		}
+	}
+	close(releaseCopies)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+func TestModelCheckpointCacheSnapshotDoesNotWaitForColdLoadIO(t *testing.T) {
+	sourceDir := t.TempDir()
+	cacheDir := t.TempDir()
+	writeCheckpoint(t, sourceDir, "model-A", "v1", bytes.Repeat([]byte("a"), 8))
+
+	cache := newModelCache(Config{
+		ModelCheckpointSourceDir: sourceDir,
+		ModelCacheDir:            cacheDir,
+		ModelCacheCapacityBytes:  32,
+		CachedModels:             []string{"prewarmed:v1"},
+	})
+
+	originalCopy := copyCheckpointFunc
+	originalRead := readCheckpointFunc
+	copyStarted := make(chan struct{})
+	releaseCopy := make(chan struct{})
+	copyCheckpointFunc = func(ctx context.Context, sourcePath, targetPath string) (int64, error) {
+		close(copyStarted)
+		select {
+		case <-releaseCopy:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			return 0, err
+		}
+		if err := os.WriteFile(targetPath, []byte("checkpoint"), 0o644); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	readCheckpointFunc = func(context.Context, string) (int64, error) {
+		return 1, nil
+	}
+	defer func() {
+		copyCheckpointFunc = originalCopy
+		readCheckpointFunc = originalRead
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	loadDone := make(chan error, 1)
+	go func() {
+		_, err := cache.ensureCheckpoint(ctx, "model-A", "v1")
+		loadDone <- err
+	}()
+
+	select {
+	case <-copyStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("checkpoint copy did not start")
+	}
+
+	snapshotDone := make(chan []*logservepb.ModelCacheEntry, 1)
+	go func() {
+		snapshotDone <- cache.snapshotEntries()
+	}()
+	select {
+	case entries := <-snapshotDone:
+		if !cacheEntriesContain(entries, "prewarmed", "v1") {
+			t.Fatalf("snapshot entries = %v, want prewarmed:v1 while checkpoint copy is blocked", entries)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("snapshotEntries waited for cold-load I/O")
+	}
+
+	close(releaseCopy)
+	if err := <-loadDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteCheckpointManifestRewritesThroughTempFile(t *testing.T) {
+	dir := t.TempDir()
+	checkpointPath := filepath.Join(dir, "model.checkpoint")
+	if err := os.WriteFile(checkpointPath, []byte("checkpoint"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	firstAccess := time.UnixMilli(1000)
+	if err := writeCheckpointManifest(checkpointPath, "model-A", "v1", 8, firstAccess); err != nil {
+		t.Fatal(err)
+	}
+	secondAccess := time.UnixMilli(2000)
+	if err := writeCheckpointManifest(checkpointPath, "model-A", "v1", 9, secondAccess); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(checkpointManifestPath(checkpointPath) + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("manifest temp file still exists or stat failed with unexpected error: %v", err)
+	}
+
+	data, err := os.ReadFile(checkpointManifestPath(checkpointPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest modelCacheManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SizeBytes != 9 || manifest.LastAccessMs != secondAccess.UnixMilli() {
+		t.Fatalf("manifest = %+v, want rewritten size/access", manifest)
+	}
+}
 func TestModelCheckpointCacheReportsExistingCheckpointOnStartup(t *testing.T) {
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
@@ -102,8 +350,8 @@ func TestModelCheckpointCacheReportsExistingCheckpointOnStartup(t *testing.T) {
 		ModelCacheDir:            cacheDir,
 		ModelCacheCapacityBytes:  1024,
 	})
-	if !cacheEntriesContain(restarted.entries(), "model-A", "v1") {
-		t.Fatalf("restarted cache entries = %v, want model-A:v1", restarted.entries())
+	if !cacheEntriesContain(restarted.snapshotEntries(), "model-A", "v1") {
+		t.Fatalf("restarted cache entries = %v, want model-A:v1", restarted.snapshotEntries())
 	}
 }
 
@@ -184,4 +432,16 @@ func cacheEntriesContain(entries []*logservepb.ModelCacheEntry, name, version st
 		}
 	}
 	return false
+}
+
+func errUnexpectedCacheHit(name string) error {
+	return &unexpectedCacheHitError{name: name}
+}
+
+type unexpectedCacheHitError struct {
+	name string
+}
+
+func (e *unexpectedCacheHitError) Error() string {
+	return e.name + " unexpectedly reported a cache hit"
 }

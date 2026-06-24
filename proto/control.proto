@@ -77,6 +77,8 @@ message TaskSpec {
   uint32 llm_max_tokens = 21;
   int64 timeout_ms = 22;
   uint64 task_lease_epoch = 23;
+  string function_ref = 24;
+  string function_hash = 25;
 }
 
 message SubmitTaskRequest {
@@ -85,6 +87,8 @@ message SubmitTaskRequest {
   string function_source = 3;
   bytes args_json = 4;
   string idempotency_key = 5;
+  string function_ref = 6;
+  string function_hash = 7;
 }
 
 message SubmitTaskResponse {
@@ -129,11 +133,14 @@ message HeartbeatResponse {
 
 message PollTaskRequest {
   string worker_id = 1;
+  uint32 max_tasks = 2;
+  int64 wait_timeout_ms = 3;
 }
 
 message PollTaskResponse {
   bool has_task = 1;
   TaskSpec task = 2;
+  repeated TaskSpec tasks = 3;
 }
 
 message StartTaskRequest {
@@ -159,6 +166,21 @@ message CompleteTaskRequest {
 
 message CompleteTaskResponse {
   bool accepted = 1;
+}
+
+message CompleteTaskBatchRequest {
+  repeated CompleteTaskRequest tasks = 1;
+}
+
+message CompleteTaskBatchResult {
+  string task_id = 1;
+  bool accepted = 2;
+  string error = 3;
+}
+
+message CompleteTaskBatchResponse {
+  bool accepted = 1;
+  repeated CompleteTaskBatchResult results = 2;
 }
 
 message WorkflowStepState {
@@ -439,4 +461,5 @@ service ControlService {
   rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
   rpc StartTask(StartTaskRequest) returns (StartTaskResponse);
   rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
+  rpc CompleteTasks(CompleteTaskBatchRequest) returns (CompleteTaskBatchResponse);
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	actorpkg "github.com/logserve/logserve/internal/actor"
 )
 
 func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
@@ -211,11 +212,8 @@ func assertActorCommandSubmittedBeforeApplied(t *testing.T, records []*logservep
 		if rec.GetEventType() != "ActorCommandSubmitted" && rec.GetEventType() != "ActorCommandApplied" {
 			continue
 		}
-		var payload struct {
-			CommandSeq uint64 `json:"command_seq"`
-			CallID     string `json:"call_id"`
-		}
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		var payload actorpkg.EventPayload
+		if err := actorpkg.UnmarshalEventPayload(rec.GetPayload(), &payload); err != nil {
 			t.Fatal(err)
 		}
 		if payload.CommandSeq == 0 {

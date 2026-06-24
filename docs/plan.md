@@ -940,6 +940,12 @@ worker 使用固定 poll interval。空闲时会空轮询；有任务时也可�
 4. 再做 long-poll，使用 condition variable 或 channel 通知新任务。
 5. 最后评估 server-streaming。
 
+### 当前落地状态
+
+已实现 unary gRPC 路径上的 `PollTask(max_tasks, wait_timeout_ms)`、批量 `tasks` 响应、`CompleteTasks` 批量完成、worker 按本地空闲容量批量拉取、空闲 long-poll 等待任务通知，以及独立 heartbeat ticker。
+
+server-streaming 暂不暴露为正式 `TaskStream` RPC。当前 batch + long-poll 已经去掉固定 tick 的主要空转和调度延迟；直接推 streaming 还需要额外定义流控、worker 断线重连、任务 lease 回收、per-worker backpressure 和观测指标。下一步只有在 unary batch 路径的 RPC/task 仍明显偏高，或需要 control 主动按 worker channel 推送时，再把 `TaskStream` 作为新的协议面加入。
+
 ### 验收指标
 
 1. 低负载任务调度延迟下降。

@@ -17,12 +17,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/logserve/logserve/internal/logrecord"
 )
 
 const (
 	magic                              uint32 = 0x4c535647
-	version                            uint16 = 1
-	headerSize                                = 36
+	recordVersionV1                    uint16 = 1
+	recordVersionV2                    uint16 = 2
+	version                            uint16 = recordVersionV2
+	legacyHeaderSize                          = 36
+	headerSize                                = 40
 	indexMagic                         uint32 = 0x4c534958
 	indexVersion                       uint16 = 2
 	legacyIndexVersion                 uint16 = 1
@@ -35,12 +40,21 @@ const (
 	defaultFsyncInterval                      = 100 * time.Millisecond
 	defaultCompactionCopyLiveRatio            = 0.5
 	defaultCompactionMaxBytesPerSecond        = 16 << 20
+	rawReadBatchEntries                       = 1024
 	retentionFileName                         = "retention.json"
 )
 
 var errCorruptRecord = errors.New("corrupt log record")
 var errCorruptIndex = errors.New("corrupt index")
 var indexCRCTable = crc32.MakeTable(crc32.Castagnoli)
+var recordEncodeBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 64*1024)
+		return &buf
+	},
+}
+
+const maxPooledRecordEncodeBuffer = 4 << 20
 
 type FsyncPolicy string
 
@@ -58,6 +72,7 @@ type Options struct {
 	CompactionInterval               time.Duration
 	CompactionCopyLiveRatioThreshold float64
 	CompactionMaxBytesPerSecond      int64
+	ChecksumType                     ChecksumType
 }
 
 func DefaultOptions() Options {
@@ -68,6 +83,7 @@ func DefaultOptions() Options {
 		SegmentReaderCacheSize:           defaultSegmentReaderCacheSize,
 		CompactionCopyLiveRatioThreshold: defaultCompactionCopyLiveRatio,
 		CompactionMaxBytesPerSecond:      defaultCompactionMaxBytesPerSecond,
+		ChecksumType:                     ChecksumTypeCRC32C,
 	}
 }
 
@@ -98,6 +114,12 @@ func (opts Options) normalize() (Options, error) {
 	}
 	if opts.CompactionMaxBytesPerSecond == 0 {
 		opts.CompactionMaxBytesPerSecond = defaultCompactionMaxBytesPerSecond
+	}
+	if opts.ChecksumType == 0 {
+		opts.ChecksumType = ChecksumTypeCRC32C
+	}
+	if err := validateChecksumType(opts.ChecksumType); err != nil {
+		return Options{}, err
 	}
 	switch opts.FsyncPolicy {
 	case FsyncAlways, FsyncBatch, FsyncInterval:
@@ -238,11 +260,13 @@ func (s *Store) Append(req AppendRequest) (Record, bool, error) {
 		TimestampMs:    time.Now().UnixMilli(),
 	}
 
-	encoded, crc, err := encodeRecord(rec)
+	encoded, crc, err := encodeRecordPooled(rec, s.options.ChecksumType)
 	if err != nil {
 		return Record{}, false, err
 	}
+	defer putRecordEncodeBuffer(encoded)
 	rec.CRC32 = crc
+	rec.ChecksumType = s.options.ChecksumType
 	if err := s.ensureWritableSegmentLocked(int64(len(encoded))); err != nil {
 		return Record{}, false, err
 	}
@@ -346,6 +370,100 @@ func (s *Store) ReadEach(streamID string, fromSeq uint64, limit int, emit func(R
 		}
 	}
 	return nil
+}
+
+// ReadRawEach emits records using scratch-backed payload slices. The emitted payload is valid until emit returns.
+func (s *Store) ReadRawEach(streamID string, fromSeq uint64, limit int, emit func(logrecord.RawRecord) error) error {
+	if streamID == "" {
+		return errors.New("stream_id is required")
+	}
+	if emit == nil {
+		return errors.New("emit is required")
+	}
+	if fromSeq == 0 {
+		fromSeq = 1
+	}
+
+	nextSeq := fromSeq
+	remaining := limit
+	snapshotNextSeq := uint64(0)
+	snapshotInitialized := false
+	var scratch rawRecordReadScratch
+	var current *segmentReader
+	defer func() {
+		if current != nil {
+			s.releaseSegmentReader(current)
+		}
+	}()
+
+	for {
+		s.mu.Lock()
+		state := s.streams[streamID]
+		if state == nil || state.nextSeq == 0 {
+			s.mu.Unlock()
+			return nil
+		}
+		if !snapshotInitialized {
+			if state.trimBefore > nextSeq {
+				nextSeq = state.trimBefore
+			}
+			snapshotNextSeq = state.nextSeq
+			snapshotInitialized = true
+		}
+		if nextSeq >= snapshotNextSeq {
+			s.mu.Unlock()
+			return nil
+		}
+
+		entries := state.entries
+		start := sort.Search(len(entries), func(i int) bool {
+			return entries[i].Seq >= nextSeq
+		})
+		maxEnd := sort.Search(len(entries), func(i int) bool {
+			return entries[i].Seq >= snapshotNextSeq
+		})
+		batchSize := rawReadBatchEntries
+		if remaining > 0 && remaining < batchSize {
+			batchSize = remaining
+		}
+		end := min(start+batchSize, maxEnd)
+		var selected []streamIndexEntry
+		if start < end {
+			selected = append([]streamIndexEntry(nil), entries[start:end]...)
+		}
+		s.mu.Unlock()
+
+		if len(selected) == 0 {
+			return nil
+		}
+		for _, entry := range selected {
+			if current == nil || current.segmentID != entry.SegmentID {
+				if current != nil {
+					s.releaseSegmentReader(current)
+				}
+				reader, err := s.acquireSegmentReader(entry.SegmentID)
+				if err != nil {
+					current = nil
+					return err
+				}
+				current = reader
+			}
+			rec, err := readIndexedRawRecordFromFile(current.file, streamID, entry, &scratch)
+			if err != nil {
+				return err
+			}
+			if err := emit(rec); err != nil {
+				return err
+			}
+			nextSeq = entry.Seq + 1
+			if remaining > 0 {
+				remaining--
+				if remaining == 0 {
+					return nil
+				}
+			}
+		}
+	}
 }
 
 func (s *Store) Trim(streamID string, beforeSeq uint64) (TrimStats, error) {
@@ -1152,6 +1270,22 @@ func (s *Store) cachedSegmentReaderCount() int {
 	defer s.mu.Unlock()
 	return len(s.segmentReaders)
 }
+func readIndexedRawRecordFromFile(file *os.File, streamID string, entry streamIndexEntry, scratch *rawRecordReadScratch) (logrecord.RawRecord, error) {
+	const maxInt64 = uint64(1<<63 - 1)
+	if entry.Offset > maxInt64 {
+		return logrecord.RawRecord{}, errCorruptIndex
+	}
+	offset := int64(entry.Offset)
+	rec, _, nextOffset, err := readRawRecordAtWithScratch(file, offset, scratch)
+	if err != nil {
+		return logrecord.RawRecord{}, err
+	}
+	if rec.StreamID != streamID || rec.Seq != entry.Seq || nextOffset-offset != int64(entry.Length) {
+		return logrecord.RawRecord{}, errCorruptRecord
+	}
+	return rec, nil
+}
+
 func readIndexedRecordFromFile(file *os.File, streamID string, entry streamIndexEntry) (Record, error) {
 	const maxInt64 = uint64(1<<63 - 1)
 	if entry.Offset > maxInt64 {
@@ -1260,82 +1394,203 @@ func (s *Store) syncFilesLocked() error {
 	return err
 }
 
-func encodeRecord(rec Record) ([]byte, uint32, error) {
-	if len(rec.StreamID) > 0xffff {
-		return nil, 0, errors.New("stream_id too large")
+func encodeRecord(rec Record, typ ChecksumType) ([]byte, uint32, error) {
+	return encodeRecordWithBuffer(rec, typ, nil)
+}
+
+func encodeRecordPooled(rec Record, typ ChecksumType) ([]byte, uint32, error) {
+	if typ == 0 {
+		typ = ChecksumTypeCRC32C
 	}
-	if len(rec.EventType) > 0xffff {
-		return nil, 0, errors.New("event_type too large")
+	size, err := encodedRecordSize(rec, typ)
+	if err != nil {
+		return nil, 0, err
 	}
-	if len(rec.IdempotencyKey) > 0xffff {
-		return nil, 0, errors.New("idempotency_key too large")
+	buf := getRecordEncodeBuffer(size)
+	encoded, crc, err := encodeRecordWithBuffer(rec, typ, buf)
+	if err != nil {
+		putRecordEncodeBuffer(buf)
+		return nil, 0, err
+	}
+	return encoded, crc, nil
+}
+func encodeRecordWithBuffer(rec Record, typ ChecksumType, buf []byte) ([]byte, uint32, error) {
+	if typ == 0 {
+		typ = ChecksumTypeCRC32C
+	}
+	size, err := encodedRecordSize(rec, typ)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(buf) < size {
+		buf = make([]byte, size)
+	} else {
+		buf = buf[:size]
 	}
 
-	stream := []byte(rec.StreamID)
-	eventType := []byte(rec.EventType)
-	key := []byte(rec.IdempotencyKey)
-	bodyLen := len(stream) + len(eventType) + len(key) + len(rec.Payload)
-	buf := make([]byte, headerSize+bodyLen)
+	streamLen := len(rec.StreamID)
+	eventLen := len(rec.EventType)
+	keyLen := len(rec.IdempotencyKey)
 
 	binary.BigEndian.PutUint32(buf[0:4], magic)
 	binary.BigEndian.PutUint16(buf[4:6], version)
-	binary.BigEndian.PutUint16(buf[6:8], uint16(len(stream)))
-	binary.BigEndian.PutUint16(buf[8:10], uint16(len(eventType)))
-	binary.BigEndian.PutUint16(buf[10:12], uint16(len(key)))
+	binary.BigEndian.PutUint16(buf[6:8], uint16(streamLen))
+	binary.BigEndian.PutUint16(buf[8:10], uint16(eventLen))
+	binary.BigEndian.PutUint16(buf[10:12], uint16(keyLen))
 	binary.BigEndian.PutUint32(buf[12:16], uint32(len(rec.Payload)))
 	binary.BigEndian.PutUint64(buf[16:24], rec.Seq)
 	binary.BigEndian.PutUint64(buf[24:32], uint64(rec.TimestampMs))
+	binary.BigEndian.PutUint16(buf[36:38], uint16(typ))
 
 	pos := headerSize
-	pos += copy(buf[pos:], stream)
-	pos += copy(buf[pos:], eventType)
-	pos += copy(buf[pos:], key)
+	pos += copy(buf[pos:], rec.StreamID)
+	pos += copy(buf[pos:], rec.EventType)
+	pos += copy(buf[pos:], rec.IdempotencyKey)
 	copy(buf[pos:], rec.Payload)
 
-	crc := crc32.ChecksumIEEE(buf[headerSize:])
+	crc, err := checksum(buf[headerSize:], typ)
+	if err != nil {
+		return nil, 0, err
+	}
 	binary.BigEndian.PutUint32(buf[32:36], crc)
 	return buf, crc, nil
 }
 
-func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
-	header := make([]byte, headerSize)
-	n, err := file.ReadAt(header, offset)
-	if errors.Is(err, io.EOF) && n == 0 {
-		return Record{}, offset, io.EOF
+func encodedRecordSize(rec Record, typ ChecksumType) (int, error) {
+	if len(rec.StreamID) > 0xffff {
+		return 0, errors.New("stream_id too large")
 	}
-	if err != nil && !errors.Is(err, io.EOF) {
+	if len(rec.EventType) > 0xffff {
+		return 0, errors.New("event_type too large")
+	}
+	if len(rec.IdempotencyKey) > 0xffff {
+		return 0, errors.New("idempotency_key too large")
+	}
+	if typ == 0 {
+		typ = ChecksumTypeCRC32C
+	}
+	if err := validateChecksumType(typ); err != nil {
+		return 0, err
+	}
+	bodyLen := len(rec.StreamID) + len(rec.EventType) + len(rec.IdempotencyKey) + len(rec.Payload)
+	return headerSize + bodyLen, nil
+}
+
+func getRecordEncodeBuffer(size int) []byte {
+	if size > maxPooledRecordEncodeBuffer {
+		return make([]byte, size)
+	}
+	ptr := recordEncodeBufferPool.Get().(*[]byte)
+	buf := *ptr
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func putRecordEncodeBuffer(buf []byte) {
+	if cap(buf) == 0 || cap(buf) > maxPooledRecordEncodeBuffer {
+		return
+	}
+	buf = buf[:0]
+	recordEncodeBufferPool.Put(&buf)
+}
+
+type rawRecordReadScratch struct {
+	header [headerSize]byte
+	body   []byte
+}
+
+func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
+	var scratch rawRecordReadScratch
+	raw, checksumType, nextOffset, err := readRawRecordAtWithScratch(file, offset, &scratch)
+	if err != nil {
 		return Record{}, offset, err
 	}
-	if n != headerSize {
-		return Record{}, offset, errCorruptRecord
+	return Record{
+		StreamID:       raw.StreamID,
+		Seq:            raw.Seq,
+		EventType:      raw.EventType,
+		IdempotencyKey: raw.IdempotencyKey,
+		Payload:        append([]byte(nil), raw.Payload...),
+		TimestampMs:    raw.TimestampMs,
+		CRC32:          raw.CRC32,
+		ChecksumType:   checksumType,
+	}, nextOffset, nil
+}
+
+func readRawRecordAt(file *os.File, offset int64) (logrecord.RawRecord, ChecksumType, int64, error) {
+	return readRawRecordAtWithScratch(file, offset, nil)
+}
+
+func readRawRecordAtWithScratch(file *os.File, offset int64, scratch *rawRecordReadScratch) (logrecord.RawRecord, ChecksumType, int64, error) {
+	if scratch == nil {
+		scratch = &rawRecordReadScratch{}
+	}
+	baseHeader := scratch.header[:legacyHeaderSize]
+	n, err := file.ReadAt(baseHeader, offset)
+	if errors.Is(err, io.EOF) && n == 0 {
+		return logrecord.RawRecord{}, 0, offset, io.EOF
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return logrecord.RawRecord{}, 0, offset, err
+	}
+	if n != legacyHeaderSize {
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
 	}
 
-	if binary.BigEndian.Uint32(header[0:4]) != magic {
-		return Record{}, offset, errCorruptRecord
+	if binary.BigEndian.Uint32(baseHeader[0:4]) != magic {
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
 	}
-	if binary.BigEndian.Uint16(header[4:6]) != version {
-		return Record{}, offset, errCorruptRecord
+	recordVersion := binary.BigEndian.Uint16(baseHeader[4:6])
+	headerLen := legacyHeaderSize
+	checksumType := ChecksumTypeIEEE
+	switch recordVersion {
+	case recordVersionV1:
+	case recordVersionV2:
+		extension := scratch.header[legacyHeaderSize:headerSize]
+		n, err = file.ReadAt(extension, offset+legacyHeaderSize)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return logrecord.RawRecord{}, 0, offset, err
+		}
+		if n != len(extension) {
+			return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+		}
+		checksumType = ChecksumType(binary.BigEndian.Uint16(extension[0:2]))
+		if err := validateChecksumType(checksumType); err != nil {
+			return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+		}
+		headerLen = headerSize
+	default:
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
 	}
 
-	streamLen := int(binary.BigEndian.Uint16(header[6:8]))
-	eventLen := int(binary.BigEndian.Uint16(header[8:10]))
-	keyLen := int(binary.BigEndian.Uint16(header[10:12]))
-	payloadLen := int(binary.BigEndian.Uint32(header[12:16]))
-	seq := binary.BigEndian.Uint64(header[16:24])
-	timestampMs := int64(binary.BigEndian.Uint64(header[24:32]))
-	expectedCRC := binary.BigEndian.Uint32(header[32:36])
+	streamLen := int(binary.BigEndian.Uint16(baseHeader[6:8]))
+	eventLen := int(binary.BigEndian.Uint16(baseHeader[8:10]))
+	keyLen := int(binary.BigEndian.Uint16(baseHeader[10:12]))
+	payloadLen := int(binary.BigEndian.Uint32(baseHeader[12:16]))
+	seq := binary.BigEndian.Uint64(baseHeader[16:24])
+	timestampMs := int64(binary.BigEndian.Uint64(baseHeader[24:32]))
+	expectedCRC := binary.BigEndian.Uint32(baseHeader[32:36])
 
 	bodyLen := streamLen + eventLen + keyLen + payloadLen
-	body := make([]byte, bodyLen)
-	n, err = file.ReadAt(body, offset+headerSize)
+	if cap(scratch.body) < bodyLen {
+		scratch.body = make([]byte, bodyLen)
+	}
+	body := scratch.body[:bodyLen]
+	n, err = file.ReadAt(body, offset+int64(headerLen))
 	if err != nil && !errors.Is(err, io.EOF) {
-		return Record{}, offset, err
+		return logrecord.RawRecord{}, 0, offset, err
 	}
 	if n != bodyLen {
-		return Record{}, offset, errCorruptRecord
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
 	}
-	if crc32.ChecksumIEEE(body) != expectedCRC {
-		return Record{}, offset, errCorruptRecord
+	actualCRC, err := checksum(body, checksumType)
+	if err != nil {
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+	}
+	if actualCRC != expectedCRC {
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
 	}
 
 	pos := 0
@@ -1345,9 +1600,9 @@ func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
 	pos += eventLen
 	key := string(body[pos : pos+keyLen])
 	pos += keyLen
-	payload := append([]byte(nil), body[pos:pos+payloadLen]...)
+	payload := body[pos : pos+payloadLen]
 
-	return Record{
+	return logrecord.RawRecord{
 		StreamID:       streamID,
 		Seq:            seq,
 		EventType:      eventType,
@@ -1355,7 +1610,7 @@ func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
 		Payload:        payload,
 		TimestampMs:    timestampMs,
 		CRC32:          expectedCRC,
-	}, offset + int64(headerSize+bodyLen), nil
+	}, checksumType, offset + int64(headerLen+bodyLen), nil
 }
 
 func segmentPath(dir string, segmentID uint64, ext string) string {

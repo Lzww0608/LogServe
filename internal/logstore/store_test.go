@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/logrecord"
 	"google.golang.org/grpc"
 )
 
@@ -1088,4 +1089,297 @@ func globSegments(t *testing.T, dir, ext string) []string {
 		t.Fatal(err)
 	}
 	return paths
+}
+
+func TestRecordChecksumTypesRoundTrip(t *testing.T) {
+	cases := []ChecksumType{ChecksumTypeCRC32C, ChecksumTypeIEEE, ChecksumTypeXXH3, ChecksumTypeNone}
+	for _, typ := range cases {
+		t.Run(typ.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			opts := DefaultOptions()
+			opts.ChecksumType = typ
+			store, err := OpenWithOptions(dir, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, duplicate, err := store.Append(AppendRequest{
+				StreamID:       "task:checksum",
+				EventType:      "ChecksumEvent",
+				IdempotencyKey: "once",
+				Payload:        []byte("payload"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if duplicate {
+				t.Fatal("append reported duplicate")
+			}
+			if rec.ChecksumType != typ {
+				t.Fatalf("record checksum type = %s, want %s", rec.ChecksumType, typ)
+			}
+			if typ == ChecksumTypeNone && rec.CRC32 != 0 {
+				t.Fatalf("None checksum value = %d, want 0", rec.CRC32)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			data, err := os.ReadFile(filepath.Join(dir, "segment-00000001.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := binary.BigEndian.Uint16(data[4:6]); got != recordVersionV2 {
+				t.Fatalf("record version = %d, want %d", got, recordVersionV2)
+			}
+			if got := ChecksumType(binary.BigEndian.Uint16(data[36:38])); got != typ {
+				t.Fatalf("header checksum type = %s, want %s", got, typ)
+			}
+
+			recovered, err := Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recovered.Close()
+			records, err := recovered.Read("task:checksum", 1, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != 1 {
+				t.Fatalf("records = %d, want 1", len(records))
+			}
+			if records[0].ChecksumType != typ || !bytes.Equal(records[0].Payload, []byte("payload")) {
+				t.Fatalf("recovered record = %+v", records[0])
+			}
+		})
+	}
+}
+
+func TestReadLegacyIEEERecord(t *testing.T) {
+	dir := t.TempDir()
+	legacy := Record{
+		StreamID:       "task:legacy-record",
+		Seq:            1,
+		EventType:      "LegacyEvent",
+		IdempotencyKey: "legacy-key",
+		Payload:        []byte("legacy-payload"),
+		TimestampMs:    time.Now().UnixMilli(),
+	}
+	encoded, err := encodeLegacyRecordForTest(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "segment-00000001.log"), encoded, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	records, err := store.Read("task:legacy-record", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	if records[0].ChecksumType != ChecksumTypeIEEE {
+		t.Fatalf("legacy checksum type = %s, want IEEE", records[0].ChecksumType)
+	}
+	if !bytes.Equal(records[0].Payload, legacy.Payload) {
+		t.Fatalf("legacy payload = %q, want %q", string(records[0].Payload), string(legacy.Payload))
+	}
+}
+
+func TestRecordCorruptionRecovery(t *testing.T) {
+	cases := []struct {
+		name      string
+		corrupt   func(t *testing.T, path string)
+		wantCount int
+	}{
+		{
+			name: "header checksum type",
+			corrupt: func(t *testing.T, path string) {
+				mutateFileByte(t, path, 36, 0xff)
+			},
+			wantCount: 0,
+		},
+		{
+			name: "payload",
+			corrupt: func(t *testing.T, path string) {
+				file, err := os.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, secondOffset, err := readRecordAt(file, 0)
+				_ = file.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				mutateFileByte(t, path, secondOffset+headerSize+int64(len("task:corrupt"))+int64(len("CorruptEvent")), 0xff)
+			},
+			wantCount: 1,
+		},
+		{
+			name: "partial tail",
+			corrupt: func(t *testing.T, path string) {
+				file, err := os.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, secondOffset, err := readRecordAt(file, 0)
+				_ = file.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Truncate(path, secondOffset+int64(headerSize)+2); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantCount: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 2; i++ {
+				if _, _, err := store.Append(AppendRequest{
+					StreamID:  "task:corrupt",
+					EventType: "CorruptEvent",
+					Payload:   []byte(fmt.Sprintf("payload-%d", i)),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			logPath := filepath.Join(dir, "segment-00000001.log")
+			tc.corrupt(t, logPath)
+			recovered, err := Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recovered.Close()
+			records, err := recovered.Read("task:corrupt", 1, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != tc.wantCount {
+				t.Fatalf("records = %d, want %d", len(records), tc.wantCount)
+			}
+		})
+	}
+}
+
+func encodeLegacyRecordForTest(rec Record) ([]byte, error) {
+	stream := []byte(rec.StreamID)
+	eventType := []byte(rec.EventType)
+	key := []byte(rec.IdempotencyKey)
+	bodyLen := len(stream) + len(eventType) + len(key) + len(rec.Payload)
+	buf := make([]byte, legacyHeaderSize+bodyLen)
+	binary.BigEndian.PutUint32(buf[0:4], magic)
+	binary.BigEndian.PutUint16(buf[4:6], recordVersionV1)
+	binary.BigEndian.PutUint16(buf[6:8], uint16(len(stream)))
+	binary.BigEndian.PutUint16(buf[8:10], uint16(len(eventType)))
+	binary.BigEndian.PutUint16(buf[10:12], uint16(len(key)))
+	binary.BigEndian.PutUint32(buf[12:16], uint32(len(rec.Payload)))
+	binary.BigEndian.PutUint64(buf[16:24], rec.Seq)
+	binary.BigEndian.PutUint64(buf[24:32], uint64(rec.TimestampMs))
+	pos := legacyHeaderSize
+	pos += copy(buf[pos:], stream)
+	pos += copy(buf[pos:], eventType)
+	pos += copy(buf[pos:], key)
+	copy(buf[pos:], rec.Payload)
+	binary.BigEndian.PutUint32(buf[32:36], crc32.ChecksumIEEE(buf[legacyHeaderSize:]))
+	return buf, nil
+}
+
+func mutateFileByte(t *testing.T, path string, offset int64, xor byte) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	var b [1]byte
+	if _, err := file.ReadAt(b[:], offset); err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= xor
+	if _, err := file.WriteAt(b[:], offset); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadRawEachReturnsRawPayload(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	payload := []byte(`{"value":42}`)
+	if _, _, err := store.Append(AppendRequest{StreamID: "raw:stream", EventType: "RawEvent", Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	if err := store.ReadRawEach("raw:stream", 1, 0, func(rec logrecord.RawRecord) error {
+		if rec.EventType != "RawEvent" {
+			t.Fatalf("EventType = %q", rec.EventType)
+		}
+		got = append([]byte(nil), rec.Payload...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("raw payload = %q, want %q", got, payload)
+	}
+}
+
+func TestReadRawEachBatchesSnapshot(t *testing.T) {
+	opts := DefaultOptions()
+	opts.FsyncPolicy = FsyncBatch
+	store, err := OpenWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const streamID = "raw:batch"
+	total := rawReadBatchEntries + 7
+	for i := 0; i < total; i++ {
+		if _, _, err := store.Append(AppendRequest{
+			StreamID:  streamID,
+			EventType: "RawEvent",
+			Payload:   []byte{byte(i)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	count := 0
+	if err := store.ReadRawEach(streamID, 1, 0, func(rec logrecord.RawRecord) error {
+		wantSeq := uint64(count + 1)
+		if rec.Seq != wantSeq {
+			t.Fatalf("seq = %d, want %d", rec.Seq, wantSeq)
+		}
+		if len(rec.Payload) != 1 || rec.Payload[0] != byte(count) {
+			t.Fatalf("payload for seq %d = %v", rec.Seq, rec.Payload)
+		}
+		count++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != total {
+		t.Fatalf("records = %d, want %d", count, total)
+	}
 }

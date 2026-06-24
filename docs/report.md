@@ -310,9 +310,44 @@ Dashboard snapshot 包含：
 
 Dashboard 用来查看 materialized view 中的 workflow DAG、task 状态、actor 状态、worker 和 model cache。Compose 实验中 dashboard 至少观测到 3 个 worker，满足多 worker 模拟验收条件。
 
+### Ubuntu Project Acceptance（2026-06-24）
+
+2026-06-24 在 Ubuntu 服务器上执行的顶层验收已经通过：
+
+```text
+Run directory: /home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-20260624T025707Z
+Verdict: PASS
+Package: /home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-20260624T025707Z/ubuntu-project-acceptance-package.tar.gz
+```
+
+这次运行覆盖了 baseline Go/Python 测试、`go vet`、physical compaction 专项测试、logstore/control race 测试、Docker Compose 端到端实验、metadata checkpoint 验收和 PostgreSQL async materializer 验收。顶层 acceptance checks 全部为 `pass`，其中包括 `physical_compaction_tests`、`logstore_race_tests`、`compose_experiment_pass`、`checkpoint_acceptance_pass` 和 `postgres_async_acceptance_pass`。
+
+Compose 实验的关键结果如下：
+
+| 指标 | 结果 |
+|---|---:|
+| Workflow p95 / p99 latency | 924 ms / 924 ms |
+| Task throughput | 5.11 tasks/s |
+| Task p99 latency | 209 ms |
+| Actor full replay commands | 21 |
+| Actor snapshot replay commands | 1 |
+| Actor compactable log records / bytes | 45 / 18,382 |
+| LLM cold / warm total latency | 111 ms / 17 ms |
+| LLM cold / warm checkpoint fetch | 1 ms / 0 ms |
+| Dashboard workers | 3 |
+| Dashboard replay consistency | true |
+
+这组数值和预期一致。actor snapshot 后 replay work 从 21 条 command 降到 1 条，并且 dashboard 报告了 compactable records/bytes，说明 logical trim 后已有可供 physical compaction 处理的空间回收输入。physical compaction 的 Go 专项和 logstore race 测试也通过，证明 delete/copy/crash window 下没有破坏 replay 语义。
+
+metadata checkpoint 子验收在同一轮顶层运行中再次通过。workload 包含 120 个 task、12 个 workflow、12 个 actor、40 条 LLM stream 和 68 条 tail event；full replay 读取 614 条 records，checkpoint-plus-tail replay 读取 71 条，比例为 0.1156。一致性检查覆盖 156 个对象，结果为 `consistent=true`。这次嵌套运行中的 duration 从 6.463 ms 降到 5.506 ms，属于单机小样本观测；更稳的结论仍然是历史 records 读取量明显下降。
+
+PostgreSQL async materializer 子验收也通过。sync 与 async 的任务吞吐都为 5.0 tasks/s，task p99 从 209 ms 到 207 ms；PostgreSQL transaction rate 从 72.382 tx/s 降到 1.304 tx/s，row writes rate 从 100.519 rows/s 降到 16.570 rows/s。async run 的 `flush_errors=0`，dashboard 中观察到 `materializer_mode=async`，同时保留少量 pending deltas 和约 746 ms 的 eventual lag。这里应表述为写数据库压力显著下降且任务路径没有退化，不应表述为吞吐显著提升。
+
+本轮验收的边界不变：它验证的是单台 Ubuntu 服务器上的多进程、Docker Compose 和 mock LLM 机制正确性。它不能替代多节点部署、真实 GPU/vLLM 负载或大 checkpoint 冷启动曲线。
+
 ## 结论
 
-PostgreSQL async materializer 的单机 Compose 对比验收已经通过：内存状态和 shared log 仍是主路径，PostgreSQL 作为可重建 view，写入 QPS 明显下降；dashboard replay consistency 证明 workflow/actor view 与 shared-log replay 最终一致。metadata checkpoint bootstrap 验收也通过了，control restart 可以从 checkpoint + log tail 恢复 metadata view，并明显减少历史 records 读取。
+Ubuntu project acceptance 的完整包装器已经在 2026-06-24 通过，覆盖 baseline 测试、physical compaction、Compose 端到端实验、metadata checkpoint bootstrap 和 PostgreSQL async materializer。结果说明当前实现可以在单台 Ubuntu 服务器上稳定复现主要机制：shared log 仍是状态源，metadata 和 dashboard 是可重建 view；checkpoint + tail replay 能减少历史 records 读取；async materializer 能降低 PostgreSQL 写入压力；physical compaction 的 delete/copy/crash 路径没有破坏 log replay。
 
 当前 Ubuntu 单机实验的自动汇总结果为 `PASS`。这说明 LogServe 的核心机制能在可复现的单机多进程环境中稳定跑通：
 

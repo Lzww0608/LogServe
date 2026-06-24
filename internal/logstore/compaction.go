@@ -479,22 +479,25 @@ func (s *Store) writeCompactedSegmentLocked(ctx context.Context, plan *segmentCo
 			_ = newFile.Close()
 			return errCorruptRecord
 		}
-		encoded, _, err := encodeRecord(rec)
+		encoded, _, err := encodeRecordPooled(rec, rec.ChecksumType)
 		if err != nil {
 			_ = newFile.Close()
 			return err
 		}
+		encodedLen := len(encoded)
 		if _, err := newFile.Write(encoded); err != nil {
+			putRecordEncodeBuffer(encoded)
 			_ = newFile.Close()
 			return err
 		}
+		putRecordEncodeBuffer(encoded)
 		entry := item.entry
 		entry.SegmentID = plan.newSegmentID
 		entry.Offset = offset
-		entry.Length = uint32(len(encoded))
+		entry.Length = uint32(encodedLen)
 		newEntries = append(newEntries, recoveredIndexEntry{streamID: item.streamID, entry: entry})
-		offset += uint64(len(encoded))
-		if err := throttleCompactionWrite(ctx, int64(len(encoded)), opts.MaxBytesPerSecond); err != nil {
+		offset += uint64(encodedLen)
+		if err := throttleCompactionWrite(ctx, int64(encodedLen), opts.MaxBytesPerSecond); err != nil {
 			_ = newFile.Close()
 			return err
 		}

@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import inspect
 import json
 
@@ -30,12 +31,14 @@ class WorkflowTraceContext:
         encoded_kwargs, deps_k = _encode_refs(dict(kwargs))
         deps = sorted(set(deps_a + deps_k))
         original = inspect.unwrap(fn)
+        source = inspect.getsource(original)
         self.steps.append(
             {
                 "step_id": step_id,
                 "task_name": base,
                 "function_name": base,
-                "function_source": inspect.getsource(original),
+                "function_source": source,
+                "function_hash": _source_hash(source),
                 "args_json": {
                     "args": encoded_args,
                     "kwargs": encoded_kwargs,
@@ -155,6 +158,8 @@ def encode_json(value):
     return encoded
 
 
+def _source_hash(source):
+    return "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
 def _encode_refs(value):
     deps = []
     if isinstance(value, StepRef):

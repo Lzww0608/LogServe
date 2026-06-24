@@ -58,6 +58,8 @@ class GrpcControlTransport:
                 function_source=payload.get("function_source", ""),
                 args_json=args_json,
                 idempotency_key=payload.get("idempotency_key", ""),
+                function_ref=payload.get("function_ref", ""),
+                function_hash=payload.get("function_hash", ""),
             ),
             timeout=timeout,
         )

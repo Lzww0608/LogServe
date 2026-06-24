@@ -39,6 +39,7 @@ const (
 	ControlService_PollTask_FullMethodName             = "/logserve.v1.ControlService/PollTask"
 	ControlService_StartTask_FullMethodName            = "/logserve.v1.ControlService/StartTask"
 	ControlService_CompleteTask_FullMethodName         = "/logserve.v1.ControlService/CompleteTask"
+	ControlService_CompleteTasks_FullMethodName        = "/logserve.v1.ControlService/CompleteTasks"
 )
 
 // ControlServiceClient is the client API for ControlService service.
@@ -65,6 +66,7 @@ type ControlServiceClient interface {
 	PollTask(ctx context.Context, in *PollTaskRequest, opts ...grpc.CallOption) (*PollTaskResponse, error)
 	StartTask(ctx context.Context, in *StartTaskRequest, opts ...grpc.CallOption) (*StartTaskResponse, error)
 	CompleteTask(ctx context.Context, in *CompleteTaskRequest, opts ...grpc.CallOption) (*CompleteTaskResponse, error)
+	CompleteTasks(ctx context.Context, in *CompleteTaskBatchRequest, opts ...grpc.CallOption) (*CompleteTaskBatchResponse, error)
 }
 
 type controlServiceClient struct {
@@ -275,6 +277,16 @@ func (c *controlServiceClient) CompleteTask(ctx context.Context, in *CompleteTas
 	return out, nil
 }
 
+func (c *controlServiceClient) CompleteTasks(ctx context.Context, in *CompleteTaskBatchRequest, opts ...grpc.CallOption) (*CompleteTaskBatchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompleteTaskBatchResponse)
+	err := c.cc.Invoke(ctx, ControlService_CompleteTasks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServiceServer is the server API for ControlService service.
 // All implementations must embed UnimplementedControlServiceServer
 // for forward compatibility
@@ -299,6 +311,7 @@ type ControlServiceServer interface {
 	PollTask(context.Context, *PollTaskRequest) (*PollTaskResponse, error)
 	StartTask(context.Context, *StartTaskRequest) (*StartTaskResponse, error)
 	CompleteTask(context.Context, *CompleteTaskRequest) (*CompleteTaskResponse, error)
+	CompleteTasks(context.Context, *CompleteTaskBatchRequest) (*CompleteTaskBatchResponse, error)
 	mustEmbedUnimplementedControlServiceServer()
 }
 
@@ -365,6 +378,9 @@ func (UnimplementedControlServiceServer) StartTask(context.Context, *StartTaskRe
 }
 func (UnimplementedControlServiceServer) CompleteTask(context.Context, *CompleteTaskRequest) (*CompleteTaskResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CompleteTask not implemented")
+}
+func (UnimplementedControlServiceServer) CompleteTasks(context.Context, *CompleteTaskBatchRequest) (*CompleteTaskBatchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CompleteTasks not implemented")
 }
 func (UnimplementedControlServiceServer) mustEmbedUnimplementedControlServiceServer() {}
 
@@ -739,6 +755,24 @@ func _ControlService_CompleteTask_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlService_CompleteTasks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteTaskBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServiceServer).CompleteTasks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlService_CompleteTasks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServiceServer).CompleteTasks(ctx, req.(*CompleteTaskBatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlService_ServiceDesc is the grpc.ServiceDesc for ControlService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -825,6 +859,10 @@ var ControlService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CompleteTask",
 			Handler:    _ControlService_CompleteTask_Handler,
+		},
+		{
+			MethodName: "CompleteTasks",
+			Handler:    _ControlService_CompleteTasks_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -240,6 +240,9 @@ func (s *Service) redeliverExpiredTasksLegacy(ctx context.Context) error {
 		}
 	}
 	s.queueMu.Unlock()
+	if len(requeued) > 0 {
+		s.notifyTaskAvailable()
+	}
 	return nil
 }
 
@@ -287,6 +290,7 @@ func (s *Service) redeliverExpiredTasksIndexed(ctx context.Context) error {
 			return err
 		}
 	}
+	requeuedCount := 0
 	for _, lease := range valid {
 		task, requeued := s.meta.RequeueTaskIfLeaseExpired(lease.taskID, lease.leaseEpoch, redeliveryTimeout)
 		if !requeued {
@@ -297,11 +301,15 @@ func (s *Service) redeliverExpiredTasksIndexed(ctx context.Context) error {
 			}
 			continue
 		}
+		requeuedCount++
 		s.scheduler.Enqueue(s.schedulerMetaFromTask(task))
 		if task.WorkerID != "" {
 			s.meta.DecrementWorkerLoad(task.WorkerID)
 			s.updateSchedulerWorker(task.WorkerID)
 		}
+	}
+	if requeuedCount > 0 {
+		s.notifyTaskAvailable()
 	}
 	return nil
 }

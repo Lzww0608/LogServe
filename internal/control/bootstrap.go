@@ -9,10 +9,10 @@ import (
 
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/actor"
+	"github.com/logserve/logserve/internal/logrecord"
 	"github.com/logserve/logserve/internal/metadata"
 	"github.com/logserve/logserve/internal/observability"
 	"github.com/logserve/logserve/internal/workflow"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const bootstrapReadLimit = 1000
@@ -28,6 +28,9 @@ func (s *Service) BootstrapFromLog(ctx context.Context) error {
 		return err
 	}
 	if err := s.bootstrapBackpressure(ctx); err != nil {
+		return err
+	}
+	if err := s.bootstrapFunctions(ctx); err != nil {
 		return err
 	}
 	checkpoint, err := s.loadLatestMetadataCheckpoint(ctx)
@@ -63,8 +66,8 @@ func (s *Service) bootstrapTasks(ctx context.Context) error {
 		return err
 	}
 	for _, streamID := range streams {
-		state, err := replayTaskMetadataEach(func(emit func(*logservepb.LogRecord) error) error {
-			return s.forEachLogRecord(ctx, streamID, emit)
+		state, err := replayTaskMetadataRawEach(func(emit func(logrecord.RawRecord) error) error {
+			return s.forEachRawLogRecord(ctx, streamID, 1, emit)
 		}, nil)
 		if err != nil {
 			return err
@@ -100,16 +103,12 @@ func replayTaskSpecEach(iterate func(func(*logservepb.LogRecord) error) error) (
 	if err := iterate(func(rec *logservepb.LogRecord) error {
 		switch rec.GetEventType() {
 		case "TaskSubmitted":
-			var payload taskSubmittedPayload
-			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+			decoded, err := unmarshalTaskSubmittedSpec(rec.GetPayload())
+			if err != nil {
 				return err
 			}
-			if len(payload.TaskSpec) == 0 {
+			if decoded.GetTaskId() == "" {
 				return nil
-			}
-			decoded := &logservepb.TaskSpec{}
-			if err := protojson.Unmarshal(payload.TaskSpec, decoded); err != nil {
-				return err
 			}
 			spec = decoded
 			status = logservepb.TaskStatus_TASK_STATUS_QUEUED
@@ -308,8 +307,8 @@ func (s *Service) bootstrapWorkflowsWithScheduling(ctx context.Context, schedule
 	}
 	for _, streamID := range streams {
 		workflowID := strings.TrimPrefix(streamID, "wf:")
-		state, err := workflow.ReplayEach(workflowID, func(emit func(*logservepb.LogRecord) error) error {
-			return s.forEachLogRecord(ctx, streamID, emit)
+		state, err := workflow.ReplayRawEach(workflowID, func(emit func(logrecord.RawRecord) error) error {
+			return s.forEachRawLogRecord(ctx, streamID, 1, emit)
 		})
 		if err != nil {
 			continue
@@ -360,7 +359,7 @@ func (s *Service) restoreWorkflowTasks(state workflow.State) error {
 			step.Status != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_STARTED {
 			continue
 		}
-		argsJSON, inputHash, err := workflow.ResolveArgs(stepDef, state, s)
+		argsJSON, inputHash, err := workflow.ResolveCachedArgs(stepDef, step, state, s)
 		if err != nil {
 			return err
 		}
@@ -373,6 +372,8 @@ func (s *Service) restoreWorkflowTasks(state workflow.State) error {
 			TaskName:        stepDef.TaskName,
 			FunctionName:    stepDef.FunctionName,
 			FunctionSource:  stepDef.FunctionSource,
+			FunctionRef:     stepDef.FunctionRef,
+			FunctionHash:    stepDef.FunctionHash,
 			ArgsJson:        argsJSON,
 			IdempotencyKey:  state.WorkflowID + ":" + stepDef.StepID + ":" + inputHash + ":attempt:" + strconv.FormatUint(uint64(attempt), 10),
 			WorkflowId:      state.WorkflowID,
@@ -420,8 +421,8 @@ func (s *Service) bootstrapActors(ctx context.Context) error {
 	}
 	for _, streamID := range streams {
 		actorID := strings.TrimPrefix(streamID, "actor:")
-		replayed, err := actor.ReplayEach(actorID, func(emit func(*logservepb.LogRecord) error) error {
-			return s.forEachLogRecord(ctx, streamID, emit)
+		replayed, err := actor.ReplayRawEach(actorID, func(emit func(logrecord.RawRecord) error) error {
+			return s.forEachRawLogRecord(ctx, streamID, 1, emit)
 		}, s)
 		if err != nil {
 			continue

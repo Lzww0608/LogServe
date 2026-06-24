@@ -1,8 +1,11 @@
 package logstore
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
+
+	"github.com/logserve/logserve/internal/logrecord"
 )
 
 func BenchmarkReadLargeStream(b *testing.B) {
@@ -37,6 +40,28 @@ func BenchmarkReadLargeStream(b *testing.B) {
 	}
 }
 
+func BenchmarkReadRawLargeStream(b *testing.B) {
+	store := buildBenchmarkStore(b, 100_000)
+	defer store.Close()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		count := 0
+		if err := store.ReadRawEach("bench:large-stream", 50_000, 10, func(rec logrecord.RawRecord) error {
+			if len(rec.Payload) != 1 {
+				b.Fatalf("payload len = %d", len(rec.Payload))
+			}
+			count++
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if count != 10 {
+			b.Fatalf("records = %d, want 10", count)
+		}
+	}
+}
 func buildBenchmarkStore(b *testing.B, entries int) *Store {
 	b.Helper()
 	opts := DefaultOptions()
@@ -101,4 +126,82 @@ func buildCrossSegmentBenchmarkStore(b *testing.B, cacheSize int) *Store {
 		}
 	}
 	return store
+}
+
+func BenchmarkChecksumPayloadSizes(b *testing.B) {
+	for _, size := range []int{128, 1024, 64 << 10, 1 << 20} {
+		payload := bytes.Repeat([]byte("x"), size)
+		for _, typ := range []ChecksumType{ChecksumTypeIEEE, ChecksumTypeCRC32C, ChecksumTypeXXH3, ChecksumTypeNone} {
+			b.Run(fmt.Sprintf("%s/%s", payloadSizeName(size), typ), func(b *testing.B) {
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				var sum uint32
+				for i := 0; i < b.N; i++ {
+					got, err := checksum(payload, typ)
+					if err != nil {
+						b.Fatal(err)
+					}
+					sum = got
+				}
+				_ = sum
+			})
+		}
+	}
+}
+
+func BenchmarkEncodeRecordPayloadSizes(b *testing.B) {
+	for _, size := range []int{128, 1024, 64 << 10, 1 << 20} {
+		payload := bytes.Repeat([]byte("x"), size)
+		rec := Record{
+			StreamID:       "bench:checksum",
+			Seq:            1,
+			EventType:      "ChecksumEvent",
+			IdempotencyKey: "bench-key",
+			Payload:        payload,
+			TimestampMs:    1,
+		}
+		for _, typ := range []ChecksumType{ChecksumTypeIEEE, ChecksumTypeCRC32C, ChecksumTypeXXH3} {
+			b.Run(fmt.Sprintf("%s/%s/allocated", payloadSizeName(size), typ), func(b *testing.B) {
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				var encoded []byte
+				for i := 0; i < b.N; i++ {
+					buf, _, err := encodeRecord(rec, typ)
+					if err != nil {
+						b.Fatal(err)
+					}
+					encoded = buf
+				}
+				_ = encoded
+			})
+			b.Run(fmt.Sprintf("%s/%s/pooled", payloadSizeName(size), typ), func(b *testing.B) {
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				var encodedLen int
+				for i := 0; i < b.N; i++ {
+					buf, _, err := encodeRecordPooled(rec, typ)
+					if err != nil {
+						b.Fatal(err)
+					}
+					encodedLen = len(buf)
+					putRecordEncodeBuffer(buf)
+				}
+				_ = encodedLen
+			})
+		}
+	}
+}
+func payloadSizeName(size int) string {
+	switch size {
+	case 128:
+		return "128B"
+	case 1024:
+		return "1KB"
+	case 64 << 10:
+		return "64KB"
+	case 1 << 20:
+		return "1MB"
+	default:
+		return fmt.Sprintf("%dB", size)
+	}
 }

@@ -77,3 +77,41 @@ func actorRecord(t *testing.T, eventType string, payload EventPayload) *logserve
 		TimestampMs: payload.TimestampMs,
 	}
 }
+
+func TestActorEventPayloadBinaryAndJSONFallback(t *testing.T) {
+	payload := EventPayload{
+		ActorID:              "actor-1",
+		ClassName:            "Counter",
+		ClassSource:          "class Counter: pass",
+		WorkerID:             "worker-1",
+		Epoch:                2,
+		CommandSeq:           3,
+		StateJSON:            json.RawMessage(`{"value":3}`),
+		SnapshotRef:          "snap-3",
+		SnapshotCommandCount: 3,
+		TimestampMs:          123,
+	}
+	data, err := MarshalEventPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded EventPayload
+	if err := UnmarshalEventPayload(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ActorID != payload.ActorID || decoded.WorkerID != payload.WorkerID || decoded.CommandSeq != payload.CommandSeq || string(decoded.StateJSON) != string(payload.StateJSON) {
+		t.Fatalf("decoded payload = %+v, want %+v", decoded, payload)
+	}
+
+	legacy, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded = EventPayload{}
+	if err := UnmarshalEventPayload(legacy, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ActorID != payload.ActorID || decoded.WorkerID != payload.WorkerID || decoded.CommandSeq != payload.CommandSeq {
+		t.Fatalf("legacy decoded payload = %+v, want %+v", decoded, payload)
+	}
+}

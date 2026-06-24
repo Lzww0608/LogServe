@@ -34,6 +34,12 @@ func ResolveArgs(step StepDefinition, state State, loader ResultLoader) ([]byte,
 	return data, hex.EncodeToString(sum[:]), nil
 }
 
+func ResolveCachedArgs(step StepDefinition, stepState StepState, state State, loader ResultLoader) ([]byte, string, error) {
+	if stepState.LastInputHash != "" && len(stepState.ResolvedArgsJSON) > 0 {
+		return append([]byte(nil), stepState.ResolvedArgsJSON...), stepState.LastInputHash, nil
+	}
+	return ResolveArgs(step, state, loader)
+}
 func DependenciesSucceeded(step StepDefinition, state State) bool {
 	for _, dep := range step.DependsOn {
 		depState, ok := state.Steps[dep]

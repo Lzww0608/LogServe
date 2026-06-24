@@ -1,6 +1,9 @@
+import hashlib
+import importlib.util
 import json
 import os
 import statistics
+from pathlib import Path
 import time
 
 from logserve import (
@@ -233,6 +236,82 @@ def locality_ablation(requests):
     return out
 
 
+def env_counts(name, default):
+    value = os.getenv(name)
+    if not value:
+        return default
+    out = []
+    for item in value.split(","):
+        try:
+            parsed = int(item.strip())
+        except ValueError:
+            continue
+        if parsed > 0:
+            out.append(parsed)
+    return out or default
+
+
+def function_registry_executor_ablation(counts):
+    executor = load_python_executor()
+    source = "".join(
+        f"# module padding line {i:03d}: repeated source for registry benchmark\n"
+        for i in range(200)
+    ) + "def registry_ping(value):\n    return value + 1\n"
+    function_hash = "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
+    out = {}
+    for count in counts:
+        legacy_requests = [
+            {
+                "function_source": source,
+                "function_name": "registry_ping",
+                "args_json": {"args": [i], "kwargs": {}},
+            }
+            for i in range(count)
+        ]
+        registry_requests = []
+        for i in range(count):
+            request = {
+                "function_hash": function_hash,
+                "function_name": "registry_ping",
+                "args_json": {"args": [i], "kwargs": {}},
+            }
+            if i == 0:
+                request["function_source"] = source
+            registry_requests.append(request)
+
+        executor._FUNCTION_CODE_CACHE.clear()
+        _, legacy_ms = ms(lambda requests=legacy_requests: run_executor_requests(executor, requests))
+        executor._FUNCTION_CODE_CACHE.clear()
+        _, registry_ms = ms(lambda requests=registry_requests: run_executor_requests(executor, requests))
+        legacy_payload_bytes = sum(len(json.dumps(req, separators=(",", ":"))) for req in legacy_requests)
+        registry_payload_bytes = sum(len(json.dumps(req, separators=(",", ":"))) for req in registry_requests)
+        out[str(count)] = {
+            "requests": count,
+            "legacy_payload_bytes": legacy_payload_bytes,
+            "registry_payload_bytes": registry_payload_bytes,
+            "payload_reduction_bytes": legacy_payload_bytes - registry_payload_bytes,
+            "legacy_direct_executor_ms": legacy_ms,
+            "registry_direct_executor_ms": registry_ms,
+        }
+    return out
+
+
+def run_executor_requests(executor, requests):
+    results = []
+    for request in requests:
+        response = executor.handle_task(request)
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "executor request failed"))
+        results.append(response.get("result"))
+    return results
+
+
+def load_python_executor():
+    path = Path(__file__).resolve().parents[2] / "executor" / "python" / "server.py"
+    spec = importlib.util.spec_from_file_location("logserve_python_executor_benchmark", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 def main():
     register_model("model-A", version="v1", size_bytes=100, path="mock://model-A", adapter="mock")
     register_model("model-C", version="v1", size_bytes=100, path="mock://model-C", adapter="mock")
@@ -243,6 +322,9 @@ def main():
         "actor_recovery_snapshot_ablation": actor_snapshot_ablation(env_int("LOGSERVE_BENCH_ACTOR_COMMANDS", 20)),
         "llm_cold_start": llm_cold_start(),
         "locality_ablation": locality_ablation(env_int("LOGSERVE_BENCH_LLM_REQUESTS", 6)),
+        "function_registry_executor_ablation": function_registry_executor_ablation(
+            env_counts("LOGSERVE_BENCH_FUNCTION_COUNTS", [1, 100, 1000])
+        ),
         "replay_ablation": {
             "enabled": "workflow/actor/llm state can be reconstructed from log streams",
             "disabled": "no independent recovery validation; dashboard marks this as analysis-only baseline",

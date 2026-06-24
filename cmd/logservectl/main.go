@@ -19,6 +19,8 @@ type submitInput struct {
 	TaskName       string          `json:"task_name"`
 	FunctionName   string          `json:"function_name"`
 	FunctionSource string          `json:"function_source"`
+	FunctionRef    string          `json:"function_ref"`
+	FunctionHash   string          `json:"function_hash"`
 	Args           json.RawMessage `json:"args"`
 	Kwargs         json.RawMessage `json:"kwargs"`
 	IdempotencyKey string          `json:"idempotency_key"`
@@ -235,6 +237,8 @@ func submit(args []string) error {
 		TaskName:       input.TaskName,
 		FunctionName:   input.FunctionName,
 		FunctionSource: input.FunctionSource,
+		FunctionRef:    input.FunctionRef,
+		FunctionHash:   input.FunctionHash,
 		ArgsJson:       argsJSON,
 		IdempotencyKey: input.IdempotencyKey,
 	})

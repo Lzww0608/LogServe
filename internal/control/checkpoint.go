@@ -10,6 +10,7 @@ import (
 
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/actor"
+	"github.com/logserve/logserve/internal/logrecord"
 	"github.com/logserve/logserve/internal/metadata"
 	"github.com/logserve/logserve/internal/observability"
 	"github.com/logserve/logserve/internal/workflow"
@@ -203,13 +204,13 @@ func (s *Service) CheckMetadataCheckpointConsistency(ctx context.Context) (Metad
 
 func (s *Service) loadLatestMetadataCheckpoint(ctx context.Context) (*MetadataCheckpoint, error) {
 	var latest *MetadataCheckpoint
-	if err := s.forEachLogRecord(ctx, metadataCheckpointStream, func(rec *logservepb.LogRecord) error {
-		if rec.GetEventType() != metadataCheckpointEvent {
+	if err := s.forEachRawLogRecord(ctx, metadataCheckpointStream, 1, func(rec logrecord.RawRecord) error {
+		if rec.EventType != metadataCheckpointEvent {
 			return nil
 		}
 		var cp MetadataCheckpoint
-		if err := json.Unmarshal(rec.GetPayload(), &cp); err != nil {
-			observability.Error("metadata_checkpoint_decode_failed", err, map[string]any{"seq": rec.GetSeq()})
+		if err := json.Unmarshal(rec.Payload, &cp); err != nil {
+			observability.Error("metadata_checkpoint_decode_failed", err, map[string]any{"seq": rec.Seq})
 			return nil
 		}
 		if cp.Streams == nil {
@@ -262,8 +263,8 @@ func (s *Service) bootstrapCheckpointTasks(ctx context.Context, cp MetadataCheck
 		if fromSeq == 1 {
 			fromSeq = 2
 		}
-		if err := s.forEachLogRecordFromSeq(ctx, streamID, fromSeq, func(rec *logservepb.LogRecord) error {
-			return state.apply(rec)
+		if err := s.forEachRawLogRecord(ctx, streamID, fromSeq, func(rec logrecord.RawRecord) error {
+			return state.applyRaw(rec)
 		}); err != nil {
 			return err
 		}
@@ -279,8 +280,8 @@ func (s *Service) bootstrapCheckpointTasks(ctx context.Context, cp MetadataCheck
 		if _, ok := seen[streamID]; ok {
 			continue
 		}
-		state, err := replayTaskMetadataEach(func(emit func(*logservepb.LogRecord) error) error {
-			return s.forEachLogRecord(ctx, streamID, emit)
+		state, err := replayTaskMetadataRawEach(func(emit func(logrecord.RawRecord) error) error {
+			return s.forEachRawLogRecord(ctx, streamID, 1, emit)
 		}, nil)
 		if err != nil {
 			return err
@@ -302,8 +303,8 @@ func (s *Service) bootstrapCheckpointWorkflows(ctx context.Context, cp MetadataC
 		if fromSeq == 1 {
 			fromSeq = 2
 		}
-		tail, err := workflow.ReplayFromEach(state, func(emit func(*logservepb.LogRecord) error) error {
-			return s.forEachLogRecordFromSeq(ctx, streamID, fromSeq, emit)
+		tail, err := workflow.ReplayFromRawEach(state, func(emit func(logrecord.RawRecord) error) error {
+			return s.forEachRawLogRecord(ctx, streamID, fromSeq, emit)
 		})
 		if err != nil {
 			return err
@@ -331,8 +332,8 @@ func (s *Service) bootstrapCheckpointWorkflows(ctx context.Context, cp MetadataC
 			continue
 		}
 		workflowID := strings.TrimPrefix(streamID, "wf:")
-		state, err := workflow.ReplayEach(workflowID, func(emit func(*logservepb.LogRecord) error) error {
-			return s.forEachLogRecord(ctx, streamID, emit)
+		state, err := workflow.ReplayRawEach(workflowID, func(emit func(logrecord.RawRecord) error) error {
+			return s.forEachRawLogRecord(ctx, streamID, 1, emit)
 		})
 		if err != nil {
 			continue
@@ -363,8 +364,8 @@ func (s *Service) bootstrapCheckpointActors(ctx context.Context, cp MetadataChec
 		if fromSeq == 1 {
 			fromSeq = 2
 		}
-		replayed, err := actor.ReplayFromStateEach(item.ActorID, item.State, func(emit func(*logservepb.LogRecord) error) error {
-			return s.forEachLogRecordFromSeq(ctx, streamID, fromSeq, emit)
+		replayed, err := actor.ReplayFromStateRawEach(item.ActorID, item.State, func(emit func(logrecord.RawRecord) error) error {
+			return s.forEachRawLogRecord(ctx, streamID, fromSeq, emit)
 		}, s)
 		if err != nil {
 			return err
@@ -380,8 +381,8 @@ func (s *Service) bootstrapCheckpointActors(ctx context.Context, cp MetadataChec
 			continue
 		}
 		actorID := strings.TrimPrefix(streamID, "actor:")
-		replayed, err := actor.ReplayEach(actorID, func(emit func(*logservepb.LogRecord) error) error {
-			return s.forEachLogRecord(ctx, streamID, emit)
+		replayed, err := actor.ReplayRawEach(actorID, func(emit func(logrecord.RawRecord) error) error {
+			return s.forEachRawLogRecord(ctx, streamID, 1, emit)
 		}, s)
 		if err != nil {
 			continue
@@ -461,16 +462,16 @@ func (s *Service) llmStatsFromCheckpointTail(ctx context.Context, cp MetadataChe
 }
 
 func (s *Service) materializeLLMStreamFromSeq(ctx context.Context, streamID string, fromSeq uint64) error {
-	return s.forEachLogRecordFromSeq(ctx, streamID, fromSeq, func(rec *logservepb.LogRecord) error {
-		if rec.GetEventType() != "LLMCompleted" {
+	return s.forEachRawLogRecord(ctx, streamID, fromSeq, func(rec logrecord.RawRecord) error {
+		if rec.EventType != "LLMCompleted" {
 			return nil
 		}
 		var payload llmEventPayload
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		if err := json.Unmarshal(rec.Payload, &payload); err != nil {
 			return err
 		}
 		if payload.TimestampMs == 0 {
-			payload.TimestampMs = rec.GetTimestampMs()
+			payload.TimestampMs = rec.TimestampMs
 		}
 		s.materializeLLMCompleted(payload)
 		return nil
@@ -607,9 +608,9 @@ func (s *Service) streamLastSeqs(ctx context.Context, prefixes []string) (map[st
 
 func (s *Service) streamLastSeqByRead(ctx context.Context, streamID string) (uint64, error) {
 	var last uint64
-	err := s.forEachLogRecord(ctx, streamID, func(rec *logservepb.LogRecord) error {
-		if rec.GetSeq() > last {
-			last = rec.GetSeq()
+	err := s.forEachRawLogRecord(ctx, streamID, 1, func(rec logrecord.RawRecord) error {
+		if rec.Seq > last {
+			last = rec.Seq
 		}
 		return nil
 	})

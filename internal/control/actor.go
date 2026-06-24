@@ -2,7 +2,6 @@ package control
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -11,6 +10,7 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/actor"
 	"github.com/logserve/logserve/internal/metadata"
+	"github.com/logserve/logserve/internal/objectstore"
 	"github.com/logserve/logserve/internal/observability"
 )
 
@@ -44,7 +44,7 @@ func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRe
 	state.IdempotencyKey = req.GetIdempotencyKey()
 	state.IdempotencyFingerprint = fingerprint
 
-	payload, _ := json.Marshal(actor.EventPayload{
+	payload, _ := actor.MarshalEventPayload(actor.EventPayload{
 		ActorID:                actorID,
 		ClassName:              req.GetClassName(),
 		ClassSource:            req.GetClassSource(),
@@ -202,7 +202,7 @@ func (s *Service) submitActorCommand(ctx context.Context, req *logservepb.CallAc
 		task = existing
 	} else {
 		now := actor.NowMs()
-		payload, _ := json.Marshal(actor.EventPayload{
+		payload, _ := actor.MarshalEventPayload(actor.EventPayload{
 			ActorID:     state.ActorID,
 			CallID:      callID,
 			CommandSeq:  commandSeq,
@@ -302,7 +302,7 @@ func (s *Service) ensureActorOwner(ctx context.Context, actorID string) (actor.S
 	owner := workers[0].WorkerID
 	epoch := state.Epoch + 1
 	now := actor.NowMs()
-	payload, _ := json.Marshal(actor.EventPayload{
+	payload, _ := actor.MarshalEventPayload(actor.EventPayload{
 		ActorID:     actorID,
 		WorkerID:    owner,
 		Epoch:       epoch,
@@ -352,7 +352,7 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 	stateJSON := actor.NormalizeJSON(req.GetActorStateJson())
 	commandCount := commandSeq
 	now := actor.NowMs()
-	payload, _ := json.Marshal(actor.EventPayload{
+	payload, _ := actor.MarshalEventPayload(actor.EventPayload{
 		ActorID:      task.ActorID,
 		CallID:       task.ActorCallID,
 		CommandSeq:   commandSeq,
@@ -402,7 +402,7 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 
 func (s *Service) failActorCommand(ctx context.Context, task metadata.Task, req *logservepb.CompleteTaskRequest, spec *logservepb.TaskSpec, commandSeq uint64) error {
 	now := actor.NowMs()
-	payload, _ := json.Marshal(actor.EventPayload{
+	payload, _ := actor.MarshalEventPayload(actor.EventPayload{
 		ActorID:      task.ActorID,
 		CallID:       task.ActorCallID,
 		CommandSeq:   commandSeq,
@@ -438,12 +438,12 @@ func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) er
 	if s.resultStore == nil {
 		return nil
 	}
-	ref, err := s.resultStore.Put(ctx, filepath.Join("actors", state.ActorID, "snapshots"), state.StateJSON)
+	ref, err := objectstore.PutBytes(ctx, s.resultStore, filepath.Join("actors", state.ActorID, "snapshots"), state.StateJSON)
 	if err != nil {
 		return err
 	}
 	now := actor.NowMs()
-	payload, _ := json.Marshal(actor.EventPayload{
+	payload, _ := actor.MarshalEventPayload(actor.EventPayload{
 		ActorID:              state.ActorID,
 		ClassName:            state.ClassName,
 		ClassSource:          state.ClassSource,

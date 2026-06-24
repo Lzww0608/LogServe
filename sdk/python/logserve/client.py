@@ -1,6 +1,8 @@
+import hashlib
 import inspect
 import json
 import os
+from pathlib import Path
 import subprocess
 import textwrap
 
@@ -46,6 +48,7 @@ class LogServeClient:
             "task_name": getattr(fn, "__name__", "task"),
             "function_name": getattr(fn, "__name__", "task"),
             "function_source": source,
+            "function_hash": _source_hash(source),
             "args": list(args),
             "kwargs": kwargs,
             "idempotency_key": idempotency_key or "",
@@ -299,11 +302,15 @@ def _build_workflow_definition(fn, args, kwargs):
     for step in ctx.steps:
         step = dict(step)
         step["function_source"] = textwrap.dedent(step["function_source"])
+        if step["function_source"]:
+            step["function_hash"] = _source_hash(step["function_source"])
         steps.append(step)
 
+    workflow_source = textwrap.dedent(inspect.getsource(inspect.unwrap(fn)))
     return {
         "workflow_name": getattr(fn, "__name__", "workflow"),
-        "function_source": textwrap.dedent(inspect.getsource(inspect.unwrap(fn))),
+        "function_source": workflow_source,
+        "function_hash": _source_hash(workflow_source),
         "args_json": {"args": list(args), "kwargs": kwargs},
         "steps": steps,
         "result_step_id": result.step_id,
@@ -312,6 +319,10 @@ def _build_workflow_definition(fn, args, kwargs):
     }
 
 
+
+
+def _source_hash(source):
+    return "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
 def _default_client():

@@ -61,6 +61,7 @@ class ClientIdempotencyTests(unittest.TestCase):
 
         self.assertEqual(transport.calls[0][1]["idempotency_key"], "")
         self.assertEqual(transport.calls[1][1]["idempotency_key"], "")
+        self.assertTrue(transport.calls[0][1]["function_hash"].startswith("sha256:"))
 
     def test_submit_uses_explicit_idempotency_key_only_when_provided(self):
         transport = CapturingTransport()
@@ -86,7 +87,9 @@ class ClientIdempotencyTests(unittest.TestCase):
         sdk.submit_workflow(echo_workflow, "hello")
 
         definition = transport.calls[0][1]["definition"]
-        step_source = definition["steps"][0]["function_source"]
+        step = definition["steps"][0]
+        step_source = step["function_source"]
+        self.assertTrue(step["function_hash"].startswith("sha256:"))
         self.assertIn("def echo", step_source)
         self.assertNotIn("import sys", step_source)
         self.assertNotIn("from pathlib", step_source)

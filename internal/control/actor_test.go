@@ -2,7 +2,6 @@ package control
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -170,7 +169,7 @@ func TestActorCommandSeqAdvancesAfterTimedOutSubmittedCommand(t *testing.T) {
 			continue
 		}
 		var payload actor.EventPayload
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		if err := actor.UnmarshalEventPayload(rec.GetPayload(), &payload); err != nil {
 			t.Fatal(err)
 		}
 		seqs = append(seqs, payload.CommandSeq)

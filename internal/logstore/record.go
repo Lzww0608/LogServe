@@ -8,6 +8,7 @@ type Record struct {
 	Payload        []byte
 	TimestampMs    int64
 	CRC32          uint32
+	ChecksumType   ChecksumType
 }
 
 type AppendRequest struct {

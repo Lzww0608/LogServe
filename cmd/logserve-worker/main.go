@@ -26,10 +26,12 @@ func main() {
 	flag.StringVar(&cfg.ModelCheckpointSourceDir, "model-source-dir", "", "source directory for mock model checkpoints")
 	flag.StringVar(&cfg.ModelCacheDir, "model-cache-dir", "", "local directory used as the mock model checkpoint cache")
 	flag.Int64Var(&cfg.ModelCacheCapacityBytes, "model-cache-capacity-bytes", 0, "optional local model cache capacity in bytes; 0 means unlimited")
-	pollMs := flag.Int("poll-ms", 200, "poll interval in milliseconds")
+	pollMs := flag.Int("poll-ms", 200, "poll/long-poll timeout in milliseconds")
+	heartbeatMs := flag.Int("heartbeat-ms", 1000, "heartbeat interval in milliseconds")
 	flag.IntVar(&cfg.MaxTasks, "max-tasks", 0, "optional max tasks before the worker exits")
 	flag.Parse()
 	cfg.PollInterval = time.Duration(*pollMs) * time.Millisecond
+	cfg.HeartbeatInterval = time.Duration(*heartbeatMs) * time.Millisecond
 	cfg.CachedModels = splitCSV(*models)
 	cfg.Capacity = uint32(*capacity)
 

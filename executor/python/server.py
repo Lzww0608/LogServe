@@ -1,12 +1,21 @@
 import ast
 import builtins
+import hashlib
 import json
 import os
+import struct
 import sys
 import tempfile
 import time
 import types
 import traceback
+
+try:
+    import msgpack
+except ImportError:
+    msgpack = None
+
+_MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 
 def _identity_decorator(fn=None, **_kwargs):
@@ -109,6 +118,8 @@ def _safe_open(path, mode="r", *args, **kwargs):
     if not any(os.path.commonpath([root, target]) == root for root in _ALLOWED_FILE_ROOTS):
         raise PermissionError("executor open is restricted to the system temp directory")
     return builtins.open(target, mode, *args, **kwargs)
+_FUNCTION_CODE_CACHE = {}
+
 _SAFE_BUILTINS = {
     "__build_class__": builtins.__build_class__,
     "__import__": _limited_import,
@@ -185,7 +196,8 @@ def handle_request(request):
 
 
 def handle_task(request):
-    source = request["function_source"]
+    source = request.get("function_source") or ""
+    function_hash = request.get("function_hash") or ""
     function_name = request["function_name"]
     args_payload = _payload(request.get("args_json") or {})
     args = args_payload.get("args", [])
@@ -193,10 +205,35 @@ def handle_task(request):
 
     _install_fake_logserve()
     namespace = _sandbox_namespace("logserve_task")
-    exec(_compile_user_source(source, "<logserve-task>"), namespace, namespace)
+    code = _code_for_task_source(source, function_hash)
+    exec(code, namespace, namespace)
     fn = namespace[function_name]
     result = fn(*args, **kwargs)
     return {"ok": True, "result": result}
+
+
+def _code_for_task_source(source, function_hash):
+    if function_hash:
+        cached = _FUNCTION_CODE_CACHE.get(function_hash)
+        if cached is not None and not source:
+            return cached
+        if not source:
+            raise ValueError(f"function source for {function_hash} is not cached")
+        computed = _source_hash(source)
+        if computed != function_hash:
+            raise ValueError(f"function hash mismatch: expected {function_hash}, got {computed}")
+        if cached is not None:
+            return cached
+        code = _compile_user_source(source, f"<logserve-task:{function_hash}>")
+        _FUNCTION_CODE_CACHE[function_hash] = code
+        return code
+    if not source:
+        raise ValueError("function_source is required when function_hash is omitted")
+    return _compile_user_source(source, "<logserve-task>")
+
+
+def _source_hash(source):
+    return "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
 def handle_actor(request):
@@ -228,12 +265,72 @@ def handle_actor(request):
 def _payload(raw):
     if raw is None:
         return {}
+    if isinstance(raw, (bytes, bytearray)):
+        return json.loads(bytes(raw).decode("utf-8")) if raw else {}
     if isinstance(raw, str):
         return json.loads(raw) if raw else {}
     return raw
+def _json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _response_for_msgpack(response):
+    out = {"ok": bool(response.get("ok"))}
+    if response.get("error"):
+        out["error"] = response["error"]
+    if "result" in response:
+        out["result_json"] = _json_bytes(response["result"])
+    if "state" in response:
+        out["state_json"] = _json_bytes(response["state"])
+    return out
+
+
+def _read_exact(stream, size):
+    data = stream.read(size)
+    if len(data) != size:
+        raise EOFError("unexpected EOF while reading executor frame")
+    return data
+
+
+def _read_frame(stream):
+    header = stream.read(4)
+    if not header:
+        return None
+    if len(header) != 4:
+        raise EOFError("short executor frame header")
+    (size,) = struct.unpack(">I", header)
+    if size > _MAX_FRAME_BYTES:
+        raise ValueError(f"executor frame {size} exceeds max {_MAX_FRAME_BYTES}")
+    return _read_exact(stream, size)
+
+
+def _write_frame(stream, payload):
+    if len(payload) > _MAX_FRAME_BYTES:
+        raise ValueError(f"executor frame {len(payload)} exceeds max {_MAX_FRAME_BYTES}")
+    stream.write(struct.pack(">I", len(payload)))
+    stream.write(payload)
+    stream.flush()
+
+
+def _loop_msgpack():
+    if msgpack is None:
+        print("msgpack is required for --loop-msgpack", file=sys.stderr, flush=True)
+        return 2
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    while True:
+        frame = _read_frame(stdin)
+        if frame is None:
+            return 0
+        request = msgpack.unpackb(frame, raw=False)
+        response = _response_for_msgpack(handle_request(request))
+        _write_frame(stdout, msgpack.packb(response, use_bin_type=True))
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--loop-msgpack":
+        return _loop_msgpack()
+
     if len(sys.argv) > 1 and sys.argv[1] == "--loop":
         for line in sys.stdin:
             if not line.strip():

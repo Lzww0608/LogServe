@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/logrecord"
 )
 
 type Service struct {
@@ -54,6 +55,17 @@ func (s *Service) ReadLogStream(req *logservepb.ReadLogRequest, stream logservep
 	})
 }
 
+func (s *Service) ReadLogRawEach(ctx context.Context, streamID string, fromSeq uint64, limit int, emit func(logrecord.RawRecord) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.store.ReadRawEach(streamID, fromSeq, limit, func(rec logrecord.RawRecord) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return emit(rec)
+	})
+}
 func logRecordFromStoreRecord(rec Record) *logservepb.LogRecord {
 	return &logservepb.LogRecord{
 		StreamId:       rec.StreamID,
