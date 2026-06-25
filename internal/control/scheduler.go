@@ -66,6 +66,7 @@ type Scheduler struct {
 
 	workerViews map[string]workerView
 	placement   map[modelKey]modelPlacement
+	llmPlacement modelPlacementStore
 }
 
 type taskDeque struct {
@@ -102,6 +103,7 @@ func newScheduler() *Scheduler {
 		runningLeases: make(map[string]runningLease),
 		workerViews:   make(map[string]workerView),
 		placement:     make(map[modelKey]modelPlacement),
+		llmPlacement:  newModelPlacementStore(),
 	}
 }
 
@@ -131,6 +133,9 @@ func (s *Scheduler) Enqueue(meta SchedMeta) {
 	}
 	s.taskMeta[meta.TaskID] = meta
 	s.queued[meta.TaskID] = meta.TaskType
+	if meta.TaskType == TaskKindLLM {
+		s.ensureModelPlacementLocked(modelKeyFromParts(meta.ModelName, meta.ModelVersion))
+	}
 	s.queueForLocked(meta).PushBack(meta.TaskID)
 }
 
@@ -265,8 +270,11 @@ func (s *Scheduler) UpsertWorker(worker metadata.Worker) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if previous, ok := s.workerViews[worker.WorkerID]; ok {
+	var previous workerView
+	if prev, ok := s.workerViews[worker.WorkerID]; ok {
+		previous = prev
 		s.removeWorkerPlacementLocked(previous)
+		s.removeWorkerPlacementIndexLocked(worker.WorkerID, previous)
 	}
 	view := workerView{
 		workerID:      worker.WorkerID,
@@ -280,6 +288,7 @@ func (s *Scheduler) UpsertWorker(worker metadata.Worker) {
 	}
 	s.workerViews[worker.WorkerID] = view
 	s.addWorkerPlacementLocked(view)
+	s.refreshWorkerPlacementLocked(worker.WorkerID, view, previous)
 }
 
 func (s *Scheduler) PreferredLocalityWorker(key modelKey, createdAtMs, nowMs int64, waitMs int64) string {
@@ -292,36 +301,7 @@ func (s *Scheduler) PreferredLocalityWorker(key modelKey, createdAtMs, nowMs int
 	if createdAtMs > 0 && nowMs > createdAtMs {
 		queueDelayMs = nowMs - createdAtMs
 	}
-	hasCachedAvailable := false
-	for workerID := range s.placement[key].cachedWorkers {
-		worker, ok := s.workerViews[workerID]
-		if ok && worker.hasCapacity() {
-			hasCachedAvailable = true
-			break
-		}
-	}
-	bestWorker := ""
-	bestScore := -1 << 30
-	for _, workerID := range sortedWorkerIDs(s.workerViews) {
-		worker := s.workerViews[workerID]
-		if !worker.hasCapacity() {
-			continue
-		}
-		available := int(worker.capacity - worker.runningTasks)
-		score := available*100 - int(worker.runningTasks)*10
-		_, cacheHit := worker.cachedModels[key]
-		if cacheHit {
-			score += 1000
-		}
-		if !cacheHit && hasCachedAvailable && queueDelayMs < waitMs {
-			score -= 1000
-		}
-		if bestWorker == "" || score > bestScore || (score == bestScore && worker.workerID < bestWorker) {
-			bestWorker = worker.workerID
-			bestScore = score
-		}
-	}
-	return bestWorker
+	return s.preferredLocalityFromPlacementLocked(key, queueDelayMs, waitMs)
 }
 
 func (s *Scheduler) nextFromQueueLocked(q *taskDeque, kind TaskKind, check func(SchedMeta) schedulerDecision) (SchedMeta, bool) {
@@ -342,15 +322,47 @@ func (s *Scheduler) nextFromQueueLocked(q *taskDeque, kind TaskKind, check func(
 			q.PopFront()
 			delete(s.queued, taskID)
 			delete(s.taskMeta, taskID)
+			s.maybeCleanupQueueLocked(q, kind, meta)
 		case schedulerSkip:
 			return SchedMeta{}, false
 		default:
 			q.PopFront()
 			delete(s.queued, taskID)
+			s.maybeCleanupQueueLocked(q, kind, meta)
 			return meta, true
 		}
 	}
 	return SchedMeta{}, false
+}
+
+func (s *Scheduler) maybeCleanupQueueLocked(q *taskDeque, kind TaskKind, meta SchedMeta) {
+	if q == nil || q.Len() > 0 {
+		return
+	}
+	switch kind {
+	case TaskKindActor:
+		if meta.ActorID != "" && s.actorPending[meta.ActorID] == q {
+			delete(s.actorPending, meta.ActorID)
+		}
+	case TaskKindTargetWorker:
+		if meta.TargetWorker != "" && s.byTarget[meta.TargetWorker] == q {
+			delete(s.byTarget, meta.TargetWorker)
+		}
+	case TaskKindLLM:
+		key := modelKeyFromParts(meta.ModelName, meta.ModelVersion)
+		if s.llmByModel[key] == q {
+			delete(s.llmByModel, key)
+		}
+	}
+}
+
+func (s *Scheduler) ActorPendingActors() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.actorPending)
 }
 
 func (s *Scheduler) llmCandidateModelsLocked(snapshot workerSnapshot, nowMs int64) []modelKey {

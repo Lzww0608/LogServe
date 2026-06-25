@@ -3,6 +3,7 @@ module github.com/logserve/logserve
 go 1.25.0
 
 require (
+	github.com/klauspost/crc32 v1.2.0
 	github.com/lib/pq v1.10.9
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/zeebo/xxh3 v1.1.0

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/eventcodec"
 )
 
 type mapResultLoader map[string][]byte
@@ -113,5 +114,22 @@ func TestActorEventPayloadBinaryAndJSONFallback(t *testing.T) {
 	}
 	if decoded.ActorID != payload.ActorID || decoded.WorkerID != payload.WorkerID || decoded.CommandSeq != payload.CommandSeq {
 		t.Fatalf("legacy decoded payload = %+v, want %+v", decoded, payload)
+	}
+}
+
+func TestActorEventPayloadRecordsByteSizes(t *testing.T) {
+	fields := eventPayloadMap(EventPayload{
+		ArgsJSON:    json.RawMessage(`{"args":[1]}`),
+		ResultJSON:  json.RawMessage(`{"ok":true}`),
+		StateJSON:   json.RawMessage(`{"value":3}`),
+	})
+	if got := eventcodec.Int64Value(fields["args_json_bytes"]); got != int64(len(`{"args":[1]}`)) {
+		t.Fatalf("args_json_bytes = %d, want %d", got, len(`{"args":[1]}`))
+	}
+	if got := eventcodec.Int64Value(fields["result_json_bytes"]); got != int64(len(`{"ok":true}`)) {
+		t.Fatalf("result_json_bytes = %d, want %d", got, len(`{"ok":true}`))
+	}
+	if got := eventcodec.Int64Value(fields["state_json_bytes"]); got != int64(len(`{"value":3}`)) {
+		t.Fatalf("state_json_bytes = %d, want %d", got, len(`{"value":3}`))
 	}
 }

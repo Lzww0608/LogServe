@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/logrecord"
 	"github.com/logserve/logserve/internal/objectstore"
 	"github.com/logserve/logserve/internal/workflow"
 )
@@ -132,12 +133,12 @@ func (s *Service) ensureFunctionRegistered(ctx context.Context, entrypoint, sour
 }
 
 func (s *Service) bootstrapFunctions(ctx context.Context) error {
-	return s.forEachLogRecord(ctx, functionRegistryStream, func(rec *logservepb.LogRecord) error {
-		if rec.GetEventType() != "FunctionRegistered" {
+	return s.forEachRawLogRecord(ctx, functionRegistryStream, 1, func(rec logrecord.RawRecord) error {
+		if rec.EventType != "FunctionRegistered" {
 			return nil
 		}
 		var payload functionRegisteredPayload
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		if err := json.Unmarshal(rec.Payload, &payload); err != nil {
 			return err
 		}
 		if payload.FunctionHash == "" || payload.SourceRef == "" {

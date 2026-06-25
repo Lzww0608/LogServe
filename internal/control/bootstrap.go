@@ -57,6 +57,7 @@ func (s *Service) BootstrapFromLog(ctx context.Context) error {
 	if err := s.bootstrapLLMStats(ctx); err != nil {
 		return err
 	}
+	s.syncSchedulerWorkers()
 	return nil
 }
 
@@ -178,21 +179,16 @@ func taskTerminalEventApplies(status logservepb.TaskStatus, currentLeaseEpoch, r
 }
 
 func taskEventLeaseEpoch(payload []byte) uint64 {
-	var decoded taskLifecyclePayload
-	if len(payload) == 0 {
-		return 0
-	}
-	_ = json.Unmarshal(payload, &decoded)
-	return decoded.TaskLeaseEpoch
+	return decodeTaskLifecyclePayload(payload).TaskLeaseEpoch
 }
 
 func (s *Service) bootstrapModels(ctx context.Context) error {
-	return s.forEachLogRecord(ctx, "system:models", func(rec *logservepb.LogRecord) error {
-		if rec.GetEventType() != "ModelRegistered" {
+	return s.forEachRawLogRecord(ctx, "system:models", 1, func(rec logrecord.RawRecord) error {
+		if rec.EventType != "ModelRegistered" {
 			return nil
 		}
 		var model logservepb.ModelInfo
-		if err := json.Unmarshal(rec.GetPayload(), &model); err != nil {
+		if err := json.Unmarshal(rec.Payload, &model); err != nil {
 			return err
 		}
 		s.meta.RegisterModel(&model)
@@ -201,8 +197,8 @@ func (s *Service) bootstrapModels(ctx context.Context) error {
 }
 
 func (s *Service) bootstrapWorkers(ctx context.Context) error {
-	return s.forEachLogRecord(ctx, "system:workers", func(rec *logservepb.LogRecord) error {
-		if rec.GetEventType() != "WorkerRegistered" {
+	return s.forEachRawLogRecord(ctx, "system:workers", 1, func(rec logrecord.RawRecord) error {
+		if rec.EventType != "WorkerRegistered" {
 			return nil
 		}
 		var payload struct {
@@ -215,7 +211,7 @@ func (s *Service) bootstrapWorkers(ctx context.Context) error {
 			} `json:"cached_models"`
 			Capacity uint32 `json:"capacity"`
 		}
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		if err := json.Unmarshal(rec.Payload, &payload); err != nil {
 			return err
 		}
 		if payload.WorkerID == "" {
@@ -234,7 +230,7 @@ func (s *Service) bootstrapWorkers(ctx context.Context) error {
 			Labels:        payload.Labels,
 			CachedModels:  cachedModels,
 			Capacity:      payload.Capacity,
-			LastHeartbeat: rec.GetTimestampMs(),
+			LastHeartbeat: rec.TimestampMs,
 		})
 		s.updateSchedulerWorker(payload.WorkerID)
 		return nil
@@ -243,14 +239,14 @@ func (s *Service) bootstrapWorkers(ctx context.Context) error {
 
 func (s *Service) bootstrapScheduler(ctx context.Context) error {
 	var policy logservepb.SchedulingPolicy
-	if err := s.forEachLogRecord(ctx, "system:scheduler", func(rec *logservepb.LogRecord) error {
-		if rec.GetEventType() != "SchedulingPolicyChanged" {
+	if err := s.forEachRawLogRecord(ctx, "system:scheduler", 1, func(rec logrecord.RawRecord) error {
+		if rec.EventType != "SchedulingPolicyChanged" {
 			return nil
 		}
 		var payload struct {
 			Policy string `json:"policy"`
 		}
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		if err := json.Unmarshal(rec.Payload, &payload); err != nil {
 			return err
 		}
 		if value, ok := logservepb.SchedulingPolicy_value[payload.Policy]; ok {
@@ -274,11 +270,11 @@ func (s *Service) bootstrapBackpressure(ctx context.Context) error {
 		RedeliveryTimeout  int64  `json:"redelivery_timeout_ms"`
 		LogAppendSlow      int64  `json:"log_append_slow_ms"`
 	}
-	if err := s.forEachLogRecord(ctx, "system:backpressure", func(rec *logservepb.LogRecord) error {
-		if rec.GetEventType() != "BackpressureConfigured" {
+	if err := s.forEachRawLogRecord(ctx, "system:backpressure", 1, func(rec logrecord.RawRecord) error {
+		if rec.EventType != "BackpressureConfigured" {
 			return nil
 		}
-		return json.Unmarshal(rec.GetPayload(), &payload)
+		return json.Unmarshal(rec.Payload, &payload)
 	}); err != nil {
 		return err
 	}

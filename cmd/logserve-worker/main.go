@@ -7,11 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/logserve/logserve/internal/observability"
 	"github.com/logserve/logserve/internal/worker"
 )
 
 func main() {
 	cfg := worker.Config{}
+	pprofAddr := flag.String("pprof-addr", observability.PprofAddrFromEnv(), "optional pprof listen address, for example 127.0.0.1:6063")
 	flag.StringVar(&cfg.WorkerID, "worker-id", "worker-1", "worker id")
 	flag.StringVar(&cfg.ControlAddr, "control-addr", "127.0.0.1:50052", "control service address")
 	flag.StringVar(&cfg.LogAddr, "log-addr", "127.0.0.1:50051", "log service address")
@@ -30,6 +32,7 @@ func main() {
 	heartbeatMs := flag.Int("heartbeat-ms", 1000, "heartbeat interval in milliseconds")
 	flag.IntVar(&cfg.MaxTasks, "max-tasks", 0, "optional max tasks before the worker exits")
 	flag.Parse()
+	observability.StartDebugServer(*pprofAddr)
 	cfg.PollInterval = time.Duration(*pollMs) * time.Millisecond
 	cfg.HeartbeatInterval = time.Duration(*heartbeatMs) * time.Millisecond
 	cfg.CachedModels = splitCSV(*models)

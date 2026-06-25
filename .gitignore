@@ -6,8 +6,35 @@ __pycache__/
 .pytest_cache/
 .venv/
 dashboard/snapshot.json
+
+# Generated benchmark snapshots (keep README + baseline.example.json)
 benchmarks/phase5_latest.json
 benchmarks/logstore_v1_latest.json
+benchmarks/micro-*.txt
+benchmarks/micro-*.json
+benchmarks/metadata_*.pprof
+benchmarks/*.pprof
+!benchmarks/README.md
+!benchmarks/baseline.example.json
+
+# Top-level report JSON drops (final results live under reports/<run-id>/)
 reports/*.json
-reports/experiment-*/
+
 *.word
+*.test
+*.exe
+vendor/
+
+# Experiment intermediate artifacts: logs, profiles, packages, runtime state
+reports/**/runtime/
+reports/**/bin/
+reports/**/venv/
+reports/**/*.log
+reports/**/*.stderr.log
+reports/**/command_status.jsonl
+reports/**/*.pprof
+reports/**/*.tar.gz
+reports/**/compose.env
+reports/**/package.log
+reports/**/environment.txt
+reports/**/server_environment.txt

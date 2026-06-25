@@ -19,6 +19,7 @@ type EventPayload struct {
 	TaskID                 string          `json:"task_id,omitempty"`
 	Attempt                uint32          `json:"attempt,omitempty"`
 	InputHash              string          `json:"input_hash,omitempty"`
+	ResolvedArgsJSON       json.RawMessage `json:"resolved_args_json,omitempty"`
 	ResultJSON             json.RawMessage `json:"result_json,omitempty"`
 	ResultRef              string          `json:"result_ref,omitempty"`
 	Error                  string          `json:"error,omitempty"`
@@ -146,7 +147,7 @@ func applyWorkflowRecord(state State, fallbackWorkflowID string, rec logrecord.R
 		state.IdempotencyKey = payload.IdempotencyKey
 		state.IdempotencyFingerprint = payload.IdempotencyFingerprint
 	case "StepScheduled":
-		state.SetStepScheduled(payload.StepID, payload.TaskID, payload.Attempt, payload.InputHash, nil, payload.TimestampMs)
+		state.SetStepScheduled(payload.StepID, payload.TaskID, payload.Attempt, payload.InputHash, payload.ResolvedArgsJSON, payload.TimestampMs)
 	case "StepStarted":
 		state.SetStepStarted(payload.StepID, payload.TaskID, payload.TimestampMs)
 	case "StepSucceeded":
@@ -191,6 +192,9 @@ func eventPayloadMap(payload EventPayload) map[string]any {
 	if payload.InputHash != "" {
 		fields["input_hash"] = payload.InputHash
 	}
+	if len(payload.ResolvedArgsJSON) > 0 {
+		fields["resolved_args_json"] = []byte(payload.ResolvedArgsJSON)
+	}
 	if len(payload.ResultJSON) > 0 {
 		fields["result_json"] = []byte(payload.ResultJSON)
 	}
@@ -224,6 +228,7 @@ func eventPayloadFromMap(fields map[string]any) EventPayload {
 		TaskID:                 eventcodec.StringValue(fields["task_id"]),
 		Attempt:                eventcodec.Uint32Value(fields["attempt"]),
 		InputHash:              eventcodec.StringValue(fields["input_hash"]),
+		ResolvedArgsJSON:       json.RawMessage(eventcodec.BytesValue(fields["resolved_args_json"])),
 		ResultJSON:             json.RawMessage(eventcodec.BytesValue(fields["result_json"])),
 		ResultRef:              eventcodec.StringValue(fields["result_ref"]),
 		Error:                  eventcodec.StringValue(fields["error"]),

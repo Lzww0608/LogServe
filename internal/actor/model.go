@@ -489,12 +489,15 @@ func eventPayloadMap(payload EventPayload) map[string]any {
 	}
 	if len(payload.ArgsJSON) > 0 {
 		fields["args_json"] = []byte(payload.ArgsJSON)
+		fields["args_json_bytes"] = len(payload.ArgsJSON)
 	}
 	if len(payload.ResultJSON) > 0 {
 		fields["result_json"] = []byte(payload.ResultJSON)
+		fields["result_json_bytes"] = len(payload.ResultJSON)
 	}
 	if len(payload.StateJSON) > 0 {
 		fields["state_json"] = []byte(payload.StateJSON)
+		fields["state_json_bytes"] = len(payload.StateJSON)
 	}
 	if payload.SnapshotRef != "" {
 		fields["snapshot_ref"] = payload.SnapshotRef

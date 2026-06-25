@@ -1,0 +1,55 @@
+{
+  "verdict": "FAIL",
+  "generated_at_utc": "2026-06-23T15:38:53Z",
+  "workload": {
+    "tasks": 120,
+    "workflows": 12,
+    "actors": 12,
+    "llm_streams": 40,
+    "tail_events": 68
+  },
+  "checkpoint": {
+    "id": "checkpoint-0d063f68110f243a",
+    "stream_count": 196,
+    "task_count": 132,
+    "workflow_count": 12,
+    "actor_count": 12,
+    "llm_stats_count": 2
+  },
+  "full_replay": {
+    "duration_ms": 7.676,
+    "read_log_calls": 224,
+    "records_read": 614
+  },
+  "checkpoint_replay": {
+    "duration_ms": 5.573,
+    "read_log_calls": 201,
+    "records_read": 71
+  },
+  "ratios": {
+    "checkpoint_duration_over_full": 0.726,
+    "checkpoint_read_calls_over_full": 0.8973,
+    "checkpoint_records_over_full": 0.1156
+  },
+  "consistency": {
+    "consistent": false,
+    "checked_count": 157,
+    "failure_keys": [
+      "llm_stats"
+    ],
+    "checkpoint_id": "checkpoint-0d063f68110f243a",
+    "checkpoint_age_ms": 29
+  },
+  "checks": {
+    "checkpoint_created": true,
+    "checkpoint_read_records_reduced": true,
+    "checkpoint_replay_consistent": false,
+    "checkpoint_retention": true,
+    "checkpoint_tail_only_reads": true,
+    "corrupt_checkpoint_fallback": true
+  },
+  "failures": [
+    "checkpoint_replay_consistent",
+    "llm_stats"
+  ]
+}

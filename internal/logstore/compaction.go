@@ -608,7 +608,7 @@ func (s *Store) closeSegmentReaderLocked(segmentID uint64) error {
 	delete(s.segmentReaders, segmentID)
 	reader.cached = false
 	reader.element = nil
-	return reader.file.Close()
+	return reader.reader.Close()
 }
 
 func (s *Store) segmentReaderBusyLocked(segmentID uint64) bool {

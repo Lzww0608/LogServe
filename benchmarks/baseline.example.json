@@ -1,0 +1,17 @@
+{
+  "BenchmarkStoreAppendSingleStream/payload=128B/fsync=always": {
+    "ns_per_op": 0,
+    "bytes_per_op": 0,
+    "allocs_per_op": 0
+  },
+  "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=10": {
+    "ns_per_op": 0,
+    "bytes_per_op": 0,
+    "allocs_per_op": 0
+  },
+  "BenchmarkMemoryStoreConcurrentLeaseComplete/legacy": {
+    "ns_per_op": 0,
+    "bytes_per_op": 0,
+    "allocs_per_op": 0
+  }
+}

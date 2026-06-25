@@ -215,6 +215,7 @@ func (e *workflowTestEnv) restartControl(t *testing.T) {
 
 func runWorkerForTest(ctx context.Context, t *testing.T, env *workflowTestEnv, workerID string, maxTasks int) {
 	t.Helper()
+	ensureExecutorDeps(t)
 	err := worker.Run(ctx, worker.Config{
 		WorkerID:     workerID,
 		ControlAddr:  env.controlServer.Addr(),

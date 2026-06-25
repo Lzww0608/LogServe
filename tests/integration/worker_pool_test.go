@@ -12,6 +12,7 @@ import (
 )
 
 func TestWorkerLocalTaskPoolExecutesPythonTasksConcurrently(t *testing.T) {
+	ensureExecutorDeps(t)
 	env := startWorkflowEnv(t)
 	defer env.stop()
 

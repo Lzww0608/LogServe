@@ -455,7 +455,11 @@ start_native_runtime() {
   fi
   record_status runtime_logd_start 0 0 logd.log
 
-  start_bg control env LOGSERVE_API_TOKEN="$API_TOKEN" LOGSERVE_SCHEDULER_V2="$SCHEDULER_V2" go run ./cmd/logserve-control --addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR"
+  local control_pprof_args=()
+  if [ -n "${LOGSERVE_CONTROL_PPROF_ADDR:-}" ]; then
+    control_pprof_args=(--pprof-addr "$LOGSERVE_CONTROL_PPROF_ADDR")
+  fi
+  start_bg control env LOGSERVE_API_TOKEN="$API_TOKEN" LOGSERVE_SCHEDULER_V2="$SCHEDULER_V2" go run ./cmd/logserve-control --addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" "${control_pprof_args[@]}"
   local control_pid="$LAST_BG_PID"
   if ! wait_tcp 127.0.0.1 "${CONTROL_ADDR##*:}" 30 || ! ensure_bg_alive control "$control_pid"; then
     record_status runtime_control_start 1 30 control.log
@@ -620,8 +624,11 @@ run_step python_grpc_deps "$RUN_DIR/python_grpc_deps.log" "$PYTHON" -c "import g
 run_step build_logservectl "$RUN_DIR/build_logservectl.log" go build -o "$CLI_BIN" ./cmd/logservectl
 
 if [ "${LOGSERVE_RUN_GO_BENCH:-1}" = "1" ]; then
-  run_step scheduler_benchmark "$RUN_DIR/scheduler_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/control -run '^$' -bench BenchmarkSchedulerAssignMixedBacklog -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}"
-  run_step metadata_benchmark "$RUN_DIR/metadata_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/metadata -run '^$' -bench BenchmarkMemoryStore -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}" -memprofile "$RUN_DIR/metadata_heap.pprof" -mutexprofile "$RUN_DIR/metadata_mutex.pprof"
+  run_step scheduler_benchmark "$RUN_DIR/scheduler_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/control -run '^$' -bench 'BenchmarkSchedulerAssignMixedBacklog|BenchmarkPreferred' -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}"
+  run_step logstore_micro_benchmark "$RUN_DIR/logstore_micro_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/logstore -run '^$' -bench 'BenchmarkStoreAppend|BenchmarkStoreRecover|BenchmarkRead' -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}"
+  run_step bootstrap_micro_benchmark "$RUN_DIR/bootstrap_micro_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/control -run '^$' -bench BenchmarkBootstrapFromLog -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}"
+  run_step workflow_micro_benchmark "$RUN_DIR/workflow_micro_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/workflow -run '^$' -bench 'BenchmarkSchedule' -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}"
+  run_step metadata_benchmark "$RUN_DIR/metadata_benchmark.log" "${HOST_GO_ENV[@]}" go test ./internal/metadata -run '^$' -bench BenchmarkMemoryStore -benchmem -benchtime "${LOGSERVE_GO_BENCHTIME:-300ms}" -memprofile "$RUN_DIR/metadata_heap.pprof" -mutexprofile "$RUN_DIR/metadata_mutex.pprof" -blockprofile "$RUN_DIR/metadata_block.pprof"
 fi
 
 if [ "${LOGSERVE_RUN_LOGSTORE_BENCH:-1}" = "1" ]; then
@@ -643,6 +650,11 @@ if [ "${LOGSERVE_RUN_BENCHMARK:-1}" = "1" ]; then
     run_json_step postgres_after_benchmark "$RUN_DIR/postgres_after_benchmark.json" "$RUN_DIR/postgres_after_benchmark.stderr.log" postgres_stats_json
     run_json_step postgres_benchmark_stats "$RUN_DIR/postgres_benchmark_stats.json" "$RUN_DIR/postgres_benchmark_stats.stderr.log" postgres_benchmark_delta_json
     run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" "$PYTHON" examples/evaluation/checkpoint_cache.py
+    run_json_step checkpoint_cache_bench "$RUN_DIR/checkpoint_cache_bench.json" "$RUN_DIR/checkpoint_cache_bench.stderr.log" "$PYTHON" examples/evaluation/checkpoint_cache_bench.py
+    run_json_step executor_bench "$RUN_DIR/executor_bench.json" "$RUN_DIR/executor_bench.stderr.log" "$PYTHON" examples/evaluation/executor_bench.py
+    if [ -n "${LOGSERVE_PPROF_ADDR:-${LOGSERVE_CONTROL_PPROF_ADDR:-}}" ]; then
+      run_step collect_pprof "$RUN_DIR/collect_pprof.log" env LOGSERVE_PPROF_OUT="$RUN_DIR/profiles" bash scripts/collect_pprof.sh "${LOGSERVE_PPROF_ADDR:-$LOGSERVE_CONTROL_PPROF_ADDR}"
+    fi
     run_step checkpoint_cache_artifact "$RUN_DIR/checkpoint_cache_artifact.log" verify_checkpoint_cache_artifact
     run_json_step dashboard_snapshot "$RUN_DIR/dashboard_snapshot.json" "$RUN_DIR/dashboard_snapshot.stderr.log" "$CLI_BIN" dashboard-snapshot --control-addr "$CONTROL_ADDR"
     run_json_step dashboard_replay_consistency "$RUN_DIR/dashboard_replay_consistency.json" "$RUN_DIR/dashboard_replay_consistency.stderr.log" verify_dashboard_replay_consistency

@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -140,6 +141,54 @@ func TestReplayRawEachConsumesRawWorkflowRecords(t *testing.T) {
 	}
 	if step.TaskID != "task-1" || step.LastInputHash != "hash" {
 		t.Fatalf("step after raw replay = %+v", step)
+	}
+}
+
+func TestReplayRawEachRestoresResolvedArgsCache(t *testing.T) {
+	definition := json.RawMessage(`{"workflow_name":"wf","steps":[{"step_id":"step-1","task_name":"task","function_name":"fn","function_source":"def fn():\n    return 1\n"}],"result_step_id":"step-1"}`)
+	started, err := MarshalEventPayload(EventPayload{DefinitionJSON: definition, TimestampMs: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved := []byte(`{"args":[1],"kwargs":{}}`)
+	scheduled, err := MarshalEventPayload(EventPayload{
+		StepID:           "step-1",
+		TaskID:           "task-1",
+		Attempt:          1,
+		InputHash:        "hash",
+		ResolvedArgsJSON: resolved,
+		TimestampMs:      11,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := ReplayRawEach("wf-1", func(emit func(logrecord.RawRecord) error) error {
+		if err := emit(logrecord.RawRecord{EventType: "WorkflowStarted", Payload: started, TimestampMs: 10}); err != nil {
+			return err
+		}
+		return emit(logrecord.RawRecord{EventType: "StepScheduled", Payload: scheduled, TimestampMs: 11})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, ok := state.Step("step-1")
+	if !ok {
+		t.Fatal("step missing")
+	}
+	if !bytes.Equal(step.ResolvedArgsJSON, resolved) {
+		t.Fatalf("resolved args = %q, want %q", step.ResolvedArgsJSON, resolved)
+	}
+	args, hash, err := ResolveCachedArgs(
+		StepDefinition{StepID: "step-1"},
+		step,
+		state,
+		failingResultLoader{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash != "hash" || string(args) != string(resolved) {
+		t.Fatalf("cached resolve = %q hash=%q", args, hash)
 	}
 }
 

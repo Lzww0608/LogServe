@@ -22,6 +22,7 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/eventcodec"
 	"github.com/logserve/logserve/internal/objectstore"
+	"github.com/logserve/logserve/internal/actorlock"
 	"github.com/logserve/logserve/internal/observability"
 	"github.com/logserve/logserve/internal/rpcauth"
 	"github.com/vmihailenco/msgpack/v5"
@@ -101,7 +102,15 @@ const (
 	executorProtocolJSON    = "json"
 	executorProtocolMsgpack = "msgpack"
 	maxExecutorFrameBytes   = 16 << 20
+	maxPooledExecutorFrame  = 4 << 20
 )
+
+var executorFrameBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 64*1024)
+		return &buf
+	},
+}
 
 type pythonRunner struct {
 	cmd            *exec.Cmd
@@ -198,8 +207,7 @@ type localExecutorPool struct {
 	llmQueue      chan workerJob
 	actorQueue    chan workerJob
 	results       chan workerJobResult
-	actorLocksMu  sync.Mutex
-	actorLocks    map[string]*sync.Mutex
+	actorLocks    *actorlock.Table
 	closeOnce     sync.Once
 	wg            sync.WaitGroup
 }
@@ -481,7 +489,7 @@ func startLocalExecutorPool(ctx context.Context, cfg Config, cache *modelCache, 
 		llmQueue:      make(chan workerJob, queueSize),
 		actorQueue:    make(chan workerJob, queueSize),
 		results:       make(chan workerJobResult, queueSize),
-		actorLocks:    map[string]*sync.Mutex{},
+		actorLocks:    actorlock.NewTable(),
 	}
 
 	for _, runner := range taskRunners {
@@ -584,19 +592,10 @@ func (p *localExecutorPool) finish(ctx context.Context, task *logservepb.TaskSpe
 }
 
 func (p *localExecutorPool) lockActor(actorID string) func() {
-	if actorID == "" {
+	if p == nil || p.actorLocks == nil {
 		return nil
 	}
-	p.actorLocksMu.Lock()
-	lock, ok := p.actorLocks[actorID]
-	if !ok {
-		lock = &sync.Mutex{}
-		p.actorLocks[actorID] = lock
-	}
-	p.actorLocksMu.Unlock()
-
-	lock.Lock()
-	return lock.Unlock
+	return p.actorLocks.Lock(actorID)
 }
 
 func closeRunners(runners []*pythonRunner) {
@@ -952,7 +951,9 @@ func (r *pythonRunner) executeMsgpackLocked(ctx context.Context, req any) (execu
 		if err != nil {
 			return executorResponse{}, executorReadError(err, r.stderr)
 		}
-		return unmarshalExecutorResponseMsgpack(data)
+		resp, err := unmarshalExecutorResponseMsgpack(data)
+		putExecutorFrameBuffer(data)
+		return resp, err
 	})
 }
 
@@ -1064,11 +1065,32 @@ func readExecutorFrame(r io.Reader) ([]byte, error) {
 	if size > maxExecutorFrameBytes {
 		return nil, fmt.Errorf("executor frame %d exceeds max %d", size, maxExecutorFrameBytes)
 	}
-	data := make([]byte, int(size))
+	data := getExecutorFrameBuffer(int(size))
 	if _, err := io.ReadFull(r, data); err != nil {
+		putExecutorFrameBuffer(data)
 		return nil, err
 	}
 	return data, nil
+}
+
+func getExecutorFrameBuffer(size int) []byte {
+	if size > maxPooledExecutorFrame {
+		return make([]byte, size)
+	}
+	ptr := executorFrameBufferPool.Get().(*[]byte)
+	buf := *ptr
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func putExecutorFrameBuffer(buf []byte) {
+	if cap(buf) == 0 || cap(buf) > maxPooledExecutorFrame {
+		return
+	}
+	buf = buf[:0]
+	executorFrameBufferPool.Put(&buf)
 }
 
 func executorReadError(err error, stderr *lockedBuffer) error {

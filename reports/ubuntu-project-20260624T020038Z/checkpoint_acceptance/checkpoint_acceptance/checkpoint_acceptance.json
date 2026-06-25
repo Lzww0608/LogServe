@@ -1,0 +1,48 @@
+{
+  "verdict": "PASS",
+  "generated_at_utc": "2026-06-24T02:02:41Z",
+  "workload": {
+    "tasks": 120,
+    "workflows": 12,
+    "actors": 12,
+    "llm_streams": 40,
+    "tail_events": 68
+  },
+  "checkpoint": {
+    "id": "checkpoint-f713852b83b7fe04",
+    "stream_count": 196,
+    "task_count": 132,
+    "workflow_count": 12,
+    "actor_count": 12,
+    "llm_stats_count": 2
+  },
+  "full_replay": {
+    "duration_ms": 10.471,
+    "read_log_calls": 224,
+    "records_read": 614
+  },
+  "checkpoint_replay": {
+    "duration_ms": 6.51,
+    "read_log_calls": 201,
+    "records_read": 71
+  },
+  "ratios": {
+    "checkpoint_duration_over_full": 0.6217,
+    "checkpoint_read_calls_over_full": 0.8973,
+    "checkpoint_records_over_full": 0.1156
+  },
+  "consistency": {
+    "consistent": true,
+    "checked_count": 156,
+    "checkpoint_id": "checkpoint-f713852b83b7fe04",
+    "checkpoint_age_ms": 30
+  },
+  "checks": {
+    "checkpoint_created": true,
+    "checkpoint_read_records_reduced": true,
+    "checkpoint_replay_consistent": true,
+    "checkpoint_retention": true,
+    "checkpoint_tail_only_reads": true,
+    "corrupt_checkpoint_fallback": true
+  }
+}

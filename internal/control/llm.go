@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/logrecord"
 	"github.com/logserve/logserve/internal/metadata"
 )
 
@@ -144,18 +145,18 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 		return nil, errors.New("task_id is required")
 	}
 	out := &logservepb.ReplayLLMResponse{TaskId: req.GetTaskId()}
-	if err := s.forEachLogRecord(ctx, llmStream(req.GetTaskId()), func(rec *logservepb.LogRecord) error {
+	if err := s.forEachRawLogRecord(ctx, llmStream(req.GetTaskId()), 1, func(rec logrecord.RawRecord) error {
 		var payload llmEventPayload
-		if len(rec.GetPayload()) > 0 {
-			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		if len(rec.Payload) > 0 {
+			if err := json.Unmarshal(rec.Payload, &payload); err != nil {
 				return err
 			}
 		}
 		if payload.TimestampMs == 0 {
-			payload.TimestampMs = rec.GetTimestampMs()
+			payload.TimestampMs = rec.TimestampMs
 		}
 		event := &logservepb.LLMEvent{
-			EventType:          rec.GetEventType(),
+			EventType:          rec.EventType,
 			TimestampMs:        payload.TimestampMs,
 			TaskId:             payload.TaskID,
 			ModelName:          payload.ModelName,
@@ -180,7 +181,7 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 		if payload.WorkerID != "" {
 			out.WorkerId = payload.WorkerID
 		}
-		if rec.GetEventType() == "ModelLoaded" {
+		if rec.EventType == "ModelLoaded" {
 			out.CacheHit = payload.CacheHit
 			out.CheckpointFetchMs = payload.CheckpointFetchMs
 			out.CacheUsedBytes = payload.CacheUsedBytes
@@ -188,7 +189,7 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 			out.EvictionCount = payload.EvictionCount
 			out.ModelLoadMs = payload.ModelLoadMs
 		}
-		if rec.GetEventType() == "LLMCompleted" {
+		if rec.EventType == "LLMCompleted" {
 			out.CacheHit = payload.CacheHit
 			out.CheckpointFetchMs = payload.CheckpointFetchMs
 			out.CacheUsedBytes = payload.CacheUsedBytes
@@ -253,14 +254,14 @@ func (s *Service) canAssignTaskToWorkerIndexed(taskID string, spec *logservepb.T
 }
 
 func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) string {
-	if s.useSchedulerV2() {
-		s.syncSchedulerWorkers()
-		createdAtMs := int64(0)
-		if task, ok := s.meta.GetTask(taskID); ok {
-			createdAtMs = task.CreatedAtMs
-		}
+	createdAtMs := int64(0)
+	if task, ok := s.meta.GetTask(taskID); ok {
+		createdAtMs = task.CreatedAtMs
+	}
+	key := modelKeyFromParts(spec.GetLlmModelName(), spec.GetLlmModelVersion())
+	if s.scheduler != nil {
 		return s.scheduler.PreferredLocalityWorker(
-			modelKeyFromParts(spec.GetLlmModelName(), spec.GetLlmModelVersion()),
+			key,
 			createdAtMs,
 			time.Now().UnixMilli(),
 			localityQueueWait.Milliseconds(),
@@ -308,19 +309,29 @@ func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) s
 }
 
 func (s *Service) predictedLLMWorker(taskID string, spec *logservepb.TaskSpec) string {
-	workers := s.meta.ActiveWorkers(schedulerWorkerLease)
-	if len(workers) == 0 {
-		return ""
-	}
 	modelName := spec.GetLlmModelName()
 	modelVersion := spec.GetLlmModelVersion()
-	modelKey := metadata.ModelKey(spec.GetLlmModelName(), spec.GetLlmModelVersion())
+	modelKey := metadata.ModelKey(modelName, modelVersion)
 	task, _ := s.meta.GetTask(taskID)
 	queueDelayMs := int64(0)
 	if task.CreatedAtMs > 0 {
 		queueDelayMs = time.Since(time.UnixMilli(task.CreatedAtMs)).Milliseconds()
 	}
-
+	if s.scheduler != nil {
+		if s.scheduler.WorkerCount() == 0 {
+			s.syncActiveSchedulerWorkers()
+		}
+		return s.scheduler.PreferredPredictedWorker(
+			modelKeyFromParts(modelName, modelVersion),
+			modelKey,
+			queueDelayMs,
+			localityQueueWait.Milliseconds(),
+		)
+	}
+	workers := s.meta.ActiveWorkers(schedulerWorkerLease)
+	if len(workers) == 0 {
+		return ""
+	}
 	bestWorker := ""
 	bestPrediction := int64(1<<62 - 1)
 	for _, worker := range workers {
@@ -395,16 +406,16 @@ func (s *Service) llmStatsForWorker(modelName, modelVersion, workerID string) (l
 
 func (s *Service) materializeLLMTaskCompletion(ctx context.Context, taskID string) error {
 	var done bool
-	return s.forEachLogRecord(ctx, llmStream(taskID), func(rec *logservepb.LogRecord) error {
-		if done || rec.GetEventType() != "LLMCompleted" {
+	return s.forEachRawLogRecord(ctx, llmStream(taskID), 1, func(rec logrecord.RawRecord) error {
+		if done || rec.EventType != "LLMCompleted" {
 			return nil
 		}
 		var payload llmEventPayload
-		if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+		if err := json.Unmarshal(rec.Payload, &payload); err != nil {
 			return err
 		}
 		if payload.TimestampMs == 0 {
-			payload.TimestampMs = rec.GetTimestampMs()
+			payload.TimestampMs = rec.TimestampMs
 		}
 		s.materializeLLMCompleted(payload)
 		done = true
@@ -440,6 +451,9 @@ func (s *Service) materializeLLMCompleted(payload llmEventPayload) {
 	stats.LastEvictionCount = payload.EvictionCount
 	stats.LastUpdatedMs = updatedAt
 	s.llmStats[key] = stats
+	if s.scheduler != nil {
+		s.scheduler.UpdateLLMStats(payload.ModelName, modelVersion, payload.WorkerID, stats)
+	}
 }
 
 func updateEWMA(previous, sample int64, count uint64) int64 {
@@ -459,16 +473,16 @@ func (s *Service) bootstrapLLMStats(ctx context.Context) error {
 	s.llmStats = make(map[llmStatsKey]llmWorkerStats)
 	s.llmStatsMu.Unlock()
 	for _, streamID := range streams {
-		if err := s.forEachLogRecord(ctx, streamID, func(rec *logservepb.LogRecord) error {
-			if rec.GetEventType() != "LLMCompleted" {
+		if err := s.forEachRawLogRecord(ctx, streamID, 1, func(rec logrecord.RawRecord) error {
+			if rec.EventType != "LLMCompleted" {
 				return nil
 			}
 			var payload llmEventPayload
-			if err := json.Unmarshal(rec.GetPayload(), &payload); err != nil {
+			if err := json.Unmarshal(rec.Payload, &payload); err != nil {
 				return err
 			}
 			if payload.TimestampMs == 0 {
-				payload.TimestampMs = rec.GetTimestampMs()
+				payload.TimestampMs = rec.TimestampMs
 			}
 			s.materializeLLMCompleted(payload)
 			return nil

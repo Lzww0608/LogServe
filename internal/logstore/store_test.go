@@ -1206,6 +1206,13 @@ func TestRecordCorruptionRecovery(t *testing.T) {
 			wantCount: 0,
 		},
 		{
+			name: "header magic",
+			corrupt: func(t *testing.T, path string) {
+				mutateFileByte(t, path, 0, 0xff)
+			},
+			wantCount: 0,
+		},
+		{
 			name: "payload",
 			corrupt: func(t *testing.T, path string) {
 				file, err := os.Open(path)
@@ -1275,6 +1282,41 @@ func TestRecordCorruptionRecovery(t *testing.T) {
 				t.Fatalf("records = %d, want %d", len(records), tc.wantCount)
 			}
 		})
+	}
+}
+
+func TestLargePayloadChunkedChecksumRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("x"), checksumChunkSize+1)
+	if _, _, err := store.Append(AppendRequest{
+		StreamID:  "task:large",
+		EventType: "LargeEvent",
+		Payload:   payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	records, err := recovered.Read("task:large", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || !bytes.Equal(records[0].Payload, payload) {
+		t.Fatalf("recovered payload len=%d want=%d", len(records[0].Payload), len(payload))
+	}
+	if records[0].ChecksumType != ChecksumTypeCRC32C {
+		t.Fatalf("checksum type = %s, want CRC32C", records[0].ChecksumType)
 	}
 }
 

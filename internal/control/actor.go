@@ -9,6 +9,7 @@ import (
 
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/actor"
+	"github.com/logserve/logserve/internal/logrecord"
 	"github.com/logserve/logserve/internal/metadata"
 	"github.com/logserve/logserve/internal/objectstore"
 	"github.com/logserve/logserve/internal/observability"
@@ -147,9 +148,8 @@ func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorReques
 }
 
 func (s *Service) submitActorCommand(ctx context.Context, req *logservepb.CallActorRequest, deadlineAt time.Time) (metadata.Task, error) {
-	lock := s.actorLock(req.GetActorId())
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := s.actorLocks.Lock(req.GetActorId())
+	defer unlock()
 
 	state, err := s.waitActorOwner(ctx, req.GetActorId(), deadlineAt)
 	if err != nil {
@@ -390,11 +390,14 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 	}
 	if commandCount == 1 || commandCount%100 == 0 {
 		observability.Info("actor_command_applied", map[string]any{
-			"actor_id":      task.ActorID,
-			"call_id":       task.ActorCallID,
-			"command_count": commandCount,
-			"epoch":         req.GetActorEpoch(),
-			"latency_ms":    now - task.CreatedAtMs,
+			"actor_id":           task.ActorID,
+			"call_id":            task.ActorCallID,
+			"command_count":      commandCount,
+			"epoch":              req.GetActorEpoch(),
+			"latency_ms":         now - task.CreatedAtMs,
+			"state_json_bytes":   len(stateJSON),
+			"args_json_bytes":    len(spec.GetArgsJson()),
+			"result_json_bytes":  len(req.GetResultJson()),
 		})
 	}
 	return nil
@@ -485,8 +488,8 @@ func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) er
 
 func (s *Service) replayActor(ctx context.Context, actorID string) (actor.ReplayResult, error) {
 	streamID := actorStream(actorID)
-	return actor.ReplayEach(actorID, func(emit func(*logservepb.LogRecord) error) error {
-		return s.forEachLogRecord(ctx, streamID, emit)
+	return actor.ReplayRawEach(actorID, func(emit func(logrecord.RawRecord) error) error {
+		return s.forEachRawLogRecord(ctx, streamID, 1, emit)
 	}, s)
 }
 

@@ -41,26 +41,67 @@ func BenchmarkReadLargeStream(b *testing.B) {
 }
 
 func BenchmarkReadRawLargeStream(b *testing.B) {
-	store := buildBenchmarkStore(b, 100_000)
-	defer store.Close()
+	for _, mmapRead := range []bool{false, true} {
+		if mmapRead && !mmapSupported() {
+			continue
+		}
+		label := "readat"
+		if mmapRead {
+			label = "mmap"
+		}
+		b.Run(label, func(b *testing.B) {
+			store := buildBenchmarkStoreWithMmap(b, 100_000, mmapRead)
+			defer store.Close()
 
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		count := 0
-		if err := store.ReadRawEach("bench:large-stream", 50_000, 10, func(rec logrecord.RawRecord) error {
-			if len(rec.Payload) != 1 {
-				b.Fatalf("payload len = %d", len(rec.Payload))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				count := 0
+				if err := store.ReadRawEach("bench:large-stream", 50_000, 10, func(rec logrecord.RawRecord) error {
+					if len(rec.Payload) != 1 {
+						b.Fatalf("payload len = %d", len(rec.Payload))
+					}
+					count++
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
+				if count != 10 {
+					b.Fatalf("records = %d, want 10", count)
+				}
 			}
-			count++
-			return nil
+		})
+	}
+}
+
+func buildBenchmarkStoreWithMmap(b *testing.B, entries int, mmapRead bool) *Store {
+	b.Helper()
+	dir := b.TempDir()
+	opts := DefaultOptions()
+	opts.FsyncPolicy = FsyncBatch
+	opts.SegmentSizeBytes = 1 << 30
+	opts.MmapRead = mmapRead
+	store, err := OpenWithOptions(dir, opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < entries; i++ {
+		if _, _, err := store.Append(AppendRequest{
+			StreamID:  "bench:large-stream",
+			EventType: "BenchEvent",
+			Payload:   []byte("x"),
 		}); err != nil {
 			b.Fatal(err)
 		}
-		if count != 10 {
-			b.Fatalf("records = %d, want 10", count)
-		}
 	}
+	if err := store.Close(); err != nil {
+		b.Fatal(err)
+	}
+	store, err = OpenWithOptions(dir, opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return store
 }
 func buildBenchmarkStore(b *testing.B, entries int) *Store {
 	b.Helper()
@@ -145,6 +186,21 @@ func BenchmarkChecksumPayloadSizes(b *testing.B) {
 				}
 				_ = sum
 			})
+			if size > checksumChunkSize && (typ == ChecksumTypeIEEE || typ == ChecksumTypeCRC32C) {
+				b.Run(fmt.Sprintf("%s/%s/chunked", payloadSizeName(size), typ), func(b *testing.B) {
+					b.SetBytes(int64(size))
+					b.ReportAllocs()
+					var sum uint32
+					for i := 0; i < b.N; i++ {
+						got, err := checksumChunked(payload, typ)
+						if err != nil {
+							b.Fatal(err)
+						}
+						sum = got
+					}
+					_ = sum
+				})
+			}
 		}
 	}
 }

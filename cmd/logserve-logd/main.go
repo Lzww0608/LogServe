@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/logserve/logserve/internal/app/logd"
@@ -12,6 +14,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "gRPC listen address")
+	pprofAddr := flag.String("pprof-addr", observability.PprofAddrFromEnv(), "optional pprof listen address, for example 127.0.0.1:6061")
 	dataDir := flag.String("data-dir", "data/logstore", "logstore data directory")
 	segmentSizeBytes := flag.Int64("segment-size-bytes", logstore.DefaultOptions().SegmentSizeBytes, "maximum bytes per log segment before rolling")
 	fsyncPolicy := flag.String("fsync-policy", string(logstore.FsyncAlways), "fsync policy: always, batch, interval")
@@ -21,6 +24,8 @@ func main() {
 	compactionMaxBytesPerSecond := flag.Int64("compaction-max-bytes-per-second", logstore.DefaultOptions().CompactionMaxBytesPerSecond, "maximum copy-compaction write rate in bytes per second")
 	flag.Parse()
 
+	observability.StartDebugServer(*pprofAddr)
+
 	opts := logstore.DefaultOptions()
 	opts.SegmentSizeBytes = *segmentSizeBytes
 	opts.FsyncPolicy = logstore.FsyncPolicy(*fsyncPolicy)
@@ -28,6 +33,9 @@ func main() {
 	opts.CompactionInterval = time.Duration(*compactionIntervalMs) * time.Millisecond
 	opts.CompactionCopyLiveRatioThreshold = *compactionCopyLiveRatio
 	opts.CompactionMaxBytesPerSecond = *compactionMaxBytesPerSecond
+	if v := os.Getenv("LOGSERVE_LOG_MMAP_READ"); v == "1" || strings.EqualFold(v, "true") {
+		opts.MmapRead = true
+	}
 
 	srv, err := logd.StartWithOptions(*addr, *dataDir, opts)
 	if err != nil {
@@ -42,6 +50,7 @@ func main() {
 		"compaction_interval_ms":          opts.CompactionInterval.Milliseconds(),
 		"compaction_copy_live_ratio":      opts.CompactionCopyLiveRatioThreshold,
 		"compaction_max_bytes_per_second": opts.CompactionMaxBytesPerSecond,
+		"mmap_read":                       opts.MmapRead,
 	})
 	select {}
 }

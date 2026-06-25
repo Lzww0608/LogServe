@@ -14,6 +14,7 @@ import (
 
 func init() {
 	runtime.SetMutexProfileFraction(1)
+	runtime.SetBlockProfileRate(10000)
 }
 
 func BenchmarkMemoryStoreConcurrentGetTask(b *testing.B) {

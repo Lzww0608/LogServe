@@ -134,6 +134,31 @@ Each `TaskStarted` event includes `local_queue_wait_ms`, which records how long
 the task waited in the worker-local queue before an executor goroutine started
 it. This is the worker-side signal for queue wait and pool saturation.
 
+## Worker Poll Batching And Long-Poll
+
+Workers no longer rely on a fixed poll tick for every idle cycle. Heartbeat and
+task pull are split: heartbeat uses `--heartbeat-ms` (default 1000ms) while poll
+uses `--poll-ms` as the long-poll timeout when the local pool is idle.
+
+Control plane `PollTask` accepts:
+
+```text
+max_tasks         batch size (up to 64); worker requests idle local capacity
+wait_timeout_ms   long-poll wait when no tasks are ready
+```
+
+The worker batches `PollTask(max_tasks=idle_capacity)` and dispatches all
+returned specs into the local executor pool. Completions are flushed through
+`CompleteTasks` in one RPC per result burst.
+
+`notifyTaskAvailable()` wakes long-polling workers as soon as tasks are enqueued,
+so low-load scheduling latency does not wait for the next poll interval.
+
+Server-streaming `TaskStream` is intentionally not exposed yet. Unary batch +
+long-poll already removes the main empty-spin and tick-delay path; adding push
+streaming would require stream flow control, reconnect, lease recovery, and
+per-worker backpressure before it becomes a supported protocol surface.
+
 ## Python SDK Transport And Idempotency
 
 The Python SDK defaults to `LOGSERVE_SDK_TRANSPORT=auto`: it uses the native
@@ -182,6 +207,61 @@ can tune the workload through environment variables such as
 `LOGSERVE_LOGBENCH_RECORDS`, `LOGSERVE_LOGBENCH_PAYLOAD_BYTES`, and
 `LOGSERVE_LOGBENCH_SEGMENT_SIZE_BYTES`.
 
+Log records use format version 2 with a 40-byte header. Version 1 segments
+remain readable: they use a 36-byte header and implicit CRC32 IEEE checksum.
+New records default to CRC32C (Castagnoli) via hardware-accelerated
+`github.com/klauspost/crc32`; the header extension records the checksum type
+(`IEEE`, `CRC32C`, `XXH3`, `None`). Bodies larger than 64 KiB are checksummed
+and verified in 64 KiB chunks so large payloads do not require a single
+monolithic hash pass. Configure the writer checksum through
+`logstore.Options.ChecksumType` (default `CRC32C`). Run checksum benchmarks with:
+
+```bash
+go test -mod=mod ./internal/logstore/... -bench=BenchmarkChecksum -benchmem -run='^$'
+```
+
+## Serialization And Buffer Pools
+
+Hot paths use pooled buffers and binary codecs where profiling showed
+allocation pressure, without replacing JSON globally:
+
+- Log record encode uses `sync.Pool` (`encodeRecordPooled`) for header+body buffers.
+- Local object store streaming copies use a pooled 32 KiB buffer.
+- Python executor IPC defaults to length-prefixed msgpack frames (`--loop-msgpack`);
+  set `LOGSERVE_EXECUTOR_PROTOCOL=json` to force JSON lines. Executor frame reads
+  reuse a pooled buffer up to 4 MiB.
+- Internal log event payloads for `TaskSubmitted`, workflow events, actor events,
+  and task lifecycle (`TaskStarted`/`TaskRedelivered`/`TaskCompleted`/`TaskFailed`)
+  use msgpack with `LSE\x01` magic and JSON fallback for older segments.
+- `ReadRawEach` / `ReadLogRawEach` let replay reducers consume scratch-backed
+  payloads without constructing full `Record` objects. `ReadLogStream` on logd
+  streams from the raw path. Control bootstrap, checkpoint replay, task/workflow/
+  actor/LLM replay, function registry, and system streams use the raw iterator.
+- Workflow `StepScheduled` events persist `resolved_args_json` so retries and
+  log-only bootstrap can hit `ResolveCachedArgs` without re-marshaling step args.
+
+CLI and dashboard surfaces remain JSON. Migrate additional event types only when
+profiling shows marshal/unmarshal in the flame graph.
+
+## Mmap Read Experiment (Linux/macOS)
+
+Sealed log segments can be read through a read-only `mmap` mapping instead of
+per-record `ReadAt` syscalls. The active segment always uses `ReadAt`. Enable
+with:
+
+```bash
+export LOGSERVE_LOG_MMAP_READ=1
+```
+
+`Store.MmapReadStats()` reports mapped segment count and bytes. Compaction unmaps
+cached readers before deleting segment files. Windows builds disable mmap read.
+
+Compare read/replay benchmarks:
+
+```bash
+go test ./internal/logstore/... -bench=BenchmarkReadRawLargeStream -benchmem -run='^$'
+```
+
 ## Docker Compose
 
 The Compose file starts PostgreSQL, NATS JetStream, MinIO, logd, control, and a worker:
@@ -222,6 +302,14 @@ controls how many checkpoint records are retained, defaulting to 3.
 ```powershell
 go test ./...
 ```
+
+On Ubuntu/Linux with the `mcts` conda environment (Python executor msgpack deps):
+
+```bash
+bash scripts/test_conda_mcts.sh
+```
+
+Override the conda env with `LOGSERVE_CONDA_ENV` if needed.
 
 Covered task and log checks:
 
@@ -265,6 +353,32 @@ objects under a filesystem-backed `local://` namespace. Set
 `LOGSERVE_S3_ENDPOINT`, `LOGSERVE_S3_BUCKET`, `LOGSERVE_S3_ACCESS_KEY`, and
 `LOGSERVE_S3_SECRET_KEY` to use the S3-compatible MinIO adapter. The Compose
 environment wires this to its MinIO service.
+
+### Runtime DAG Scheduling
+
+Workflow runtime state keeps external JSON `step_id` keys, but internally uses a
+topologically ordered `[]StepState` plus a `RuntimeDAG` view:
+
+- `byID` maps `step_id` to slice index (built once after `ParseDefinition`).
+- `remainingDeps` tracks unresolved upstream count per step.
+- `outgoing` lists downstream indices for incremental updates.
+- `ready` is a queue of step indices eligible for scheduling.
+
+`scheduleReadySteps` pops from the ready queue via `PopReadyStep` instead of
+scanning every definition step and map lookup on each schedule pass. When a step
+succeeds, `SetStepSucceeded` only walks its outgoing edges to decrement
+`remainingDeps` and enqueue newly ready steps.
+
+Replay and legacy persisted state still accept the historical
+`map[string]StepState` JSON shape; `UnmarshalJSON` normalizes into the slice
+layout and calls `RebuildRuntime` to reconstruct the ready frontier. Retry,
+timeout, and duplicate-completion semantics are unchanged.
+
+Benchmark the ready-queue path vs a legacy full-scan baseline:
+
+```bash
+go test ./internal/workflow -bench='Schedule.*DAG' -benchmem
+```
 
 ## Actor Demo
 
@@ -367,8 +481,27 @@ but segment files are not physically deleted. The retained actor tail starts at
 full physical compaction.
 
 Observability is emitted as structured logs. Workflow runs include end-to-end
-latency and step latency; actor commands include actor id, call id, epoch, and
-command count, with replay exposing full versus snapshot command counts.
+latency and step latency; actor commands include actor id, call id, epoch,
+command count, and payload byte sizes (`state_json_bytes`, `args_json_bytes`,
+`result_json_bytes`), with replay exposing full versus snapshot command counts.
+
+### Actor Mailbox And Scheduler v2
+
+Actor commands are not mixed with the general FIFO queue when scheduler v2 is
+enabled (`LOGSERVE_SCHEDULER_V2=1`). The indexed scheduler routes actor tasks into
+`actorPending[actor_id]` deques. Owner workers poll only their owned actor IDs,
+and `command_seq == command_count + 1` gating prevents a blocked future command
+from head-of-line blocking unrelated general or LLM tasks.
+
+Per-actor mutex tables on control and worker use refcount-free idle eviction:
+after unlock, an entry is removed when no other goroutine holds the lock. Empty
+`actorPending` deques are pruned after the last task is assigned so actor count
+does not leak map entries over long runtimes.
+
+Large actor state shipped on each poll is logged as `actor_command_dispatched`
+when `state_json_bytes` exceeds 4 KiB. Periodic snapshots already trim the actor
+log tail; delta snapshots for high-frequency large-state actors remain a future
+optimization path.
 
 ## LLM Demo
 
@@ -458,6 +591,29 @@ Three scheduler policies are implemented:
   `O(number_of_workers)` lookup instead of a replay-all scan over `llm:*`
   streams.
 
+### LLM Placement Index
+
+Scheduler state incrementally maintains per-model placement heaps instead of
+scanning all active workers on every poll:
+
+- Heartbeat / task lease updates call `UpsertWorker` to refresh capacity,
+  cached models, and heap membership.
+- `LLMCompleted` updates EWMA stats and re-scores the worker in the model's
+  predicted heap.
+- `LOCALITY_AWARE` reads cached/cold heaps (cache hit, capacity, queue wait).
+- `PREDICTED_LATENCY` walks the model's predicted heap ordered by EWMA latency,
+  cold-start penalty, eviction risk, and running-task queue penalty.
+
+`PollTask` no longer calls a full `ListWorkers` sync on every indexed poll;
+workers are hydrated from heartbeat updates, with a one-time active-worker sync
+only when the placement index is empty after restart.
+
+Benchmark placement-index selection vs full worker scan:
+
+```bash
+go test ./internal/control -bench='Preferred(Locality|Predicted)' -benchmem -run='^$'
+```
+
 The predicted-latency stats are keyed by `(model_name, model_version,
 worker_id)` and maintained from `LLMCompleted` events when LLM tasks finish.
 Each entry tracks request count, cache-hit count, EWMA total latency, EWMA model
@@ -497,6 +653,50 @@ Covered LLM checks:
 - file-backed checkpoint cache fetches on the first request, hits on the second
   request, and reports persisted cache entries after worker restart
 - a RAG workflow can use `llm_generate()` as a real workflow step
+
+## Benchmarks, Profiles, And Regression Gates
+
+Each optimization should ship with:
+
+1. Correctness tests (`go test ./...`).
+2. Microbenchmark before/after (`bash scripts/benchmark_micro.sh`).
+3. Macro benchmark (`bash scripts/run_experiment.sh` or `examples/evaluation/benchmark.py`).
+4. pprof evidence (`bash scripts/collect_pprof.sh`).
+5. A documented rollback flag (for example `LOGSERVE_SCHEDULER_V2`, `LOGSERVE_LOG_MMAP_READ`).
+
+### Microbenchmarks
+
+| Area | Command |
+|------|---------|
+| Logstore append/recover | `go test ./internal/logstore -bench 'BenchmarkStoreAppend|BenchmarkStoreRecover' -benchmem` |
+| Logstore read | `go test ./internal/logstore -bench 'BenchmarkRead' -benchmem` |
+| Control scheduler | `go test ./internal/control -bench 'BenchmarkSchedulerAssignMixedBacklog|BenchmarkPreferred' -benchmem` |
+| Metadata | `go test ./internal/metadata -bench BenchmarkMemoryStore -benchmem` |
+| Bootstrap | `go test ./internal/control -bench BenchmarkBootstrapFromLog -benchmem` |
+| Workflow DAG | `go test ./internal/workflow -bench 'BenchmarkSchedule' -benchmem` |
+
+Run the full micro suite and emit JSON:
+
+```bash
+bash scripts/benchmark_micro.sh
+python3 scripts/compare_benchmark.py benchmarks/baseline.json benchmarks/micro-<timestamp>.json
+```
+
+### Runtime pprof
+
+Services accept `--pprof-addr` or `LOGSERVE_PPROF_ADDR`. Mutex/block profiling is enabled via
+`LOGSERVE_MUTEX_PROFILE_FRACTION` and `LOGSERVE_BLOCK_PROFILE_RATE`.
+
+```bash
+LOGSERVE_PPROF_ADDR=127.0.0.1:6062 ./cmd/logserve-control/control ...
+bash scripts/collect_pprof.sh 127.0.0.1:6062 benchmarks/profiles
+```
+
+### Macro experiment pipeline
+
+`scripts/run_experiment.sh` runs correctness, race, Go microbenches, logstore macro bench,
+runtime macro benchmark, checkpoint cache probe/bench, executor bench, optional pprof capture,
+and `scripts/summarize_experiment.py`.
 
 ## Analysis And Hardening
 

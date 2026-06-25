@@ -1,0 +1,5 @@
+{
+  "run_compose_experiment": true,
+  "run_checkpoint_acceptance": true,
+  "run_postgres_async_acceptance": true
+}

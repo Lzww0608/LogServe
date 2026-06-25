@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 )
 
 func TestTaskExecutionEndToEnd(t *testing.T) {
+	ensureExecutorDeps(t)
 	root := repoRoot(t)
 	logServer, err := logd.Start("127.0.0.1:0", t.TempDir())
 	if err != nil {
@@ -111,13 +111,4 @@ func TestTaskExecutionEndToEnd(t *testing.T) {
 			t.Fatalf("events = %v, want %v", got, want)
 		}
 	}
-}
-
-func repoRoot(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 }

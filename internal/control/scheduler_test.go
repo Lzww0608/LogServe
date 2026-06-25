@@ -65,6 +65,29 @@ func TestSchedulerActorCommandSeqGatesPerActorQueue(t *testing.T) {
 	}
 }
 
+func TestSchedulerPrunesEmptyActorPendingQueue(t *testing.T) {
+	scheduler := newScheduler()
+	scheduler.Enqueue(SchedMeta{TaskID: "actor-ready", ActorID: "actor-1", CommandSeq: 1, CreatedAtMs: 1})
+	if scheduler.ActorPendingActors() != 1 {
+		t.Fatalf("ActorPendingActors() = %d, want 1", scheduler.ActorPendingActors())
+	}
+	snapshot := workerSnapshot{
+		WorkerID:     "owner",
+		ActorIDs:     []string{"actor-1"},
+		ActorNextSeq: map[string]uint64{"actor-1": 1},
+	}
+	if _, ok := scheduler.Assign(snapshot, 0, schedulerAssignAll); !ok {
+		t.Fatal("expected actor task assignment")
+	}
+	if scheduler.ActorPendingActors() != 0 {
+		t.Fatalf("ActorPendingActors() after drain = %d, want 0", scheduler.ActorPendingActors())
+	}
+	scheduler.Enqueue(SchedMeta{TaskID: "actor-next", ActorID: "actor-1", CommandSeq: 2, CreatedAtMs: 2})
+	if scheduler.ActorPendingActors() != 1 {
+		t.Fatalf("ActorPendingActors() after re-enqueue = %d, want 1", scheduler.ActorPendingActors())
+	}
+}
+
 func TestSchedulerLLMLocalityUsesModelIndex(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.UpsertWorker(metadata.Worker{
@@ -139,7 +162,7 @@ func TestSchedulerDeadlineHeapReturnsOnlyExpiredLeases(t *testing.T) {
 
 func BenchmarkSchedulerAssignMixedBacklog(b *testing.B) {
 	for _, depth := range []int{1000, 10000, 100000} {
-		for _, workers := range []int{1, 10, 100} {
+		for _, workers := range []int{1, 10, 100, 1000} {
 			b.Run(fmt.Sprintf("depth=%d/workers=%d", depth, workers), func(b *testing.B) {
 				scheduler := mixedBacklogScheduler(depth, workers)
 				snapshot := workerSnapshot{WorkerID: "general-worker"}
@@ -292,6 +315,7 @@ func TestPollTaskIndexedDoesNotLetActorAndLLMBacklogBlockGeneral(t *testing.T) {
 		t.Fatal("unexpected duplicate actor")
 	}
 	service := NewServiceWithResultStore(meta, acceptingLogClient{}, nil, 0)
+	service.syncSchedulerWorkers()
 
 	_, _, err := service.enqueueTaskWithMetadata(context.Background(), &logservepb.TaskSpec{
 		TaskId:            "actor-future",
@@ -406,6 +430,7 @@ func TestPollTaskIndexedAssignsLLMToCachedWorker(t *testing.T) {
 		LastHeartbeat: actor.NowMs(),
 	})
 	service := NewServiceWithResultStore(meta, acceptingLogClient{}, nil, 0)
+	service.syncSchedulerWorkers()
 	task, _, err := service.enqueueTask(context.Background(), &logservepb.TaskSpec{
 		TaskId:          "llm-cached",
 		TaskName:        "llm:model-A",

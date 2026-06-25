@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/actorlock"
 	"github.com/logserve/logserve/internal/eventcodec"
+	"github.com/logserve/logserve/internal/logrecord"
 	"github.com/logserve/logserve/internal/metadata"
 	"github.com/logserve/logserve/internal/objectstore"
 	"github.com/logserve/logserve/internal/observability"
@@ -25,6 +27,7 @@ import (
 )
 
 const defaultResultInlineThreshold = 4096
+const largeActorStateLogThreshold = 4096
 const actorOwnerLease = 750 * time.Millisecond
 const schedulerWorkerLease = 5 * time.Second
 const localityQueueWait = 250 * time.Millisecond
@@ -58,8 +61,7 @@ type Service struct {
 	llmStatsMu            sync.RWMutex
 	llmStats              map[llmStatsKey]llmWorkerStats
 	workflowMu            sync.Mutex
-	actorLocksMu          sync.Mutex
-	actorLocks            map[string]*sync.Mutex
+	actorLocks            *actorlock.Table
 	resultStore           objectstore.Store
 	resultInlineThreshold int
 	functionStore         objectstore.Store
@@ -96,7 +98,7 @@ func NewServiceWithResultStore(meta metadata.Store, logClient logClient, store o
 		schedulerV2:           os.Getenv("LOGSERVE_SCHEDULER_V2") == "1",
 		specs:                 make(map[string]*logservepb.TaskSpec),
 		llmStats:              make(map[llmStatsKey]llmWorkerStats),
-		actorLocks:            make(map[string]*sync.Mutex),
+		actorLocks:            actorlock.NewTable(),
 		functions:             make(map[string]functionRegisteredPayload),
 		resultStore:           store,
 		functionStore:         functionStore,
@@ -204,17 +206,47 @@ func (s *Service) useSchedulerV2() bool {
 	return s != nil && s.schedulerV2 && s.scheduler != nil
 }
 
+func (s *Service) syncSchedulerLLMStats() {
+	if s == nil || s.scheduler == nil {
+		return
+	}
+	s.llmStatsMu.RLock()
+	snapshot := make(map[llmStatsKey]llmWorkerStats, len(s.llmStats))
+	for key, stats := range s.llmStats {
+		snapshot[key] = stats
+	}
+	s.llmStatsMu.RUnlock()
+	s.scheduler.SyncLLMStats(snapshot)
+}
+
+func (s *Service) syncActiveSchedulerWorkers() {
+	if s.scheduler == nil {
+		return
+	}
+	for _, worker := range s.meta.ActiveWorkers(schedulerWorkerLease) {
+		s.scheduler.UpsertWorker(worker)
+	}
+}
+
 func (s *Service) syncSchedulerWorkers() {
-	if !s.useSchedulerV2() {
+	if s.scheduler == nil {
 		return
 	}
 	for _, worker := range s.meta.ListWorkers() {
 		s.scheduler.UpsertWorker(worker)
 	}
+	s.syncSchedulerLLMStats()
+}
+
+func (s *Service) hydrateSchedulerWorkersIfNeeded() {
+	if s.scheduler == nil || s.scheduler.WorkerCount() > 0 {
+		return
+	}
+	s.syncActiveSchedulerWorkers()
 }
 
 func (s *Service) updateSchedulerWorker(workerID string) {
-	if !s.useSchedulerV2() || workerID == "" {
+	if s.scheduler == nil || workerID == "" {
 		return
 	}
 	if worker, ok := s.meta.GetWorker(workerID); ok {
@@ -396,8 +428,8 @@ func (s *Service) GetWorkflowStatus(ctx context.Context, req *logservepb.GetWork
 
 func (s *Service) ReplayWorkflow(ctx context.Context, req *logservepb.ReplayWorkflowRequest) (*logservepb.ReplayWorkflowResponse, error) {
 	streamID := workflowStream(req.GetWorkflowId())
-	replayed, err := workflow.ReplayEach(req.GetWorkflowId(), func(emit func(*logservepb.LogRecord) error) error {
-		return s.forEachLogRecord(ctx, streamID, emit)
+	replayed, err := workflow.ReplayRawEach(req.GetWorkflowId(), func(emit func(logrecord.RawRecord) error) error {
+		return s.forEachRawLogRecord(ctx, streamID, 1, emit)
 	})
 	if err != nil {
 		return nil, err
@@ -539,7 +571,7 @@ func (s *Service) pollTaskLegacy(workerID string, maxTasks int) ([]*logservepb.T
 }
 
 func (s *Service) pollTaskIndexed(workerID string, maxTasks int) ([]*logservepb.TaskSpec, error) {
-	s.syncSchedulerWorkers()
+	s.hydrateSchedulerWorkersIfNeeded()
 	tasks := make([]*logservepb.TaskSpec, 0, maxTasks)
 	_, redeliveryTimeout, _ := s.getBackpressureConfig()
 	for len(tasks) < maxTasks {
@@ -620,6 +652,14 @@ func (s *Service) leasedTaskSpec(spec *logservepb.TaskSpec, leased metadata.Task
 	leasedSpec.TargetWorkerId = state.OwnerWorkerID
 	leasedSpec.ActorEpoch = state.Epoch
 	leasedSpec.ActorStateJson = append([]byte(nil), state.StateJSON...)
+	if stateBytes := len(state.StateJSON); stateBytes >= largeActorStateLogThreshold {
+		observability.Info("actor_command_dispatched", map[string]any{
+			"actor_id":         leased.ActorID,
+			"task_id":          leased.TaskID,
+			"command_seq":      leased.ActorCommandSeq,
+			"state_json_bytes": stateBytes,
+		})
+	}
 	return leasedSpec
 }
 
@@ -738,13 +778,15 @@ func (s *Service) CompleteTasks(ctx context.Context, req *logservepb.CompleteTas
 }
 
 func (s *Service) appendTaskStarted(ctx context.Context, task metadata.Task, workerID string) error {
-	payload, _ := json.Marshal(map[string]any{
-		"task_id":          task.TaskID,
-		"worker_id":        workerID,
-		"task_lease_epoch": task.TaskLeaseEpoch,
-		"timestamp_ms":     time.Now().UnixMilli(),
+	payload, err := marshalTaskLifecyclePayload(taskLifecyclePayload{
+		TaskLeaseEpoch: task.TaskLeaseEpoch,
+		WorkerID:       workerID,
+		TimestampMs:    time.Now().UnixMilli(),
 	})
-	_, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
+	if err != nil {
+		return err
+	}
+	_, err = s.appendLog(ctx, &logservepb.AppendLogRequest{
 		StreamId:       taskStream(task.TaskID),
 		EventType:      "TaskStarted",
 		IdempotencyKey: fmt.Sprintf("%s:started:%s:%d", task.TaskID, workerID, task.TaskLeaseEpoch),
@@ -768,21 +810,17 @@ func (s *Service) appendTaskTerminal(ctx context.Context, task metadata.Task, st
 }
 
 func taskTerminalLogPayload(task metadata.Task, status logservepb.TaskStatus, resultJSON []byte, taskErr string) []byte {
-	payload := map[string]any{
-		"task_id":          task.TaskID,
-		"worker_id":        task.WorkerID,
-		"status":           status.String(),
-		"task_lease_epoch": task.TaskLeaseEpoch,
-		"timestamp_ms":     time.Now().UnixMilli(),
+	payload, err := marshalTaskLifecyclePayload(taskLifecyclePayload{
+		TaskLeaseEpoch: task.TaskLeaseEpoch,
+		WorkerID:       task.WorkerID,
+		ResultJSON:     resultJSON,
+		Error:          taskErr,
+		TimestampMs:    time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil
 	}
-	if len(resultJSON) > 0 {
-		payload["result_json"] = json.RawMessage(resultJSON)
-	}
-	if taskErr != "" {
-		payload["error"] = taskErr
-	}
-	data, _ := json.Marshal(payload)
-	return data
+	return payload
 }
 
 func taskTerminalIdempotencyKey(taskID, eventType, workerID string, leaseEpoch uint64) string {
@@ -976,12 +1014,13 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			return err
 		}
 		payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
-			WorkflowID:  workflowID,
-			StepID:      stepDef.StepID,
-			TaskID:      task.TaskID,
-			Attempt:     attempt,
-			InputHash:   inputHash,
-			TimestampMs: now,
+			WorkflowID:       workflowID,
+			StepID:           stepDef.StepID,
+			TaskID:           task.TaskID,
+			Attempt:          attempt,
+			InputHash:        inputHash,
+			ResolvedArgsJSON: argsJSON,
+			TimestampMs:      now,
 		})
 		if _, err := s.appendLog(ctx, &logservepb.AppendLogRequest{
 			StreamId:       workflowStream(workflowID),
@@ -1356,17 +1395,6 @@ func workflowStream(workflowID string) string {
 
 func actorStream(actorID string) string {
 	return "actor:" + actorID
-}
-
-func (s *Service) actorLock(actorID string) *sync.Mutex {
-	s.actorLocksMu.Lock()
-	defer s.actorLocksMu.Unlock()
-	lock, ok := s.actorLocks[actorID]
-	if !ok {
-		lock = &sync.Mutex{}
-		s.actorLocks[actorID] = lock
-	}
-	return lock
 }
 
 func sortedWorkers(workers []metadata.Worker) []metadata.Worker {

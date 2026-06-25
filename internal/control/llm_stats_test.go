@@ -63,6 +63,7 @@ func TestPredictedLatencySchedulerUsesMaterializedStatsWithoutListingLLMStreams(
 		Capacity:      1,
 		LastHeartbeat: time.Now().UnixMilli(),
 	})
+	service.syncSchedulerWorkers()
 
 	service.materializeLLMCompleted(llmEventPayload{
 		ModelName:      "model-A",

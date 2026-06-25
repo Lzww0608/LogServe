@@ -13,6 +13,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50052", "gRPC listen address")
+	pprofAddr := flag.String("pprof-addr", observability.PprofAddrFromEnv(), "optional pprof listen address, for example 127.0.0.1:6062")
 	logAddr := flag.String("log-addr", "127.0.0.1:50051", "log service address")
 	metadataStore := flag.String("metadata-store", getenv("LOGSERVE_METADATA_STORE", "memory"), "metadata store: memory or postgres")
 	postgresDSN := flag.String("postgres-dsn", getenv("LOGSERVE_POSTGRES_DSN", getenv("DATABASE_URL", "")), "PostgreSQL DSN when --metadata-store=postgres")
@@ -21,6 +22,8 @@ func main() {
 	metadataCheckpointRetention := flag.Int("metadata-checkpoint-retention", getenvInt("LOGSERVE_METADATA_CHECKPOINT_RETENTION", 3), "metadata checkpoints to retain in system:checkpoints")
 	apiToken := flag.String("api-token", getenv("LOGSERVE_API_TOKEN", ""), "API token required for gRPC calls when set")
 	flag.Parse()
+
+	observability.StartDebugServer(*pprofAddr)
 
 	srv, err := controlplane.StartWithOptions(*addr, *logAddr, controlplane.Options{
 		MetadataStore:               *metadataStore,

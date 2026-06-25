@@ -1,0 +1,35 @@
+{
+  "available": true,
+  "mode": "sync",
+  "elapsed_ms": 39913,
+  "transactions_delta": 2889,
+  "row_writes_delta": 4012,
+  "transactions_per_sec": 72.382,
+  "row_writes_per_sec": 100.519,
+  "before": {
+    "available": true,
+    "mode": "sync",
+    "captured_at_ms": 1782269964539,
+    "datname": "logserve",
+    "xact_commit": 39,
+    "xact_rollback": 0,
+    "tup_inserted": 621,
+    "tup_updated": 82,
+    "tup_deleted": 20,
+    "tup_returned": 5000,
+    "tup_fetched": 4743
+  },
+  "after": {
+    "available": true,
+    "mode": "sync",
+    "captured_at_ms": 1782270004452,
+    "datname": "logserve",
+    "xact_commit": 2928,
+    "xact_rollback": 0,
+    "tup_inserted": 1827,
+    "tup_updated": 2019,
+    "tup_deleted": 889,
+    "tup_returned": 31864,
+    "tup_fetched": 25098
+  }
+}

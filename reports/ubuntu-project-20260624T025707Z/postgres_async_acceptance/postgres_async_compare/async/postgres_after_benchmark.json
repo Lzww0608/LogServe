@@ -1,0 +1,1 @@
+{"available" : true, "mode" : "async", "captured_at_ms" : 1782270059105, "datname" : "logserve", "xact_commit" : 57, "xact_rollback" : 0, "tup_inserted" : 977, "tup_updated" : 252, "tup_deleted" : 85, "tup_returned" : 7557, "tup_fetched" : 5876}

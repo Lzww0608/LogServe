@@ -401,6 +401,7 @@ func (s *Service) restoreCheckpointLLMStats(cp MetadataCheckpoint) {
 	s.llmStatsMu.Lock()
 	s.llmStats = llmStatsFromCheckpoint(cp)
 	s.llmStatsMu.Unlock()
+	s.syncSchedulerLLMStats()
 }
 
 func llmStatsFromCheckpoint(cp MetadataCheckpoint) map[llmStatsKey]llmWorkerStats {

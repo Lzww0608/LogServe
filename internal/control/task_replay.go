@@ -1,7 +1,6 @@
 package control
 
 import (
-	"encoding/json"
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/logrecord"
 	"github.com/logserve/logserve/internal/metadata"
@@ -171,12 +170,4 @@ func (s *taskReplayState) finalTask() metadata.Task {
 		task.Status = s.status
 	}
 	return task
-}
-
-func decodeTaskLifecyclePayload(data []byte) taskLifecyclePayload {
-	var payload taskLifecyclePayload
-	if len(data) > 0 {
-		_ = json.Unmarshal(data, &payload)
-	}
-	return payload
 }

@@ -47,12 +47,24 @@ func (s *Service) ReadLog(ctx context.Context, req *logservepb.ReadLogRequest) (
 }
 
 func (s *Service) ReadLogStream(req *logservepb.ReadLogRequest, stream logservepb.LogService_ReadLogStreamServer) error {
-	return s.store.ReadEach(req.GetStreamId(), req.GetFromSeq(), int(req.GetLimit()), func(rec Record) error {
+	return s.store.ReadRawEach(req.GetStreamId(), req.GetFromSeq(), int(req.GetLimit()), func(rec logrecord.RawRecord) error {
 		if err := stream.Context().Err(); err != nil {
 			return err
 		}
-		return stream.Send(logRecordFromStoreRecord(rec))
+		return stream.Send(rawRecordToProto(rec))
 	})
+}
+
+func rawRecordToProto(rec logrecord.RawRecord) *logservepb.LogRecord {
+	return &logservepb.LogRecord{
+		StreamId:       rec.StreamID,
+		Seq:            rec.Seq,
+		EventType:      rec.EventType,
+		IdempotencyKey: rec.IdempotencyKey,
+		Payload:        rec.Payload,
+		TimestampMs:    rec.TimestampMs,
+		Crc32:          rec.CRC32,
+	}
 }
 
 func (s *Service) ReadLogRawEach(ctx context.Context, streamID string, fromSeq uint64, limit int, emit func(logrecord.RawRecord) error) error {

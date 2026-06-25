@@ -73,6 +73,7 @@ type Options struct {
 	CompactionCopyLiveRatioThreshold float64
 	CompactionMaxBytesPerSecond      int64
 	ChecksumType                     ChecksumType
+	MmapRead                         bool
 }
 
 func DefaultOptions() Options {
@@ -121,6 +122,7 @@ func (opts Options) normalize() (Options, error) {
 	if err := validateChecksumType(opts.ChecksumType); err != nil {
 		return Options{}, err
 	}
+	opts.MmapRead = opts.MmapRead || mmapReadFromEnv()
 	switch opts.FsyncPolicy {
 	case FsyncAlways, FsyncBatch, FsyncInterval:
 		return opts, nil
@@ -167,7 +169,7 @@ type recoveredIndexEntry struct {
 
 type segmentReader struct {
 	segmentID uint64
-	file      *os.File
+	reader    SegmentReader
 	refs      int
 	element   *list.Element
 	cached    bool
@@ -361,7 +363,7 @@ func (s *Store) ReadEach(streamID string, fromSeq uint64, limit int, emit func(R
 			}
 			current = reader
 		}
-		rec, err := readIndexedRecordFromFile(current.file, streamID, entry)
+		rec, err := readIndexedRecordFromReader(current, streamID, entry)
 		if err != nil {
 			return err
 		}
@@ -448,7 +450,7 @@ func (s *Store) ReadRawEach(streamID string, fromSeq uint64, limit int, emit fun
 				}
 				current = reader
 			}
-			rec, err := readIndexedRawRecordFromFile(current.file, streamID, entry, &scratch)
+			rec, err := readIndexedRawRecordFromReader(current, streamID, entry, &scratch)
 			if err != nil {
 				return err
 			}
@@ -1175,30 +1177,45 @@ func writeSegmentIndex(w io.Writer, segmentID uint64, entries []recoveredIndexEn
 }
 
 func (s *Store) acquireSegmentReader(segmentID uint64) (*segmentReader, error) {
-	if s.options.SegmentReaderCacheSize <= 0 {
-		file, err := os.Open(segmentPath(s.dir, segmentID, ".log"))
-		if err != nil {
-			return nil, err
+	s.mu.Lock()
+	activeSegmentID := s.activeSegmentID
+	mmapRead := s.options.MmapRead
+	cacheSize := s.options.SegmentReaderCacheSize
+	dir := s.dir
+	if cacheSize > 0 {
+		if reader := s.segmentReaders[segmentID]; reader != nil {
+			reader.refs++
+			if reader.element != nil {
+				s.segmentReaderLRU.MoveToBack(reader.element)
+			}
+			s.mu.Unlock()
+			return reader, nil
 		}
-		return &segmentReader{segmentID: segmentID, file: file, refs: 1}, nil
+	}
+	s.mu.Unlock()
+
+	sealed := activeSegmentID != 0 && segmentID < activeSegmentID
+	segReader, err := openSegmentReader(dir, segmentID, sealed, mmapRead)
+	if err != nil {
+		return nil, err
+	}
+	reader := &segmentReader{segmentID: segmentID, reader: segReader, refs: 1}
+
+	if cacheSize <= 0 {
+		return reader, nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if reader := s.segmentReaders[segmentID]; reader != nil {
-		reader.refs++
-		if reader.element != nil {
-			s.segmentReaderLRU.MoveToBack(reader.element)
+	if existing := s.segmentReaders[segmentID]; existing != nil {
+		_ = segReader.Close()
+		existing.refs++
+		if existing.element != nil {
+			s.segmentReaderLRU.MoveToBack(existing.element)
 		}
-		return reader, nil
+		return existing, nil
 	}
-
-	file, err := os.Open(segmentPath(s.dir, segmentID, ".log"))
-	if err != nil {
-		return nil, err
-	}
-	reader := &segmentReader{segmentID: segmentID, file: file, refs: 1, cached: true}
+	reader.cached = true
 	reader.element = s.segmentReaderLRU.PushBack(reader)
 	s.segmentReaders[segmentID] = reader
 	s.evictSegmentReadersLocked()
@@ -1210,7 +1227,7 @@ func (s *Store) releaseSegmentReader(reader *segmentReader) {
 		return
 	}
 	if !reader.cached {
-		_ = reader.file.Close()
+		_ = reader.reader.Close()
 		return
 	}
 
@@ -1241,7 +1258,7 @@ func (s *Store) evictSegmentReadersLocked() {
 				delete(s.segmentReaders, reader.segmentID)
 				reader.cached = false
 				reader.element = nil
-				_ = reader.file.Close()
+				_ = reader.reader.Close()
 				evicted = true
 				break
 			}
@@ -1256,7 +1273,7 @@ func (s *Store) evictSegmentReadersLocked() {
 func (s *Store) closeSegmentReadersLocked() error {
 	var err error
 	for segmentID, reader := range s.segmentReaders {
-		err = errors.Join(err, reader.file.Close())
+		err = errors.Join(err, reader.reader.Close())
 		delete(s.segmentReaders, segmentID)
 		reader.cached = false
 		reader.element = nil
@@ -1270,13 +1287,14 @@ func (s *Store) cachedSegmentReaderCount() int {
 	defer s.mu.Unlock()
 	return len(s.segmentReaders)
 }
-func readIndexedRawRecordFromFile(file *os.File, streamID string, entry streamIndexEntry, scratch *rawRecordReadScratch) (logrecord.RawRecord, error) {
+func readIndexedRawRecordFromReader(reader *segmentReader, streamID string, entry streamIndexEntry, scratch *rawRecordReadScratch) (logrecord.RawRecord, error) {
 	const maxInt64 = uint64(1<<63 - 1)
 	if entry.Offset > maxInt64 {
 		return logrecord.RawRecord{}, errCorruptIndex
 	}
 	offset := int64(entry.Offset)
-	rec, _, nextOffset, err := readRawRecordAtWithScratch(file, offset, scratch)
+	io := &segmentIO{reader: reader.reader}
+	rec, _, nextOffset, err := readRawRecordAtWithScratch(io, offset, scratch)
 	if err != nil {
 		return logrecord.RawRecord{}, err
 	}
@@ -1286,13 +1304,14 @@ func readIndexedRawRecordFromFile(file *os.File, streamID string, entry streamIn
 	return rec, nil
 }
 
-func readIndexedRecordFromFile(file *os.File, streamID string, entry streamIndexEntry) (Record, error) {
+func readIndexedRecordFromReader(reader *segmentReader, streamID string, entry streamIndexEntry) (Record, error) {
 	const maxInt64 = uint64(1<<63 - 1)
 	if entry.Offset > maxInt64 {
 		return Record{}, errCorruptIndex
 	}
 	offset := int64(entry.Offset)
-	rec, nextOffset, err := readRecordAt(file, offset)
+	io := &segmentIO{reader: reader.reader}
+	rec, nextOffset, err := readRecordAtIO(io, offset)
 	if err != nil {
 		return Record{}, err
 	}
@@ -1300,6 +1319,19 @@ func readIndexedRecordFromFile(file *os.File, streamID string, entry streamIndex
 		return Record{}, errCorruptRecord
 	}
 	return cloneRecord(rec), nil
+}
+
+func readIndexedRecordFromFile(file *os.File, streamID string, entry streamIndexEntry) (Record, error) {
+	return readIndexedRecordFromReader(&segmentReader{reader: &readAtSegmentReader{file: file}}, streamID, entry)
+}
+
+func readIndexedRawRecordFromFile(file *os.File, streamID string, entry streamIndexEntry, scratch *rawRecordReadScratch) (logrecord.RawRecord, error) {
+	return readIndexedRawRecordFromReader(&segmentReader{reader: &readAtSegmentReader{file: file}}, streamID, entry, scratch)
+}
+
+func mmapReadFromEnv() bool {
+	v := strings.TrimSpace(os.Getenv("LOGSERVE_LOG_MMAP_READ"))
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 func (s *Store) ensureWritableSegmentLocked(recordLen int64) error {
@@ -1502,8 +1534,12 @@ type rawRecordReadScratch struct {
 }
 
 func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
+	return readRecordAtIO(&segmentIO{reader: &readAtSegmentReader{file: file}}, offset)
+}
+
+func readRecordAtIO(io *segmentIO, offset int64) (Record, int64, error) {
 	var scratch rawRecordReadScratch
-	raw, checksumType, nextOffset, err := readRawRecordAtWithScratch(file, offset, &scratch)
+	raw, checksumType, nextOffset, err := readRawRecordAtWithScratch(io, offset, &scratch)
 	if err != nil {
 		return Record{}, offset, err
 	}
@@ -1520,15 +1556,84 @@ func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
 }
 
 func readRawRecordAt(file *os.File, offset int64) (logrecord.RawRecord, ChecksumType, int64, error) {
-	return readRawRecordAtWithScratch(file, offset, nil)
+	return readRawRecordAtWithScratch(&segmentIO{reader: &readAtSegmentReader{file: file}}, offset, nil)
 }
 
-func readRawRecordAtWithScratch(file *os.File, offset int64, scratch *rawRecordReadScratch) (logrecord.RawRecord, ChecksumType, int64, error) {
+func readRawRecordAtWithScratch(src *segmentIO, offset int64, scratch *rawRecordReadScratch) (logrecord.RawRecord, ChecksumType, int64, error) {
 	if scratch == nil {
 		scratch = &rawRecordReadScratch{}
 	}
+	if header, ok := src.slice(offset, legacyHeaderSize); ok {
+		return readRawRecordFromMmap(src, offset, header, scratch)
+	}
+	return readRawRecordFromReadAt(src, offset, scratch)
+}
+
+func readRawRecordFromMmap(src *segmentIO, offset int64, baseHeader []byte, scratch *rawRecordReadScratch) (logrecord.RawRecord, ChecksumType, int64, error) {
+	if len(baseHeader) != legacyHeaderSize {
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+	}
+	if binary.BigEndian.Uint32(baseHeader[0:4]) != magic {
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+	}
+	recordVersion := binary.BigEndian.Uint16(baseHeader[4:6])
+	headerLen := legacyHeaderSize
+	checksumType := ChecksumTypeIEEE
+	switch recordVersion {
+	case recordVersionV1:
+	case recordVersionV2:
+		extension, ok := src.slice(offset+legacyHeaderSize, headerSize-legacyHeaderSize)
+		if !ok || len(extension) != headerSize-legacyHeaderSize {
+			return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+		}
+		copy(scratch.header[legacyHeaderSize:headerSize], extension)
+		checksumType = ChecksumType(binary.BigEndian.Uint16(extension[0:2]))
+		if err := validateChecksumType(checksumType); err != nil {
+			return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+		}
+		headerLen = headerSize
+	default:
+		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+	}
+	copy(scratch.header[:legacyHeaderSize], baseHeader)
+
+	streamLen := int(binary.BigEndian.Uint16(baseHeader[6:8]))
+	eventLen := int(binary.BigEndian.Uint16(baseHeader[8:10]))
+	keyLen := int(binary.BigEndian.Uint16(baseHeader[10:12]))
+	payloadLen := int(binary.BigEndian.Uint32(baseHeader[12:16]))
+	seq := binary.BigEndian.Uint64(baseHeader[16:24])
+	timestampMs := int64(binary.BigEndian.Uint64(baseHeader[24:32]))
+	expectedCRC := binary.BigEndian.Uint32(baseHeader[32:36])
+
+	bodyLen := streamLen + eventLen + keyLen + payloadLen
+	body, err := readBodyVerifiedIO(src, offset+int64(headerLen), bodyLen, checksumType, expectedCRC, scratch)
+	if err != nil {
+		return logrecord.RawRecord{}, 0, offset, err
+	}
+
+	pos := 0
+	streamID := string(body[pos : pos+streamLen])
+	pos += streamLen
+	eventType := string(body[pos : pos+eventLen])
+	pos += eventLen
+	key := string(body[pos : pos+keyLen])
+	pos += keyLen
+	payload := body[pos : pos+payloadLen]
+
+	return logrecord.RawRecord{
+		StreamID:       streamID,
+		Seq:            seq,
+		EventType:      eventType,
+		IdempotencyKey: key,
+		Payload:        payload,
+		TimestampMs:    timestampMs,
+		CRC32:          expectedCRC,
+	}, checksumType, offset + int64(headerLen+bodyLen), nil
+}
+
+func readRawRecordFromReadAt(src *segmentIO, offset int64, scratch *rawRecordReadScratch) (logrecord.RawRecord, ChecksumType, int64, error) {
 	baseHeader := scratch.header[:legacyHeaderSize]
-	n, err := file.ReadAt(baseHeader, offset)
+	n, err := src.ReadAt(baseHeader, offset)
 	if errors.Is(err, io.EOF) && n == 0 {
 		return logrecord.RawRecord{}, 0, offset, io.EOF
 	}
@@ -1549,7 +1654,7 @@ func readRawRecordAtWithScratch(file *os.File, offset int64, scratch *rawRecordR
 	case recordVersionV1:
 	case recordVersionV2:
 		extension := scratch.header[legacyHeaderSize:headerSize]
-		n, err = file.ReadAt(extension, offset+legacyHeaderSize)
+		n, err = src.ReadAt(extension, offset+legacyHeaderSize)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return logrecord.RawRecord{}, 0, offset, err
 		}
@@ -1574,23 +1679,9 @@ func readRawRecordAtWithScratch(file *os.File, offset int64, scratch *rawRecordR
 	expectedCRC := binary.BigEndian.Uint32(baseHeader[32:36])
 
 	bodyLen := streamLen + eventLen + keyLen + payloadLen
-	if cap(scratch.body) < bodyLen {
-		scratch.body = make([]byte, bodyLen)
-	}
-	body := scratch.body[:bodyLen]
-	n, err = file.ReadAt(body, offset+int64(headerLen))
-	if err != nil && !errors.Is(err, io.EOF) {
-		return logrecord.RawRecord{}, 0, offset, err
-	}
-	if n != bodyLen {
-		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
-	}
-	actualCRC, err := checksum(body, checksumType)
+	body, err := readBodyVerifiedIO(src, offset+int64(headerLen), bodyLen, checksumType, expectedCRC, scratch)
 	if err != nil {
-		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
-	}
-	if actualCRC != expectedCRC {
-		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
+		return logrecord.RawRecord{}, 0, offset, err
 	}
 
 	pos := 0
@@ -1611,6 +1702,59 @@ func readRawRecordAtWithScratch(file *os.File, offset int64, scratch *rawRecordR
 		TimestampMs:    timestampMs,
 		CRC32:          expectedCRC,
 	}, checksumType, offset + int64(headerLen+bodyLen), nil
+}
+func readBodyVerifiedIO(src *segmentIO, offset int64, bodyLen int, checksumType ChecksumType, expectedCRC uint32, scratch *rawRecordReadScratch) ([]byte, error) {
+	if body, ok := src.slice(offset, bodyLen); ok {
+		if !verifyChecksum(body, checksumType, expectedCRC) {
+			return nil, errCorruptRecord
+		}
+		return body, nil
+	}
+
+	if cap(scratch.body) < bodyLen {
+		scratch.body = make([]byte, bodyLen)
+	}
+	body := scratch.body[:bodyLen]
+
+	useChunkedRead := bodyLen > checksumChunkSize &&
+		(checksumType == ChecksumTypeIEEE || checksumType == ChecksumTypeCRC32C)
+	if !useChunkedRead {
+		n, err := src.ReadAt(body, offset)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if n != bodyLen {
+			return nil, errCorruptRecord
+		}
+		if !verifyChecksum(body, checksumType, expectedCRC) {
+			return nil, errCorruptRecord
+		}
+		return body, nil
+	}
+
+	acc := newChecksumAccumulator(checksumType)
+	for start := 0; start < bodyLen; start += checksumChunkSize {
+		end := start + checksumChunkSize
+		if end > bodyLen {
+			end = bodyLen
+		}
+		chunk := body[start:end]
+		n, err := src.ReadAt(chunk, offset+int64(start))
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if n != len(chunk) {
+			return nil, errCorruptRecord
+		}
+		if err := acc.update(chunk); err != nil {
+			return nil, errCorruptRecord
+		}
+	}
+	actualCRC, err := acc.sum()
+	if err != nil || actualCRC != expectedCRC {
+		return nil, errCorruptRecord
+	}
+	return body, nil
 }
 
 func segmentPath(dir string, segmentID uint64, ext string) string {

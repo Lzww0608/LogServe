@@ -1,0 +1,29 @@
+{
+  "model": "model-D",
+  "version": "v1",
+  "cold_task_id": "task-d61ff1d08938f2a9",
+  "warm_task_id": "task-88b05d1e34624b8c",
+  "cold": {
+    "cache_hit": false,
+    "checkpoint_fetch_ms": 1,
+    "cache_used_bytes": 2097152,
+    "cache_capacity_bytes": 16777216,
+    "eviction_count": 0,
+    "model_load_ms": 1,
+    "first_token_ms": 15,
+    "total_latency_ms": 20,
+    "worker_id": "worker-a"
+  },
+  "warm": {
+    "cache_hit": true,
+    "checkpoint_fetch_ms": 0,
+    "cache_used_bytes": 2097152,
+    "cache_capacity_bytes": 16777216,
+    "eviction_count": 0,
+    "model_load_ms": 1,
+    "first_token_ms": 15,
+    "total_latency_ms": 17,
+    "worker_id": "worker-a"
+  },
+  "validation_errors": []
+}

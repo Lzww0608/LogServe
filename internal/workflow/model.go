@@ -388,12 +388,16 @@ func (s *State) UpdateStep(stepID string, fn func(*StepState)) bool {
 		return false
 	}
 	step := cloneStepState(s.dag.steps[idx])
+	oldStatus := step.Status
+	oldTaskID := step.TaskID
 	fn(&step)
 	if step.StepID == "" {
 		step.StepID = stepID
 	}
 	s.dag.steps[idx] = cloneStepState(step)
-	s.RebuildRuntime()
+	if step.Status != oldStatus || step.TaskID != oldTaskID {
+		s.RebuildRuntime()
+	}
 	return true
 }
 

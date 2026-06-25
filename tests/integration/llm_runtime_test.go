@@ -432,6 +432,7 @@ func waitTask(t *testing.T, client logservepb.ControlServiceClient, taskID strin
 
 func runWorkerForTestWithModels(ctx context.Context, t *testing.T, env *workflowTestEnv, workerID string, cachedModels []string, maxTasks int) {
 	t.Helper()
+	ensureExecutorDeps(t)
 	err := worker.Run(ctx, worker.Config{
 		WorkerID:     workerID,
 		ControlAddr:  env.controlServer.Addr(),
@@ -449,6 +450,7 @@ func runWorkerForTestWithModels(ctx context.Context, t *testing.T, env *workflow
 
 func runWorkerForTestWithConfig(ctx context.Context, t *testing.T, env *workflowTestEnv, cfg worker.Config) {
 	t.Helper()
+	ensureExecutorDeps(t)
 	if cfg.WorkerID == "" {
 		cfg.WorkerID = "worker"
 	}
