@@ -940,13 +940,10 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 		return nil
 	}
 
-	for _, stepDef := range state.Definition.Steps {
-		step := state.Steps[stepDef.StepID]
-		if step.Status != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED || step.TaskID != "" {
-			continue
-		}
-		if !workflow.DependenciesSucceeded(stepDef, state) {
-			continue
+	for {
+		stepDef, step, ready := state.PopReadyStep()
+		if !ready {
+			return nil
 		}
 
 		argsJSON, inputHash, err := workflow.ResolveCachedArgs(stepDef, step, state, s)
@@ -995,14 +992,7 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			return err
 		}
 		if _, err := s.meta.UpdateWorkflow(workflowID, func(current *workflow.State) error {
-			currentStep := current.Steps[stepDef.StepID]
-			currentStep.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED
-			currentStep.TaskID = task.TaskID
-			currentStep.Attempts = attempt
-			currentStep.LastInputHash = inputHash
-			currentStep.LastScheduledAtMs = now
-			currentStep.Error = ""
-			current.Steps[stepDef.StepID] = currentStep
+			current.SetStepScheduled(stepDef.StepID, task.TaskID, attempt, inputHash, argsJSON, now)
 			return nil
 		}); err != nil {
 			return err
@@ -1014,9 +1004,7 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 		})
 		state, _ = s.meta.GetWorkflow(workflowID)
 	}
-	return nil
 }
-
 func (s *Service) markWorkflowStepStarted(ctx context.Context, task metadata.Task, workerID string) error {
 	s.workflowMu.Lock()
 	defer s.workflowMu.Unlock()
@@ -1025,7 +1013,10 @@ func (s *Service) markWorkflowStepStarted(ctx context.Context, task metadata.Tas
 	if !ok {
 		return errors.New("workflow not found")
 	}
-	step := state.Steps[task.StepID]
+	step, ok := state.Step(task.StepID)
+	if !ok {
+		return errors.New("workflow step not found")
+	}
 	if step.Status == logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED || step.Status == logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_FAILED {
 		return nil
 	}
@@ -1045,19 +1036,11 @@ func (s *Service) markWorkflowStepStarted(ctx context.Context, task metadata.Tas
 		return err
 	}
 	_, err := s.meta.UpdateWorkflow(task.WorkflowID, func(current *workflow.State) error {
-		currentStep := current.Steps[task.StepID]
-		if currentStep.Status == logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED {
-			return nil
-		}
-		currentStep.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_STARTED
-		currentStep.TaskID = task.TaskID
-		currentStep.StartedAtMs = now
-		current.Steps[task.StepID] = currentStep
+		current.SetStepStarted(task.StepID, task.TaskID, now)
 		return nil
 	})
 	return err
 }
-
 func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (bool, error) {
 	s.workflowMu.Lock()
 	defer s.workflowMu.Unlock()
@@ -1066,7 +1049,10 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 	if !ok {
 		return false, errors.New("workflow not found")
 	}
-	step := state.Steps[task.StepID]
+	step, ok := state.Step(task.StepID)
+	if !ok {
+		return false, errors.New("workflow step not found")
+	}
 	if step.Status == logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED {
 		return false, nil
 	}
@@ -1100,15 +1086,7 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 			return false, err
 		}
 		updated, err := s.meta.UpdateWorkflow(task.WorkflowID, func(current *workflow.State) error {
-			currentStep := current.Steps[task.StepID]
-			currentStep.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED
-			currentStep.TaskID = task.TaskID
-			currentStep.ResultJSON = append([]byte(nil), inline...)
-			currentStep.ResultRef = ref
-			currentStep.Error = ""
-			currentStep.CompletedAtMs = now
-			currentStep.LatencyMs = latencyMs
-			current.Steps[task.StepID] = currentStep
+			current.SetStepSucceeded(task.StepID, task.TaskID, inline, ref, now, latencyMs)
 			return nil
 		})
 		if err != nil {
@@ -1148,17 +1126,7 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 	maxAttempts := workflow.StepMaxAttempts(state.Definition, task.StepID)
 	retry := int(step.Attempts) < maxAttempts
 	updated, err := s.meta.UpdateWorkflow(task.WorkflowID, func(current *workflow.State) error {
-		currentStep := current.Steps[task.StepID]
-		currentStep.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_FAILED
-		currentStep.TaskID = task.TaskID
-		currentStep.Error = taskErr
-		currentStep.CompletedAtMs = now
-		currentStep.LatencyMs = latencyMs
-		if retry {
-			currentStep.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED
-			currentStep.TaskID = ""
-		}
-		current.Steps[task.StepID] = currentStep
+		current.SetStepFailed(task.StepID, task.TaskID, taskErr, retry, now, latencyMs)
 		return nil
 	})
 	if err != nil {
@@ -1177,9 +1145,11 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 	}
 	return false, nil
 }
-
 func (s *Service) completeWorkflow(ctx context.Context, state workflow.State) error {
-	resultStep := state.Steps[state.Definition.ResultStepID]
+	resultStep, ok := state.Step(state.Definition.ResultStepID)
+	if !ok {
+		return errors.New("workflow result step not found")
+	}
 	resultJSON := resultStep.ResultJSON
 	resultRef := resultStep.ResultRef
 	if len(resultJSON) == 0 && resultRef != "" {
@@ -1226,7 +1196,6 @@ func (s *Service) completeWorkflow(ctx context.Context, state workflow.State) er
 	}
 	return err
 }
-
 func (s *Service) failWorkflow(ctx context.Context, state workflow.State, taskErr string) error {
 	now := workflow.NowMs()
 	payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
@@ -1270,14 +1239,8 @@ func (s *Service) LoadResult(ref string) ([]byte, error) {
 }
 
 func workflowDone(state workflow.State) bool {
-	for _, stepID := range state.StepOrder {
-		if state.Steps[stepID].Status != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED {
-			return false
-		}
-	}
-	return true
+	return state.AllStepsSucceeded()
 }
-
 func isTerminalTaskStatus(status logservepb.TaskStatus) bool {
 	return status == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED || status == logservepb.TaskStatus_TASK_STATUS_FAILED
 }
@@ -1295,9 +1258,9 @@ func taskStatusResponse(task metadata.Task) *logservepb.GetTaskStatusResponse {
 }
 
 func workflowStatusResponse(state workflow.State) *logservepb.GetWorkflowStatusResponse {
-	steps := make([]*logservepb.WorkflowStepState, 0, len(state.StepOrder))
-	for _, stepID := range state.StepOrder {
-		step := state.Steps[stepID]
+	stepStates := state.StepStatesInOrder()
+	steps := make([]*logservepb.WorkflowStepState, 0, len(stepStates))
+	for _, step := range stepStates {
 		steps = append(steps, &logservepb.WorkflowStepState{
 			StepId:        step.StepID,
 			TaskName:      step.TaskName,
@@ -1326,7 +1289,6 @@ func workflowStatusResponse(state workflow.State) *logservepb.GetWorkflowStatusR
 		LatencyMs:     workflow.WorkflowLatencyMs(state),
 	}
 }
-
 func cloneSpec(spec *logservepb.TaskSpec) *logservepb.TaskSpec {
 	if spec == nil {
 		return nil

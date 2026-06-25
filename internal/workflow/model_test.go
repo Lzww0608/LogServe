@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/logrecord"
 )
 
@@ -133,7 +134,10 @@ func TestReplayRawEachConsumesRawWorkflowRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	step := state.Steps["step-1"]
+	step, ok := state.Step("step-1")
+	if !ok {
+		t.Fatal("step missing")
+	}
 	if step.TaskID != "task-1" || step.LastInputHash != "hash" {
 		t.Fatalf("step after raw replay = %+v", step)
 	}
@@ -159,5 +163,76 @@ func TestResolveCachedArgsUsesStepCache(t *testing.T) {
 	}
 	if hash != "cached-hash" || string(args) != `{"args":[1],"kwargs":{}}` {
 		t.Fatalf("cached args = %q hash=%q", args, hash)
+	}
+}
+
+func TestRuntimeDAGReadyQueueUsesTopologicalOrder(t *testing.T) {
+	def, err := ParseDefinition([]byte(`{
+		"result_step_id":"b",
+		"steps":[
+			{"step_id":"b","depends_on":["a"],"task_name":"b","function_name":"b","function_source":"def b():\n    return 2\n"},
+			{"step_id":"a","task_name":"a","function_name":"a","function_source":"def a():\n    return 1\n"}
+		]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{def.Steps[0].StepID, def.Steps[1].StepID}; got[0] != "a" || got[1] != "b" {
+		t.Fatalf("topological step order = %v, want [a b]", got)
+	}
+
+	state := NewState("wf-ready", def, 1)
+	stepDef, _, ok := state.PopReadyStep()
+	if !ok || stepDef.StepID != "a" {
+		t.Fatalf("first ready step = %q/%v, want a/true", stepDef.StepID, ok)
+	}
+	if nextDef, _, ok := state.PopReadyStep(); ok {
+		t.Fatalf("unexpected ready step before dependency success: %s", nextDef.StepID)
+	}
+	state.SetStepSucceeded("a", "task-a", []byte(`1`), "", 2, 1)
+	stepDef, _, ok = state.PopReadyStep()
+	if !ok || stepDef.StepID != "b" {
+		t.Fatalf("ready step after dependency success = %q/%v, want b/true", stepDef.StepID, ok)
+	}
+}
+
+func TestStateJSONAcceptsLegacyStepMapAndRebuildsRuntime(t *testing.T) {
+	def, err := ParseDefinition([]byte(`{
+		"result_step_id":"b",
+		"steps":[
+			{"step_id":"a","task_name":"a","function_name":"a","function_source":"def a():\n    return 1\n"},
+			{"step_id":"b","depends_on":["a"],"task_name":"b","function_name":"b","function_source":"def b():\n    return 2\n"}
+		]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]any{
+		"WorkflowID":   "wf-legacy",
+		"WorkflowName": "legacy",
+		"Status":       logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING,
+		"Definition":   def,
+		"StepOrder":    []string{"a", "b"},
+		"Steps": map[string]StepState{
+			"a": {StepID: "a", TaskName: "a", Status: logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED, ResultJSON: []byte(`1`)},
+			"b": {StepID: "b", TaskName: "b", Status: logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED},
+		},
+		"CreatedAtMs": int64(1),
+		"UpdatedAtMs": int64(2),
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	stepDef, step, ok := state.PopReadyStep()
+	if !ok || stepDef.StepID != "b" || step.StepID != "b" {
+		t.Fatalf("ready step from legacy JSON = def:%q step:%q ok:%v, want b/b/true", stepDef.StepID, step.StepID, ok)
+	}
+	if _, ok := state.Step("a"); !ok {
+		t.Fatal("legacy step a missing after runtime rebuild")
 	}
 }

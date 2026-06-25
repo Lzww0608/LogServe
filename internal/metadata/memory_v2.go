@@ -920,48 +920,20 @@ func (s *workflowStoreV2) upsert(state workflow.State) {
 }
 
 func newWorkflowRecordV2(state workflow.State) *workflowRecordV2 {
+	steps := state.StepStatesInOrder()
 	record := &workflowRecordV2{
-		state:     cloneWorkflowStateWithoutSteps(state),
-		stepIndex: make(map[string]int, len(state.Steps)),
+		state:     workflow.CloneState(state),
+		stepIndex: make(map[string]int, len(steps)),
 	}
-	order := append([]string(nil), state.StepOrder...)
-	seen := make(map[string]struct{}, len(order))
-	for _, stepID := range order {
-		step, ok := state.Steps[stepID]
-		if !ok {
-			continue
-		}
-		record.stepIndex[stepID] = len(record.steps)
+	for _, step := range steps {
+		record.stepIndex[step.StepID] = len(record.steps)
 		record.steps = append(record.steps, cloneWorkflowStepState(step))
-		seen[stepID] = struct{}{}
 	}
-	missing := make([]string, 0)
-	for stepID := range state.Steps {
-		if _, ok := seen[stepID]; !ok {
-			missing = append(missing, stepID)
-		}
-	}
-	sort.Strings(missing)
-	for _, stepID := range missing {
-		step := state.Steps[stepID]
-		record.stepIndex[stepID] = len(record.steps)
-		record.steps = append(record.steps, cloneWorkflowStepState(step))
-		order = append(order, stepID)
-	}
-	record.state.StepOrder = order
-	record.state.Steps = nil
 	return record
 }
 
 func (r *workflowRecordV2) snapshot() workflow.State {
-	state := cloneWorkflowStateWithoutSteps(r.state)
-	state.StepOrder = append([]string(nil), r.state.StepOrder...)
-	state.Steps = make(map[string]workflow.StepState, len(r.steps))
-	for _, step := range r.steps {
-		cloned := cloneWorkflowStepState(step)
-		state.Steps[cloned.StepID] = cloned
-	}
-	return state
+	return workflow.CloneState(r.state)
 }
 
 type actorStoreV2 struct {
@@ -1094,11 +1066,7 @@ func (s *modelStoreV2) list() []*logservepb.ModelInfo {
 }
 
 func cloneWorkflowStateWithoutSteps(state workflow.State) workflow.State {
-	state.ResultJSON = append([]byte(nil), state.ResultJSON...)
-	state.StepOrder = append([]string(nil), state.StepOrder...)
-	state.Definition = cloneWorkflowDefinitionV2(state.Definition)
-	state.Steps = nil
-	return state
+	return workflow.CloneState(state)
 }
 
 func cloneWorkflowDefinitionV2(def workflow.Definition) workflow.Definition {

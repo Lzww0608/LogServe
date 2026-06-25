@@ -181,9 +181,9 @@ func BenchmarkMemoryStoreUpdateWorkflow(b *testing.B) {
 				for pb.Next() {
 					idx := int(atomic.AddUint64(&seq, 1)-1) % len(workflowIDs)
 					if _, err := store.UpdateWorkflow(workflowIDs[idx], func(current *workflow.State) error {
-						step := current.Steps["step-0"]
-						step.Attempts++
-						current.Steps["step-0"] = step
+						current.UpdateStep("step-0", func(step *workflow.StepState) {
+							step.Attempts++
+						})
 						return nil
 					}); err != nil {
 						b.Fatal(err)

@@ -126,15 +126,18 @@ func TestMemoryStoreV2SnapshotsAreImmutable(t *testing.T) {
 	}
 
 	state := benchmarkWorkflowState("workflow-snapshot", 2)
-	step := state.Steps["step-0"]
-	step.ResultJSON = []byte(`{"step":1}`)
-	state.Steps["step-0"] = step
+	state.UpdateStep("step-0", func(step *workflow.StepState) {
+		step.ResultJSON = []byte(`{"step":1}`)
+	})
 	store.UpsertWorkflow(state)
 	workflowState, _ := store.GetWorkflow("workflow-snapshot")
-	workflowState.Steps["step-0"] = workflow.StepState{StepID: "step-0", ResultJSON: []byte(`bad`)}
+	workflowState.UpdateStep("step-0", func(step *workflow.StepState) {
+		step.ResultJSON = []byte(`bad`)
+	})
 	workflowAgain, _ := store.GetWorkflow("workflow-snapshot")
-	if string(workflowAgain.Steps["step-0"].ResultJSON) != `{"step":1}` {
-		t.Fatalf("workflow step snapshot mutated store: %#v", workflowAgain.Steps["step-0"])
+	stepAgain, ok := workflowAgain.Step("step-0")
+	if !ok || string(stepAgain.ResultJSON) != `{"step":1}` {
+		t.Fatalf("workflow step snapshot mutated store: %#v", stepAgain)
 	}
 }
 
@@ -149,8 +152,8 @@ func TestMemoryStoreV2WorkflowRecordUsesSliceIndex(t *testing.T) {
 	if record == nil {
 		t.Fatal("workflow record missing")
 	}
-	if record.state.Steps != nil {
-		t.Fatal("workflow record stores public step map internally")
+	if len(record.state.StepStatesInOrder()) != 3 {
+		t.Fatal("workflow record state lost runtime step slice")
 	}
 	if len(record.steps) != 3 || len(record.stepIndex) != 3 {
 		t.Fatalf("steps/index sizes = %d/%d, want 3/3", len(record.steps), len(record.stepIndex))

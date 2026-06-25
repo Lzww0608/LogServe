@@ -40,9 +40,10 @@ func ResolveCachedArgs(step StepDefinition, stepState StepState, state State, lo
 	}
 	return ResolveArgs(step, state, loader)
 }
+
 func DependenciesSucceeded(step StepDefinition, state State) bool {
 	for _, dep := range step.DependsOn {
-		depState, ok := state.Steps[dep]
+		depState, ok := state.Step(dep)
 		if !ok || depState.Status != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED {
 			return false
 		}
@@ -68,7 +69,7 @@ func resolveValue(value any, state State, loader ResultLoader) (any, error) {
 			if !ok {
 				return nil, errors.New("step ref must be a string")
 			}
-			step, ok := state.Steps[stepID]
+			step, ok := state.Step(stepID)
 			if !ok {
 				return nil, errors.New("referenced step not found")
 			}

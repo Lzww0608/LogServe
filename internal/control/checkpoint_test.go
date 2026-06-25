@@ -397,7 +397,10 @@ func TestBootstrapFromMetadataCheckpointRestoresWorkflowAndActorTail(t *testing.
 	if !ok {
 		t.Fatal("workflow missing before checkpoint")
 	}
-	step := wfState.Steps["finish"]
+	step, ok := wfState.Step("finish")
+	if !ok {
+		t.Fatal("workflow step missing before checkpoint")
+	}
 
 	actorResp, err := first.CreateActor(ctx, &logservepb.CreateActorRequest{
 		ClassName:      "Counter",

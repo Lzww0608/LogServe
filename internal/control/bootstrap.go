@@ -333,16 +333,14 @@ func (s *Service) prepareRetryableFailedSteps(state *workflow.State) {
 	if state.Status != logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING {
 		return
 	}
-	for stepID, step := range state.Steps {
+	for _, step := range state.StepStatesInOrder() {
 		if step.Status != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_FAILED {
 			continue
 		}
-		if int(step.Attempts) >= workflow.StepMaxAttempts(state.Definition, stepID) {
+		if int(step.Attempts) >= workflow.StepMaxAttempts(state.Definition, step.StepID) {
 			continue
 		}
-		step.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED
-		step.TaskID = ""
-		state.Steps[stepID] = step
+		state.SetStepFailed(step.StepID, step.TaskID, step.Error, true, step.CompletedAtMs, step.LatencyMs)
 	}
 }
 
@@ -351,8 +349,8 @@ func (s *Service) restoreWorkflowTasks(state workflow.State) error {
 		return nil
 	}
 	for _, stepDef := range state.Definition.Steps {
-		step := state.Steps[stepDef.StepID]
-		if step.TaskID == "" {
+		step, ok := state.Step(stepDef.StepID)
+		if !ok || step.TaskID == "" {
 			continue
 		}
 		if step.Status != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED &&

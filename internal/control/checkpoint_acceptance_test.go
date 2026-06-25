@@ -220,7 +220,11 @@ func buildCheckpointAcceptanceHistory(t *testing.T, ctx context.Context, service
 		if !ok {
 			return checkpointAcceptancePendingTail{}, fmt.Errorf("workflow %s missing", resp.GetWorkflowId())
 		}
-		taskID := state.Steps["finish"].TaskID
+		step, ok := state.Step("finish")
+		if !ok {
+			return checkpointAcceptancePendingTail{}, fmt.Errorf("workflow %s finish step missing", resp.GetWorkflowId())
+		}
+		taskID := step.TaskID
 		if i >= workload.Workflows-workflowTailCount {
 			pending.WorkflowTaskIDs = append(pending.WorkflowTaskIDs, taskID)
 			continue

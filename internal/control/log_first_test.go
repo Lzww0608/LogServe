@@ -76,7 +76,10 @@ func TestWorkflowScheduleBackpressureDoesNotLeavePhantomTaskID(t *testing.T) {
 	if len(workflows) != 1 {
 		t.Fatalf("workflows = %d, want 1", len(workflows))
 	}
-	step := workflows[0].Steps["finish"]
+	step, ok := workflows[0].Step("finish")
+	if !ok {
+		t.Fatal("finish step missing")
+	}
 	if step.TaskID != "" {
 		t.Fatalf("workflow step has phantom task_id %q after enqueue failure", step.TaskID)
 	}

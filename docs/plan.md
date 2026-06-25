@@ -987,6 +987,14 @@ type RuntimeDAG struct {
 3. replay 时重建 DAG runtime index。
 4. 对现有 map state 保持兼容，内部引入 runtime view。
 
+### 当前落地状态
+
+已实现 unary workflow runtime view：`workflow.State` 内部使用 `RuntimeDAG` 保存 `[]StepState`、`stepID -> index`、outgoing edges、remaining dependency count 和 ready queue；`ParseDefinition` 后 definition steps 会按 topological order 归一化。外部 workflow definition/API/status 仍保留 `step_id`，`GetWorkflowStatus` 继续输出 `repeated WorkflowStepState`。
+
+`scheduleReadySteps` 已改为从 `PopReadyStep()` 出队，不再每次扫描所有 definition steps；`SetStepSucceeded()` 只沿 succeeded step 的 outgoing edges 递减依赖计数并推进新 ready step。retry 失败回到 scheduled 时会重新进入 ready queue。
+
+Replay、checkpoint tail replay 和 metadata clone 都会重建 runtime index/ready queue。`workflow.State` 的 JSON 反序列化同时接受旧 checkpoint 中的 `Steps: {step_id: StepState}` map 和新的 step slice，保持已有 metadata checkpoint 兼容。PostgreSQL materialized view 仍按 `step_id` 写 `workflow_steps`，不改 schema。
+
 ### 验收指标
 
 1. 大 DAG 调度 CPU 下降。

@@ -640,15 +640,8 @@ ON CONFLICT (workflow_id) DO UPDATE SET
 		return err
 	}
 
-	stepIDs := append([]string(nil), state.StepOrder...)
-	if len(stepIDs) == 0 {
-		for stepID := range state.Steps {
-			stepIDs = append(stepIDs, stepID)
-		}
-		sort.Strings(stepIDs)
-	}
-	for _, stepID := range stepIDs {
-		step := state.Steps[stepID]
+	stepStates := state.StepStatesInOrder()
+	for _, step := range stepStates {
 		if _, err := exec.ExecContext(ctx, `
 INSERT INTO workflow_steps (
   workflow_id, step_id, task_name, status, attempts, task_id, result_json,

@@ -548,13 +548,7 @@ func (s *MemoryStore) ListModels() []*logservepb.ModelInfo {
 }
 
 func cloneWorkflow(state workflow.State) workflow.State {
-	state.ResultJSON = append([]byte(nil), state.ResultJSON...)
-	state.StepOrder = append([]string(nil), state.StepOrder...)
-	state.Definition.Steps = append([]workflow.StepDefinition(nil), state.Definition.Steps...)
-	state.Definition.ArgsJSON = append([]byte(nil), state.Definition.ArgsJSON...)
-	state.Definition.FunctionSource = string([]byte(state.Definition.FunctionSource))
-	state.Steps = cloneWorkflowSteps(state.Steps)
-	return state
+	return workflow.CloneState(state)
 }
 
 func cloneWorkflowSteps(source map[string]workflow.StepState) map[string]workflow.StepState {

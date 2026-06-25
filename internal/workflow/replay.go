@@ -88,12 +88,13 @@ func ReplayRawEach(workflowID string, iterate RawRecordIterator) (State, error) 
 	if state.WorkflowID == "" {
 		return State{}, errors.New("workflow start event not found")
 	}
+	state.RebuildRuntime()
 	return state, nil
 }
 
 func ReplayFromEach(initial State, iterate RecordIterator) (State, error) {
 	if iterate == nil {
-		return cloneStateForReplay(initial), nil
+		return CloneState(initial), nil
 	}
 	return ReplayFromRawEach(initial, func(emit func(logrecord.RawRecord) error) error {
 		return iterate(func(rec *logservepb.LogRecord) error {
@@ -103,7 +104,7 @@ func ReplayFromEach(initial State, iterate RecordIterator) (State, error) {
 }
 
 func ReplayFromRawEach(initial State, iterate RawRecordIterator) (State, error) {
-	state := cloneStateForReplay(initial)
+	state := CloneState(initial)
 	if iterate != nil {
 		if err := iterate(func(rec logrecord.RawRecord) error {
 			var err error
@@ -116,6 +117,7 @@ func ReplayFromRawEach(initial State, iterate RawRecordIterator) (State, error) 
 	if state.WorkflowID == "" {
 		return State{}, errors.New("workflow start event not found")
 	}
+	state.RebuildRuntime()
 	return state, nil
 }
 
@@ -144,42 +146,13 @@ func applyWorkflowRecord(state State, fallbackWorkflowID string, rec logrecord.R
 		state.IdempotencyKey = payload.IdempotencyKey
 		state.IdempotencyFingerprint = payload.IdempotencyFingerprint
 	case "StepScheduled":
-		step := state.Steps[payload.StepID]
-		step.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED
-		step.TaskID = payload.TaskID
-		step.Attempts = payload.Attempt
-		step.LastInputHash = payload.InputHash
-		step.LastScheduledAtMs = payload.TimestampMs
-		step.Error = ""
-		state.Steps[payload.StepID] = step
-		state.UpdatedAtMs = payload.TimestampMs
+		state.SetStepScheduled(payload.StepID, payload.TaskID, payload.Attempt, payload.InputHash, nil, payload.TimestampMs)
 	case "StepStarted":
-		step := state.Steps[payload.StepID]
-		step.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_STARTED
-		step.TaskID = payload.TaskID
-		step.StartedAtMs = payload.TimestampMs
-		state.Steps[payload.StepID] = step
-		state.UpdatedAtMs = payload.TimestampMs
+		state.SetStepStarted(payload.StepID, payload.TaskID, payload.TimestampMs)
 	case "StepSucceeded":
-		step := state.Steps[payload.StepID]
-		step.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED
-		step.TaskID = payload.TaskID
-		step.ResultJSON = append([]byte(nil), payload.ResultJSON...)
-		step.ResultRef = payload.ResultRef
-		step.Error = ""
-		step.CompletedAtMs = payload.TimestampMs
-		step.LatencyMs = payload.LatencyMs
-		state.Steps[payload.StepID] = step
-		state.UpdatedAtMs = payload.TimestampMs
+		state.SetStepSucceeded(payload.StepID, payload.TaskID, payload.ResultJSON, payload.ResultRef, payload.TimestampMs, payload.LatencyMs)
 	case "StepFailed":
-		step := state.Steps[payload.StepID]
-		step.Status = logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_FAILED
-		step.TaskID = payload.TaskID
-		step.Error = payload.Error
-		step.CompletedAtMs = payload.TimestampMs
-		step.LatencyMs = payload.LatencyMs
-		state.Steps[payload.StepID] = step
-		state.UpdatedAtMs = payload.TimestampMs
+		state.SetStepFailed(payload.StepID, payload.TaskID, payload.Error, false, payload.TimestampMs, payload.LatencyMs)
 	case "WorkflowCompleted":
 		state.Status = logservepb.WorkflowStatus_WORKFLOW_STATUS_COMPLETED
 		state.ResultJSON = append([]byte(nil), payload.ResultJSON...)
@@ -261,28 +234,6 @@ func eventPayloadFromMap(fields map[string]any) EventPayload {
 	}
 }
 
-func cloneStateForReplay(state State) State {
-	state.ResultJSON = append([]byte(nil), state.ResultJSON...)
-	state.StepOrder = append([]string(nil), state.StepOrder...)
-	state.Definition.ArgsJSON = append([]byte(nil), state.Definition.ArgsJSON...)
-	state.Definition.Steps = append([]StepDefinition(nil), state.Definition.Steps...)
-	for i := range state.Definition.Steps {
-		state.Definition.Steps[i].ArgsJSON = append([]byte(nil), state.Definition.Steps[i].ArgsJSON...)
-		state.Definition.Steps[i].DependsOn = append([]string(nil), state.Definition.Steps[i].DependsOn...)
-	}
-	state.Steps = cloneStepsForReplay(state.Steps)
-	return state
-}
-
-func cloneStepsForReplay(source map[string]StepState) map[string]StepState {
-	out := make(map[string]StepState, len(source))
-	for stepID, step := range source {
-		step.ResultJSON = append([]byte(nil), step.ResultJSON...)
-		step.ResolvedArgsJSON = append([]byte(nil), step.ResolvedArgsJSON...)
-		out[stepID] = step
-	}
-	return out
-}
 func Consistent(a, b State) bool {
 	if a.WorkflowID != b.WorkflowID || a.Status != b.Status || a.Error != b.Error {
 		return false
@@ -290,16 +241,16 @@ func Consistent(a, b State) bool {
 	if !bytes.Equal(a.ResultJSON, b.ResultJSON) || a.ResultRef != b.ResultRef {
 		return false
 	}
-	if len(a.StepOrder) != len(b.StepOrder) {
+	as := a.StepStatesInOrder()
+	bs := b.StepStatesInOrder()
+	if len(as) != len(bs) {
 		return false
 	}
-	for _, stepID := range a.StepOrder {
-		as := a.Steps[stepID]
-		bs := b.Steps[stepID]
-		if as.Status != bs.Status || as.Attempts != bs.Attempts || as.TaskID != bs.TaskID || as.ResultRef != bs.ResultRef || as.Error != bs.Error {
+	for i := range as {
+		if as[i].StepID != bs[i].StepID || as[i].Status != bs[i].Status || as[i].Attempts != bs[i].Attempts || as[i].TaskID != bs[i].TaskID || as[i].ResultRef != bs[i].ResultRef || as[i].Error != bs[i].Error {
 			return false
 		}
-		if !bytes.Equal(as.ResultJSON, bs.ResultJSON) {
+		if !bytes.Equal(as[i].ResultJSON, bs[i].ResultJSON) {
 			return false
 		}
 	}
