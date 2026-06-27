@@ -109,3 +109,19 @@ reports/ubuntu-console-latest/console-acceptance-package.tar.gz
 ```
 
 `acceptance_summary.json` 的 `verdict` 为 `PASS` 才表示 console 验收通过。失败时先不要删目录，把 `console-acceptance-package.tar.gz` 和 `acceptance_summary.md/json` 发回来，我会根据里面的命令状态、探针结果和日志判断是否符合预期，以及失败点是环境问题还是代码问题。
+
+## 本地判定
+
+如果想在服务器上先按同一套规则自查：
+
+```bash
+python3 scripts/evaluate_console_acceptance.py reports/ubuntu-console-latest/console-acceptance-package.tar.gz
+```
+
+判定结果有三种：
+
+- `PASS`：完整 Docker console 验收符合预期。
+- `FAIL`：验收失败，输出里会列出失败命令或失败检查。
+- `INCOMPLETE`：只跑了轻量模式，没有覆盖 Docker runtime 和真实 Console API 链路。
+
+我收到结果包后，也会用这个脚本作为第一层判定，再结合日志看是否需要修代码或调整服务器环境。
