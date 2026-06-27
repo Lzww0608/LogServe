@@ -24,6 +24,10 @@ class UbuntuConsoleAcceptanceWrapperTest(unittest.TestCase):
         self.assertIn(compose_up + "\n      COMPOSE_STARTED=1", text)
         self.assertNotIn(compose_up + '\n      if [ "$LAST_STEP_CODE" -eq 0 ]; then\n        COMPOSE_STARTED=1', text)
 
+        first_summary = text.index("write_acceptance_summary\npackage_results")
+        final_summary = text.index("package_results\nwrite_acceptance_summary")
+        self.assertLess(first_summary, final_summary)
+
 
 if __name__ == "__main__":
     unittest.main()

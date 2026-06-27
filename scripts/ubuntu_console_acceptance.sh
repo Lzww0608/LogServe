@@ -396,6 +396,7 @@ if [ "$PREREQ_OK" -eq 1 ]; then
   fi
 fi
 
+write_acceptance_summary
 package_results
 write_acceptance_summary
 if [ "$SUMMARY_FAIL" -ne 0 ]; then
