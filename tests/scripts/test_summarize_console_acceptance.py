@@ -92,8 +92,12 @@ class ConsoleAcceptanceSummaryTest(unittest.TestCase):
 
             self.assertEqual("PASS", summary["verdict"])
             self.assertTrue(summary["checks"]["probe_submit_task_via_console_api"])
+            self.assertEqual("PASS", summary["features_6_10"]["verdict"])
+            self.assertEqual("PASS", summary["features_6_10"]["features"]["feature_10_log_stream_explorer"]["state"])
             markdown = (root / "acceptance_summary.md").read_text(encoding="utf-8")
             self.assertIn("Ubuntu Console Acceptance Summary", markdown)
+            self.assertIn("Features 6-10", markdown)
+            self.assertIn("feature_6_workflow_dag", markdown)
             self.assertIn("HTTP Probe", markdown)
 
     def test_docker_disabled_skips_probe_checks(self):
@@ -106,6 +110,7 @@ class ConsoleAcceptanceSummaryTest(unittest.TestCase):
             summary = module.write_summary(root)
 
             self.assertEqual("PASS", summary["verdict"])
+            self.assertEqual("INCOMPLETE", summary["features_6_10"]["verdict"])
             self.assertNotIn("console_http_probe", summary["checks"])
             self.assertNotIn("probe_dashboard_with_auth", summary["checks"])
 

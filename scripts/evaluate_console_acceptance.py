@@ -90,6 +90,78 @@ def bool_config(config, key, default=False):
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
+FEATURE_GROUPS_6_10 = {
+    "feature_6_workflow_dag": {
+        "title": "Workflow DAG and replay",
+        "checks": (
+            "submit_workflow_via_console_api",
+            "workflow_detail_has_dag_dependencies",
+            "workflow_replay_consistent",
+        ),
+    },
+    "feature_7_llm_playground": {
+        "title": "LLM playground and replay trace",
+        "checks": (
+            "register_model_via_console_api",
+            "submit_llm_via_console_api",
+            "llm_replay_trace_has_latency",
+        ),
+    },
+    "feature_8_worker_cache_matrix": {
+        "title": "Worker cache matrix",
+        "checks": ("worker_cache_matrix_has_model",),
+    },
+    "feature_9_actor_console": {
+        "title": "Actor create, call, and status",
+        "checks": (
+            "create_actor_via_console_api",
+            "call_actor_via_console_api",
+            "get_actor_status",
+        ),
+    },
+    "feature_10_log_stream_explorer": {
+        "title": "Log stream explorer",
+        "checks": (
+            "log_streams_list_system_functions",
+            "log_stream_read_system_functions",
+            "log_stream_read_workflow",
+            "log_stream_read_actor",
+        ),
+    },
+}
+
+
+def build_feature_groups_6_10(run_docker, probe_checks):
+    features = {}
+    states = []
+    probe_checks = probe_checks or {}
+    for feature_id, spec in FEATURE_GROUPS_6_10.items():
+        check_results = {name: probe_checks.get(name) is True for name in spec["checks"]}
+        missing_checks = [name for name in spec["checks"] if name not in probe_checks]
+        failed_checks = [name for name, passed in check_results.items() if not passed]
+        if not run_docker:
+            state = "INCOMPLETE"
+        elif failed_checks:
+            state = "FAIL"
+        else:
+            state = "PASS"
+        states.append(state)
+        features[feature_id] = {
+            "title": spec["title"],
+            "state": state,
+            "checks": check_results,
+            "missing_checks": missing_checks,
+            "failed_checks": failed_checks,
+        }
+    if all(state == "PASS" for state in states):
+        verdict = "PASS"
+    elif all(state == "INCOMPLETE" for state in states):
+        verdict = "INCOMPLETE"
+    else:
+        verdict = "FAIL"
+    return {"verdict": verdict, "features": features}
+
+
 def missing_or_failed(checks, names):
     return [name for name in names if checks.get(name) is not True]
 
@@ -111,6 +183,7 @@ def evaluate_result(root):
             "reason": "missing acceptance_summary.json",
             "result_dir": str(root),
             "failures": ["missing acceptance_summary.json"],
+            "features_6_10": build_feature_groups_6_10(False, {}),
             "summary": {},
         }
 
@@ -135,6 +208,7 @@ def evaluate_result(root):
         failures.append("required npm install check failed or missing: web_npm_ci")
 
     run_docker = bool_config(run_config, "run_docker", False)
+    features_6_10 = build_feature_groups_6_10(run_docker, probe_checks)
     if not run_docker:
         if failures:
             return {
@@ -143,6 +217,7 @@ def evaluate_result(root):
                 "result_dir": str(root),
                 "failures": failures,
                 "warnings": warnings,
+                "features_6_10": features_6_10,
                 "summary": summary,
             }
         return {
@@ -151,6 +226,7 @@ def evaluate_result(root):
             "result_dir": str(root),
             "failures": failures,
             "warnings": warnings,
+            "features_6_10": features_6_10,
             "summary": summary,
         }
 
@@ -161,7 +237,10 @@ def evaluate_result(root):
         failures.append(f"HTTP probe verdict is {probe.get('verdict')!r}, expected 'PASS'")
     for name in missing_or_failed(probe_checks, REQUIRED_PROBE_CHECKS):
         failures.append(f"required HTTP probe check failed or missing: {name}")
-
+    for feature_id, feature in (features_6_10.get("features") or {}).items():
+        if feature.get("state") != "PASS":
+            failed = ", ".join(feature.get("failed_checks") or feature.get("missing_checks") or [])
+            failures.append(f"feature 6-10 group failed: {feature_id} ({feature.get('state')}) {failed}".strip())
 
     return {
         "verdict": "FAIL" if failures else "PASS",
@@ -169,6 +248,7 @@ def evaluate_result(root):
         "result_dir": str(root),
         "failures": failures,
         "warnings": warnings,
+        "features_6_10": features_6_10,
         "summary": summary,
     }
 
@@ -192,6 +272,19 @@ def write_markdown(result, path):
         lines.append("")
         for item in warnings:
             lines.append(f"- {item}")
+    features = result.get("features_6_10") or {}
+    if features:
+        lines.append("")
+        lines.append("## Features 6-10")
+        lines.append("")
+        lines.append(f"- Verdict: **{features.get('verdict', 'UNKNOWN')}**")
+        lines.append("")
+        lines.append("| Feature | State | Failed checks |")
+        lines.append("|---|---:|---|")
+        for feature_id, feature in (features.get("features") or {}).items():
+            failed = feature.get("failed_checks") or []
+            failed_text = "-" if not failed else ", ".join(failed)
+            lines.append(f"| `{feature_id}` {feature.get('title', '')} | {feature.get('state')} | {failed_text} |")
     summary = result.get("summary") or {}
     if summary.get("checks"):
         lines.append("")

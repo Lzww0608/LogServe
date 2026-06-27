@@ -17,6 +17,7 @@
 | `report.md` | 最新项目验收和实验结果。 |
 | `resume.md` | 简历、面试和答辩表述。 |
 | `ubuntu-project-acceptance.md` | 顶层 Ubuntu 验收流程和通过结果。 |
+| `ubuntu-console-features-6-10-acceptance.md` | Console 功能 6-10 的 Ubuntu 专项验收流程。 |
 | `ubuntu-checkpoint-acceptance.md` | metadata checkpoint 验收流程和通过结果。 |
 | `ubuntu-postgres-async-test.md` | PostgreSQL async materializer 验收流程和通过结果。 |
 | `plan.md` | 更长的优化设计备忘录，里面有很多可拆 issue 的细节。部分内容已经落地，当前状态以 `optimizations.md` 和 `report.md` 为准。 |

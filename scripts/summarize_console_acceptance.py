@@ -46,6 +46,78 @@ def bool_config(config, key, default=False):
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
+FEATURE_GROUPS_6_10 = {
+    "feature_6_workflow_dag": {
+        "title": "Workflow DAG and replay",
+        "checks": (
+            "submit_workflow_via_console_api",
+            "workflow_detail_has_dag_dependencies",
+            "workflow_replay_consistent",
+        ),
+    },
+    "feature_7_llm_playground": {
+        "title": "LLM playground and replay trace",
+        "checks": (
+            "register_model_via_console_api",
+            "submit_llm_via_console_api",
+            "llm_replay_trace_has_latency",
+        ),
+    },
+    "feature_8_worker_cache_matrix": {
+        "title": "Worker cache matrix",
+        "checks": ("worker_cache_matrix_has_model",),
+    },
+    "feature_9_actor_console": {
+        "title": "Actor create, call, and status",
+        "checks": (
+            "create_actor_via_console_api",
+            "call_actor_via_console_api",
+            "get_actor_status",
+        ),
+    },
+    "feature_10_log_stream_explorer": {
+        "title": "Log stream explorer",
+        "checks": (
+            "log_streams_list_system_functions",
+            "log_stream_read_system_functions",
+            "log_stream_read_workflow",
+            "log_stream_read_actor",
+        ),
+    },
+}
+
+
+def build_feature_groups_6_10(run_docker, probe_checks):
+    features = {}
+    states = []
+    probe_checks = probe_checks or {}
+    for feature_id, spec in FEATURE_GROUPS_6_10.items():
+        check_results = {name: probe_checks.get(name) is True for name in spec["checks"]}
+        missing_checks = [name for name in spec["checks"] if name not in probe_checks]
+        failed_checks = [name for name, passed in check_results.items() if not passed]
+        if not run_docker:
+            state = "INCOMPLETE"
+        elif failed_checks:
+            state = "FAIL"
+        else:
+            state = "PASS"
+        states.append(state)
+        features[feature_id] = {
+            "title": spec["title"],
+            "state": state,
+            "checks": check_results,
+            "missing_checks": missing_checks,
+            "failed_checks": failed_checks,
+        }
+    if all(state == "PASS" for state in states):
+        verdict = "PASS"
+    elif all(state == "INCOMPLETE" for state in states):
+        verdict = "INCOMPLETE"
+    else:
+        verdict = "FAIL"
+    return {"verdict": verdict, "features": features}
+
+
 def build_checks(statuses, config, probe):
     checks = {
         "go_web_tests": status_pass(statuses, "go_test_web"),
@@ -87,6 +159,7 @@ def write_summary(root):
     statuses = read_statuses(root / "command_status.jsonl")
     probe = read_json(root / "console_http_probe.json")
     checks = build_checks(statuses, config, probe)
+    features_6_10 = build_feature_groups_6_10(bool_config(config, "run_docker", True), probe.get("checks") or {})
     failed_commands = [item.get("name") for item in statuses if status_failed(item)]
     failed_checks = sorted(name for name, passed in checks.items() if not passed)
     package_path = root / "console-acceptance-package.tar.gz"
@@ -98,6 +171,7 @@ def write_summary(root):
         "failed_checks": failed_checks,
         "commands": statuses,
         "checks": checks,
+        "features_6_10": features_6_10,
         "probe": probe,
         "run_config": config,
         "send_back": send_back_paths(root),
@@ -117,6 +191,19 @@ def write_markdown(root, summary):
     lines.append("")
     for key, passed in sorted((summary.get("checks") or {}).items()):
         lines.append(f"- `{key}`: {'pass' if passed else 'fail'}")
+    features = summary.get("features_6_10") or {}
+    if features:
+        lines.append("")
+        lines.append("## Features 6-10")
+        lines.append("")
+        lines.append(f"- Verdict: **{features.get('verdict', 'UNKNOWN')}**")
+        lines.append("")
+        lines.append("| Feature | State | Checks |")
+        lines.append("|---|---:|---|")
+        for feature_id, feature in (features.get("features") or {}).items():
+            failed = feature.get("failed_checks") or []
+            checks_text = "all pass" if not failed else ", ".join(failed)
+            lines.append(f"| `{feature_id}` {feature.get('title', '')} | {feature.get('state')} | {checks_text} |")
     lines.append("")
     lines.append("## Commands")
     lines.append("")

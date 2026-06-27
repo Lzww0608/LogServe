@@ -100,6 +100,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
 
             self.assertEqual("PASS", result["verdict"])
             self.assertFalse(result["failures"])
+            self.assertEqual("PASS", result["features_6_10"]["verdict"])
 
     def test_lightweight_result_is_incomplete(self):
         module = load_module()
@@ -111,6 +112,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
 
             self.assertEqual("INCOMPLETE", result["verdict"])
             self.assertEqual("Docker console runtime was not exercised", result["reason"])
+            self.assertEqual("INCOMPLETE", result["features_6_10"]["verdict"])
 
     def test_lightweight_failed_local_check_is_fail(self):
         module = load_module()
@@ -153,6 +155,23 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
 
             self.assertEqual("FAIL", result["verdict"])
             self.assertTrue(any("dashboard_requires_auth" in item for item in result["failures"]))
+
+    def test_failed_feature_group_fails_expectations(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            root = Path(tmp)
+            write_summary(root)
+            summary_path = root / "acceptance_summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["probe"]["checks"]["worker_cache_matrix_has_model"] = False
+            summary["checks"]["probe_worker_cache_matrix_has_model"] = False
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+            result = module.evaluate_result(root)
+
+            self.assertEqual("FAIL", result["verdict"])
+            self.assertEqual("FAIL", result["features_6_10"]["features"]["feature_8_worker_cache_matrix"]["state"])
+            self.assertTrue(any("feature_8_worker_cache_matrix" in item for item in result["failures"]))
 
     def test_main_accepts_package(self):
         module = load_module()
