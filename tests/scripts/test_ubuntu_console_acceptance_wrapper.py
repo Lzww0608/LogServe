@@ -7,6 +7,12 @@ SCRIPT = ROOT / "scripts" / "ubuntu_console_acceptance.sh"
 
 
 class UbuntuConsoleAcceptanceWrapperTest(unittest.TestCase):
+    def test_docker_runtime_installs_executor_requirements(self):
+        text = (ROOT / "deployments" / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn("COPY executor/python/requirements.txt /tmp/logserve-executor-requirements.txt", text)
+        self.assertIn("pip install --no-cache-dir -r /tmp/logserve-executor-requirements.txt", text)
+
     def test_wrapper_covers_console_build_compose_probe_and_packaging(self):
         text = SCRIPT.read_text(encoding="utf-8")
 

@@ -166,19 +166,24 @@ type LLMEventDTO struct {
 }
 
 func dashboardDTO(snapshot *logservepb.DashboardSnapshot) DashboardDTO {
-	if snapshot == nil {
-		return DashboardDTO{}
-	}
 	out := DashboardDTO{
-		QueueDepth:            snapshot.GetQueueDepth(),
-		QueueHighWatermark:    snapshot.GetQueueHighWatermark(),
-		RedeliveryTimeoutMs:   snapshot.GetRedeliveryTimeoutMs(),
-		SchedulingPolicy:      schedulingPolicyString(snapshot.GetSchedulingPolicy()),
-		LastLogAppendMs:       snapshot.GetLastLogAppendMs(),
-		LogAppendSlowMs:       snapshot.GetLogAppendSlowMs(),
-		CompactableLogRecords: snapshot.GetCompactableLogRecords(),
-		CompactableLogBytes:   snapshot.GetCompactableLogBytes(),
+		Tasks:     []TaskDTO{},
+		Workflows: []WorkflowDTO{},
+		Actors:    []ActorDTO{},
+		Workers:   []WorkerDTO{},
+		Models:    []ModelDTO{},
 	}
+	if snapshot == nil {
+		return out
+	}
+	out.QueueDepth = snapshot.GetQueueDepth()
+	out.QueueHighWatermark = snapshot.GetQueueHighWatermark()
+	out.RedeliveryTimeoutMs = snapshot.GetRedeliveryTimeoutMs()
+	out.SchedulingPolicy = schedulingPolicyString(snapshot.GetSchedulingPolicy())
+	out.LastLogAppendMs = snapshot.GetLastLogAppendMs()
+	out.LogAppendSlowMs = snapshot.GetLogAppendSlowMs()
+	out.CompactableLogRecords = snapshot.GetCompactableLogRecords()
+	out.CompactableLogBytes = snapshot.GetCompactableLogBytes()
 	for _, task := range snapshot.GetTasks() {
 		out.Tasks = append(out.Tasks, dashboardTaskDTO(task))
 	}

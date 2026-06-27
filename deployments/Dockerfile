@@ -28,6 +28,9 @@ COPY --from=build /out/logserve-logd /usr/local/bin/logserve-logd
 COPY --from=build /out/logserve-control /usr/local/bin/logserve-control
 COPY --from=build /out/logserve-worker /usr/local/bin/logserve-worker
 COPY --from=build /out/logservectl /usr/local/bin/logservectl
+COPY executor/python/requirements.txt /tmp/logserve-executor-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/logserve-executor-requirements.txt \
+    && rm /tmp/logserve-executor-requirements.txt
 COPY executor /app/executor
 COPY sdk /app/sdk
 RUN chown -R logserve:logserve /app

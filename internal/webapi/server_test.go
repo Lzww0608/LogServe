@@ -146,6 +146,31 @@ func TestAllowUnauthenticatedBypassesToken(t *testing.T) {
 	}
 }
 
+func TestDashboardSerializesEmptyCollectionsAsArrays(t *testing.T) {
+	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/dashboard", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	for _, want := range []string{`"tasks":[]`, `"workflows":[]`, `"actors":[]`, `"workers":[]`, `"models":[]`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard response missing %s: %s", want, body)
+		}
+	}
+	for _, notWant := range []string{`"tasks":null`, `"workflows":null`, `"actors":null`, `"workers":null`, `"models":null`} {
+		if strings.Contains(body, notWant) {
+			t.Fatalf("dashboard response contains %s: %s", notWant, body)
+		}
+	}
+}
+
 func TestDecodeJSONRejectsTrailingValue(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"task_name":"x"} {"task_name":"y"}`))
 	var input submitTaskRequest
