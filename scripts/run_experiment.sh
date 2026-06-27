@@ -2,8 +2,11 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ID="${LOGSERVE_EXPERIMENT_ID:-$(date -u +%Y%m%dT%H%M%S%NZ)}"
-RUN_DIR="${LOGSERVE_EXPERIMENT_DIR:-"$ROOT/reports/experiment-$RUN_ID"}"
+. "$ROOT/scripts/naming_guard.sh"
+RUN_ID="${LOGSERVE_EXPERIMENT_ID:-latest}"
+logserve_reject_dated_name "$RUN_ID" "LOGSERVE_EXPERIMENT_ID"
+RUN_DIR="${LOGSERVE_EXPERIMENT_DIR:-"$ROOT/reports/compose-experiment-$RUN_ID"}"
+logserve_reject_dated_name "$RUN_DIR" "LOGSERVE_EXPERIMENT_DIR"
 STATUS_FILE="$RUN_DIR/command_status.jsonl"
 DATA_DIR="${LOGSERVE_EXPERIMENT_DATA_DIR:-"$RUN_DIR/runtime"}"
 EXPERIMENT_MODE="${LOGSERVE_EXPERIMENT_MODE:-compose}"

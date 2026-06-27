@@ -2,13 +2,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/scripts/naming_guard.sh"
 cd "$ROOT"
 
 OUT_DIR="${LOGSERVE_MICRO_BENCH_OUT:-$ROOT/benchmarks}"
 mkdir -p "$OUT_DIR"
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT_FILE="$OUT_DIR/micro-${STAMP}.txt"
-JSON_FILE="$OUT_DIR/micro-${STAMP}.json"
+BENCH_ID="${LOGSERVE_MICRO_BENCH_ID:-latest}"
+logserve_reject_dated_name "$BENCH_ID" "LOGSERVE_MICRO_BENCH_ID"
+OUT_FILE="$OUT_DIR/micro-${BENCH_ID}.txt"
+JSON_FILE="$OUT_DIR/micro-${BENCH_ID}.json"
+logserve_reject_dated_name "$OUT_FILE" "microbenchmark text output"
+logserve_reject_dated_name "$JSON_FILE" "microbenchmark JSON output"
 
 BENCHTIME="${LOGSERVE_GO_BENCHTIME:-300ms}"
 GO_ENV=(env -u LOGSERVE_API_TOKEN -u LOGSERVE_SCHEDULER_V2)
@@ -27,8 +31,8 @@ run_bench logstore_read ./internal/logstore -bench 'BenchmarkRead|BenchmarkEncod
 run_bench control_scheduler ./internal/control -bench 'BenchmarkSchedulerAssignMixedBacklog|BenchmarkPreferred'
 run_bench workflow_dag ./internal/workflow -bench 'BenchmarkSchedule'
 run_bench metadata ./internal/metadata -bench 'BenchmarkMemoryStore' \
-  -memprofile "$OUT_DIR/metadata_heap-${STAMP}.pprof" \
-  -mutexprofile "$OUT_DIR/metadata_mutex-${STAMP}.pprof"
+  -memprofile "$OUT_DIR/metadata_heap-${BENCH_ID}.pprof" \
+  -mutexprofile "$OUT_DIR/metadata_mutex-${BENCH_ID}.pprof"
 run_bench bootstrap ./internal/control -bench 'BenchmarkBootstrapFromLog'
 
 PYTHON="${LOGSERVE_PYTHON:-python3}"

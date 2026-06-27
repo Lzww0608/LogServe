@@ -1,4 +1,6 @@
-# LogServe 优化空间与执行计划：数据结构与基础架构方向
+# LogServe 深度优化备忘录：数据结构与基础架构方向
+
+> 说明：这是一份长版优化备忘录，保留了设计推导、候选方案和可拆任务。部分内容已经在当前代码中落地，例如 scheduler v2、metadata checkpoint、PostgreSQL async materializer、physical compaction、workflow RuntimeDAG、CRC32C、msgpack executor 和 mmap read。当前项目说明以 `docs/architecture.md` 为准，当前优化状态以 `docs/optimizations.md` 为准，当前实验结论以 `docs/report.md` 为准。
 
 ---
 
@@ -1166,8 +1168,8 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 交付物：
 
-1. `benchmarks/baseline-<timestamp>.json`
-2. `reports/profile-<timestamp>/`
+1. `benchmarks/baseline.json`
+2. `reports/profile-latest/`
 3. 文档化基线。
 
 ### Phase 1：logstore 写读路径

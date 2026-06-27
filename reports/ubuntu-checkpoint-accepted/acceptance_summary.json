@@ -1,0 +1,132 @@
+{
+  "verdict": "PASS",
+  "result_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted",
+  "package": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/ubuntu-checkpoint-acceptance-package.tar.gz",
+  "checkpoint_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/checkpoint_acceptance",
+  "failed_commands": [],
+  "commands": [
+    {
+      "name": "prerequisite_check",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "prerequisite_check.log"
+    },
+    {
+      "name": "go_test_all",
+      "exit_code": 0,
+      "duration_sec": 27,
+      "log": "go_test_all.log"
+    },
+    {
+      "name": "go_race_control_checkpoint",
+      "exit_code": 0,
+      "duration_sec": 3,
+      "log": "go_race_control_checkpoint.log"
+    },
+    {
+      "name": "python_script_tests",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_script_tests.log"
+    },
+    {
+      "name": "python_compileall",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_compileall.log"
+    },
+    {
+      "name": "checkpoint_acceptance",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "checkpoint_acceptance.log"
+    },
+    {
+      "name": "package_results",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "package.log"
+    }
+  ],
+  "checkpoint_acceptance": {
+    "verdict": "PASS",
+    "result_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/checkpoint_acceptance",
+    "failed_commands": [],
+    "failed_checks": [],
+    "commands": [
+      {
+        "name": "checkpoint_unit_tests",
+        "exit_code": 0,
+        "duration_sec": 0,
+        "log": "checkpoint_unit_tests.log"
+      },
+      {
+        "name": "checkpoint_acceptance_go_test",
+        "exit_code": 0,
+        "duration_sec": 1,
+        "log": "checkpoint_acceptance_go_test.log"
+      }
+    ],
+    "acceptance": {
+      "verdict": "PASS",
+      "generated_at_utc": "2026-06-23T15:48:34Z",
+      "workload": {
+        "tasks": 120,
+        "workflows": 12,
+        "actors": 12,
+        "llm_streams": 40,
+        "tail_events": 68
+      },
+      "checkpoint": {
+        "id": "checkpoint-53be70c761a0af47",
+        "stream_count": 196,
+        "task_count": 132,
+        "workflow_count": 12,
+        "actor_count": 12,
+        "llm_stats_count": 2
+      },
+      "full_replay": {
+        "duration_ms": 3.759,
+        "read_log_calls": 224,
+        "records_read": 614
+      },
+      "checkpoint_replay": {
+        "duration_ms": 2.327,
+        "read_log_calls": 201,
+        "records_read": 71
+      },
+      "ratios": {
+        "checkpoint_duration_over_full": 0.619,
+        "checkpoint_read_calls_over_full": 0.8973,
+        "checkpoint_records_over_full": 0.1156
+      },
+      "consistency": {
+        "consistent": true,
+        "checked_count": 156,
+        "checkpoint_id": "checkpoint-53be70c761a0af47",
+        "checkpoint_age_ms": 13
+      },
+      "checks": {
+        "checkpoint_created": true,
+        "checkpoint_read_records_reduced": true,
+        "checkpoint_replay_consistent": true,
+        "checkpoint_retention": true,
+        "checkpoint_tail_only_reads": true,
+        "corrupt_checkpoint_fallback": true
+      }
+    },
+    "send_back": [
+      "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/checkpoint_acceptance/summary.md",
+      "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/checkpoint_acceptance/summary.json",
+      "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/checkpoint_acceptance/checkpoint_acceptance.json"
+    ]
+  },
+  "send_back": [
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/acceptance_summary.md",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/acceptance_summary.json",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/checkpoint_acceptance/summary.md",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/checkpoint_acceptance/summary.json",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/checkpoint_acceptance/checkpoint_acceptance.json",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-checkpoint-accepted/ubuntu-checkpoint-acceptance-package.tar.gz"
+  ]
+}

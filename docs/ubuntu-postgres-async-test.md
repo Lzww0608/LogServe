@@ -1,51 +1,47 @@
-# Ubuntu PostgreSQL Async Acceptance Test
+# Ubuntu PostgreSQL Async Materializer 验收
 
-This run is intended for one Ubuntu server. Docker Compose starts PostgreSQL,
-MinIO, logd, control, and three workers on the same host, then runs sync and
-async PostgreSQL metadata materialization back to back.
+这份文档说明如何验证 PostgreSQL async materializer。LogServe 的 source of truth 是 shared log，PostgreSQL 只是 metadata 的 materialized view。async 模式的目标是降低同步 SQL 写入压力，同时不让 task throughput 和 p99 退化。
 
-## Prerequisites
-
-Install these on the server:
+## 环境准备
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y git curl ca-certificates build-essential python3 python3-venv
 ```
 
-Install Go and Docker using your normal server process. The script requires:
+还需要：
 
 - `go`
 - `python3`
 - `docker`
-- either `docker compose` or `docker-compose`
+- `docker compose` 或 `docker-compose`
 
-Confirm Docker is usable by the current user:
+确认当前用户能访问 Docker：
 
 ```bash
 docker info
 docker compose version || docker-compose --version
 ```
 
-## Run
+## 运行
 
-From the repository root on the Ubuntu server:
+在仓库根目录执行：
 
 ```bash
 bash scripts/ubuntu_postgres_async_acceptance.sh
 ```
 
-The wrapper runs:
+脚本会跑：
 
-- prerequisite capture and environment snapshot
-- `go test -count=1 ./...`
-- `go test -race -count=1 ./internal/metadata ./internal/control`
-- Python SDK unittest and compile checks
-- Docker Compose sync PostgreSQL metadata run
-- Docker Compose async PostgreSQL metadata run
-- automatic comparison and result packaging
+- 环境检查。
+- `go test -count=1 ./...`。
+- `go test -race -count=1 ./internal/metadata ./internal/control`。
+- Python SDK unittest 和 compileall。
+- Docker Compose sync PostgreSQL metadata run。
+- Docker Compose async PostgreSQL metadata run。
+- 自动比较和打包结果。
 
-For a faster smoke run while checking server setup:
+快速 smoke run：
 
 ```bash
 LOGSERVE_SERVER_SKIP_BASELINE=1 \
@@ -56,7 +52,7 @@ LOGSERVE_COMPARE_BENCH_ACTOR_COMMANDS=10 \
 bash scripts/ubuntu_postgres_async_acceptance.sh
 ```
 
-For a stronger final run, increase the workload:
+更强的最终运行：
 
 ```bash
 LOGSERVE_COMPARE_BENCH_TASKS=128 \
@@ -66,60 +62,63 @@ LOGSERVE_COMPARE_BENCH_ACTOR_COMMANDS=100 \
 bash scripts/ubuntu_postgres_async_acceptance.sh
 ```
 
-## Outputs
+## 输出文件
 
-The wrapper creates:
+脚本会生成：
 
 ```text
-reports/ubuntu-postgres-async-<timestamp>/
+reports/ubuntu-postgres-async-latest/
 ```
 
-Important files:
+重要文件：
 
-- `acceptance_summary.md`: top-level human-readable result
-- `acceptance_summary.json`: top-level machine-readable result
-- `postgres_async_compare/summary.md`: sync-vs-async comparison table
-- `postgres_async_compare/comparison.json`: acceptance checks and ratios
-- `ubuntu-acceptance-package.tar.gz`: packaged logs and JSON summaries
+- `acceptance_summary.md`
+- `acceptance_summary.json`
+- `postgres_async_compare/summary.md`
+- `postgres_async_compare/comparison.json`
+- `ubuntu-acceptance-package.tar.gz`
 
-Send back `acceptance_summary.md`, `acceptance_summary.json`,
-`postgres_async_compare/summary.md`, and
-`postgres_async_compare/comparison.json`. If a command fails, also send
-`ubuntu-acceptance-package.tar.gz`.
+失败时优先看 `acceptance_summary.md` 中标出的失败 log。
 
-## Expected Result
+## 验收标准
 
-The final comparison is expected to show:
+这些 checks 应该通过：
 
-- async task throughput within the configured non-regression tolerance (`LOGSERVE_COMPARE_TASK_THROUGHPUT_MIN_RATIO`, default `0.99`)
-- async task submit p99 within the configured non-regression tolerance (`LOGSERVE_COMPARE_TASK_P99_MAX_RATIO`, default `1.0`)
-- async PostgreSQL transaction rate lower than sync
-- async PostgreSQL row-write rate lower than sync
-- async materializer mode observed in dashboard
-- async materializer flush errors equal to zero
+- async task throughput within tolerance，默认阈值 `LOGSERVE_COMPARE_TASK_THROUGHPUT_MIN_RATIO=0.99`。
+- async task submit p99 within tolerance，默认阈值 `LOGSERVE_COMPARE_TASK_P99_MAX_RATIO=1.0`。
+- async PostgreSQL transaction rate lower than sync。
+- async PostgreSQL row-write rate lower than sync。
+- async materializer mode observed in dashboard。
+- async materializer flush errors equal to zero。
 
-The summary still reports the exact async/sync ratios and strict-improvement
-observations, so a pass should be described as non-regression unless the reported
-ratios show a real improvement. If any of these fail, keep the generated package
-and inspect the corresponding command log listed in `acceptance_summary.md`.
+通过不等于吞吐一定提升。只有 summary 里的 strict-improvement 指标为 true，才可以说对应指标严格改善。
 
-## Accepted Comparison Snapshot
+## 已通过结果
 
-The accepted comparison from the Ubuntu single-server run is:
+最新嵌套在顶层项目验收里的结果：
 
 ```text
-reports/ubuntu-postgres-async-20260623T121546Z/postgres_async_compare
+reports/ubuntu-project-accepted/postgres_async_acceptance/postgres_async_compare
 Acceptance: PASS
 ```
 
 | Metric | Sync | Async | Async/Sync |
 |---|---:|---:|---:|
-| Task throughput tps | 5.08 | 5.03 | 0.9902 |
-| Task submit p99 ms | 209 | 209 | 1.0000 |
-| PostgreSQL tx/s | 72.629 | 1.329 | 0.0183 |
-| PostgreSQL row writes/s | 101.423 | 17.083 | 0.1684 |
+| Task throughput tps | 5.0 | 5.0 | 1.0 |
+| Task submit p99 ms | 209 | 207 | 0.9904 |
+| PostgreSQL tx/s | 72.382 | 1.304 | 0.018 |
+| PostgreSQL row writes/s | 100.519 | 16.57 | 0.1648 |
 
-Accepted checks:
+Materializer 状态：
+
+| Item | Sync | Async |
+|---|---:|---:|
+| mode | sync | async |
+| pending deltas | None | 6 |
+| flush errors | 0 | 0 |
+| eventual lag ms | None | 746 |
+
+通过的 checks：
 
 - `task_throughput_within_tolerance`: pass
 - `task_submit_p99_within_tolerance`: pass
@@ -128,12 +127,4 @@ Accepted checks:
 - `async_materializer_mode_observed`: pass
 - `async_materializer_flush_errors_zero`: pass
 
-Dashboard replay consistency passed for both sync and async runs with 5
-workflows, 2 actors, 7 checked objects, and no failures. The async dashboard
-reported `pending_deltas=6`, `flush_errors=0`, and
-`eventual_lag_estimate_ms=840`.
-
-Interpret this as a successful async materialized-view validation: PostgreSQL
-transaction/write rates dropped substantially, while task throughput and p99
-remained within the configured non-regression tolerance. This run does not show
-strict task throughput or p99 improvement.
+结论：async materializer 把 PostgreSQL transaction/write rate 降了很多，task throughput 和 p99 没有退化。不要把这轮结果写成“吞吐显著提升”，因为 `task_throughput_strictly_improved=false`。

@@ -1,0 +1,58 @@
+{
+  "run_dir": "F:\\Code\\Go-Programming\\LogServe\\reports\\experiment-sample",
+  "commands": [
+    {
+      "name": "go_test_all",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "go_test_all.log"
+    }
+  ],
+  "benchmark": {
+    "workflow_p95_ms": 10,
+    "workflow_p99_ms": 12,
+    "task_throughput_tps": 100,
+    "task_p99_latency_ms": 3,
+    "llm_cold_total_latency_ms": 100,
+    "llm_warm_total_latency_ms": 20,
+    "llm_warm_cache_hit": true,
+    "llm_cold_checkpoint_fetch_ms": 5,
+    "llm_warm_checkpoint_fetch_ms": 0,
+    "resource_only_cache_hit_rate": 0.1,
+    "locality_aware_cache_hit_rate": 0.9,
+    "predicted_latency_cache_hit_rate": null,
+    "resource_only_p95_latency_ms": 100,
+    "locality_aware_p95_latency_ms": 40,
+    "predicted_latency_p95_latency_ms": null
+  },
+  "logstore": {
+    "logstore_always_append_tps": 123.4,
+    "logstore_always_read_tps": 567.8,
+    "logstore_always_recover_ms": 9,
+    "logstore_always_segments": 2
+  },
+  "checkpoint_cache": {
+    "checkpoint_model": "model-D",
+    "checkpoint_cold_cache_hit": false,
+    "checkpoint_warm_cache_hit": true,
+    "checkpoint_cold_worker_id": null,
+    "checkpoint_warm_worker_id": null,
+    "checkpoint_cold_fetch_ms": 4,
+    "checkpoint_warm_fetch_ms": 0,
+    "checkpoint_cache_used_bytes": 1048576,
+    "checkpoint_cache_capacity_bytes": 16777216,
+    "checkpoint_validation_errors": []
+  },
+  "fault_injection": {},
+  "dashboard": {
+    "dashboard_queue_depth": 0,
+    "dashboard_tasks": 1,
+    "dashboard_workflows": 0,
+    "dashboard_actors": 0,
+    "dashboard_workers": 1,
+    "dashboard_models": 1,
+    "dashboard_compactable_log_records": null,
+    "dashboard_compactable_log_bytes": null
+  },
+  "notes": []
+}

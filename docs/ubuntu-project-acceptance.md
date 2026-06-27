@@ -1,13 +1,12 @@
-# Ubuntu Project Acceptance Test
+# Ubuntu 顶层项目验收
 
-This is the top-level single-server acceptance runner for LogServe. It is meant
-for one Ubuntu machine. Docker Compose is used to simulate the multi-process
-runtime with logd, control, workers, PostgreSQL, NATS, and MinIO on the same
-host.
+这份文档说明如何在一台 Ubuntu 服务器上跑 LogServe 的顶层验收。它会同时验证基础测试、Docker Compose 端到端实验、metadata checkpoint、PostgreSQL async materializer 和 physical compaction。
 
-## Prerequisites
+这个验收适合项目交付前使用。通过后可以说明单机多进程机制健康；不能把它解释成多机生产性能结论。
 
-Install the basic tools:
+## 环境准备
+
+安装基础工具：
 
 ```bash
 sudo apt-get update
@@ -15,47 +14,43 @@ sudo apt-get install -y git curl ca-certificates build-essential python3 python3
 sudo usermod -aG docker "$USER"
 ```
 
-Log out and log back in after adding your user to the `docker` group, or run the
-script with a shell that can reach the Docker daemon.
+把用户加入 `docker` 组后需要重新登录，或者确保当前 shell 能访问 Docker daemon。
 
-The runner expects these commands to be available:
+脚本要求这些命令可用：
 
 - `go`
 - `python3`
 - `bash`
 - `git`
 - `tar`
-- `docker` and either `docker compose` or `docker-compose`
+- `docker compose` 或 `docker-compose`
 
-## Full Run
+## 完整运行
 
-From the repository root on the Ubuntu server:
+在仓库根目录执行：
 
 ```bash
 bash scripts/ubuntu_project_acceptance.sh
 ```
 
-By default this runs:
+默认会跑：
 
-- prerequisite and server environment capture
-- Python virtualenv setup and SDK dependency install
-- `go test -count=1 ./...`
-- `go vet ./...`
-- physical compaction focused tests
-- physical compaction race tests for `internal/logstore`
-- race tests for `internal/control`, `internal/metadata`, and `internal/worker`
-- Python script tests and SDK tests
-- Python compile checks
-- Docker Compose experiment via `scripts/run_experiment.sh`
-- metadata checkpoint acceptance via `scripts/ubuntu_checkpoint_acceptance.sh`
-- PostgreSQL async materializer acceptance via `scripts/ubuntu_postgres_async_acceptance.sh`
-- automatic project-level summary and result packaging
+- 环境检查和服务器信息采集。
+- Python virtualenv、SDK dependency install。
+- `go test -count=1 ./...`。
+- `go vet ./...`。
+- physical compaction 专项测试。
+- `internal/logstore` race tests。
+- `internal/control`、`internal/metadata`、`internal/worker` race tests。
+- Python script tests、SDK tests 和 compileall。
+- Docker Compose 端到端实验。
+- metadata checkpoint acceptance。
+- PostgreSQL async materializer acceptance。
+- 自动生成汇总和打包结果。
 
-## Faster Smoke Run
+## 快速 smoke run
 
-Use this when you are only checking whether the server environment is wired
-correctly. It skips the compose-heavy sub-suites but still runs baseline Go,
-Python, and physical compaction checks:
+只检查服务器环境和基础路径时，可以跳过较重的子套件：
 
 ```bash
 LOGSERVE_PROJECT_RUN_COMPOSE=0 \
@@ -64,53 +59,42 @@ LOGSERVE_PROJECT_RUN_POSTGRES_ASYNC=0 \
 bash scripts/ubuntu_project_acceptance.sh
 ```
 
-## Common Controls
-
-Disable only the PostgreSQL async comparison if the server is small:
+如果服务器资源较小，可以只跳过 PostgreSQL async 对比：
 
 ```bash
 LOGSERVE_PROJECT_RUN_POSTGRES_ASYNC=0 bash scripts/ubuntu_project_acceptance.sh
 ```
 
-Keep the broad Compose experiment but skip its benchmark runtime:
+保留 Compose 实验但跳过 benchmark runtime：
 
 ```bash
 LOGSERVE_RUN_BENCHMARK=0 bash scripts/ubuntu_project_acceptance.sh
 ```
 
-Use the system Python instead of creating a virtualenv:
+## 输出文件
 
-```bash
-LOGSERVE_USE_VENV=0 bash scripts/ubuntu_project_acceptance.sh
-```
-
-## Outputs
-
-The runner creates:
+脚本会生成：
 
 ```text
-reports/ubuntu-project-<timestamp>/
+reports/ubuntu-project-latest/
 ```
 
-Important files:
+重要文件：
 
-- `acceptance_summary.md`: top-level human-readable result
-- `acceptance_summary.json`: top-level machine-readable result
-- `command_status.jsonl`: every command with exit code and duration
-- `server_environment.txt`: Ubuntu, Go, Python, Docker, and git snapshot
-- `compose_experiment/summary.md`: broad Docker Compose experiment summary
-- `checkpoint_acceptance/acceptance_summary.md`: checkpoint acceptance summary
-- `postgres_async_acceptance/acceptance_summary.md`: PostgreSQL async acceptance summary
-- `ubuntu-project-acceptance-package.tar.gz`: packaged logs and summaries
+- `acceptance_summary.md`：人读的顶层结果。
+- `acceptance_summary.json`：机器可读结果。
+- `command_status.jsonl`：每条命令的退出码和耗时。
+- `server_environment.txt`：Ubuntu、Go、Python、Docker 和 git snapshot。
+- `compose_experiment/summary.md`：Compose 端到端实验。
+- `checkpoint_acceptance/acceptance_summary.md`：checkpoint 子验收。
+- `postgres_async_acceptance/acceptance_summary.md`：PostgreSQL async 子验收。
+- `ubuntu-project-acceptance-package.tar.gz`：打包后的日志和汇总。
 
-Send back `acceptance_summary.md`, `acceptance_summary.json`, and
-`command_status.jsonl`. If anything fails, also send
-`ubuntu-project-acceptance-package.tar.gz`.
+如果验收失败，优先看 `acceptance_summary.md` 中失败命令对应的 log。
 
-## Expected Result
+## 预期通过项
 
-For a full run, the top-level verdict should be `PASS`, and these checks should
-be `pass`:
+完整运行时，顶层 verdict 应为 `PASS`，这些 checks 应为 `pass`：
 
 - `go_baseline_tests`
 - `physical_compaction_tests`
@@ -121,24 +105,17 @@ be `pass`:
 - `checkpoint_acceptance_pass`
 - `postgres_async_acceptance_pass`
 
-A passing result means the single-node mechanism validation is healthy: core Go
-packages pass, physical compaction preserves log replay across delete/copy/crash
-windows, the single-host Docker Compose runtime starts, checkpoint bootstrap is
-consistent, and the PostgreSQL async materializer acceptance checks pass. It is
-still a single-server validation and should not be read as a production
-multi-node performance claim.
+## 已通过结果（2026-06-24）
 
-## Accepted Project Result (2026-06-24)
-
-The full project acceptance run completed successfully on the Ubuntu server:
+最新通过的完整验收：
 
 ```text
-Result directory: /home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-20260624T025707Z
+Result directory: /home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted
 Verdict: PASS
-Package: /home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-20260624T025707Z/ubuntu-project-acceptance-package.tar.gz
+Package: /home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/ubuntu-project-acceptance-package.tar.gz
 ```
 
-Top-level command status:
+顶层命令：
 
 | Command | Status | Seconds |
 |---|---:|---:|
@@ -154,24 +131,13 @@ Top-level command status:
 | `checkpoint_acceptance` | PASS | 2 |
 | `postgres_async_acceptance` | PASS | 116 |
 
-Accepted checks:
+关键证据：
 
-- `go_baseline_tests`: pass
-- `physical_compaction_tests`: pass
-- `logstore_race_tests`: pass
-- `python_script_tests`: pass
-- `python_compileall`: pass
-- `compose_experiment_pass`: pass
-- `checkpoint_acceptance_pass`: pass
-- `postgres_async_acceptance_pass`: pass
+- Compose 实验通过，dashboard 观测到 3 个 worker，dashboard replay consistency 为 true。
+- Actor snapshot replay 从 21 条 command 降到 1 条 command。
+- actor log 报告 45 条 compactable records 和 18,382 compactable bytes。
+- metadata checkpoint 子验收中，checkpoint-plus-tail replay 读取 71 条 records，full replay 读取 614 条 records，156 个对象一致性检查通过。
+- PostgreSQL async materializer 将 transaction rate 从 72.382 tx/s 降到 1.304 tx/s，将 row writes rate 从 100.519 rows/s 降到 16.570 rows/s，同时 task throughput 和 p99 在验收阈值内没有退化。
+- physical compaction 专项测试和 logstore race tests 在同一轮验收中通过。
 
-Key evidence from this run:
-
-- Compose experiment passed with 3 workers and dashboard replay consistency.
-- Actor snapshot replay read 1 command versus 21 commands for full/no-snapshot replay.
-- The run reported 45 compactable actor-log records and 18,382 compactable bytes.
-- The checkpoint acceptance sub-suite read 71 records with checkpoint-plus-tail replay versus 614 with full replay, with `consistent=true` across 156 checked objects.
-- PostgreSQL async materialization reduced transaction rate from 72.382 tx/s to 1.304 tx/s and row-write rate from 100.519 rows/s to 16.570 rows/s while keeping task throughput and p99 within acceptance tolerance.
-- Physical compaction focused tests and logstore race tests passed in the same top-level run.
-
-Interpret this as the accepted single-server project gate for the current implementation. It validates mechanism correctness and non-regression on one Ubuntu host; it does not claim production multi-node performance or real GPU/vLLM cold-start behavior.
+这轮结果可以作为当前实现的单机项目验收门禁。它验证机制正确性和非退化，不验证多节点生产性能。

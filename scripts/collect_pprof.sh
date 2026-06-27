@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/scripts/naming_guard.sh"
+
 ADDR="${1:-${LOGSERVE_PPROF_ADDR:-127.0.0.1:6062}}"
 OUT_DIR="${2:-${LOGSERVE_PPROF_OUT:-benchmarks/profiles}}"
 SECONDS="${LOGSERVE_PPROF_SECONDS:-30}"
 mkdir -p "$OUT_DIR"
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-PREFIX="$OUT_DIR/profile-${STAMP}"
+PROFILE_ID="${LOGSERVE_PPROF_ID:-latest}"
+logserve_reject_dated_name "$PROFILE_ID" "LOGSERVE_PPROF_ID"
+PREFIX="$OUT_DIR/profile-${PROFILE_ID}"
+logserve_reject_dated_name "$PREFIX" "pprof output path"
 
 BASE="http://${ADDR}/debug/pprof"
 

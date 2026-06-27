@@ -1,361 +1,241 @@
-# LogServe Report
+# LogServe 实验报告
 
-## 摘要
+## 结论
 
-LogServe 是一个基于 shared log 的 AI runtime。它包含任务执行、workflow DAG、actor 状态恢复、LLM serving、locality-aware scheduling、故障恢复和 benchmark 分析。系统采用 log-first 路径：控制面先写事件日志，再更新 materialized metadata view；workflow、actor、LLM 状态都可以从日志 replay 重建。
+当前最新的完整验收是 `reports/ubuntu-project-accepted`，结果为 `PASS`。这轮验收在单台 Ubuntu 服务器上运行，使用 Docker Compose 启动 PostgreSQL、MinIO、logd、control 和 3 个 worker，并嵌套执行 Compose 端到端实验、metadata checkpoint 验收和 PostgreSQL async materializer 验收。
 
-代码现在包括 Python SDK、Go 控制面、worker 和 logd。Python SDK 支持 `@task`、`@workflow`、`@actor`；控制面负责调度、幂等、重试、actor mailbox 和模型调度；worker 负责本地 executor pool、Python 函数执行、mock/vLLM LLM 调用和 checkpoint cache；logd 提供可恢复的 append-only shared log。
+这组结果可以证明：LogServe 的核心机制在单机多进程环境中可复现，主要回归门禁通过，shared log、workflow、actor、LLM serving、checkpoint、physical compaction 和 async materializer 的关键路径没有被破坏。
 
-## 系统实现
+边界也必须说清楚：这不是生产级多机性能结论，不是真实 GPU/vLLM 压测，也不能推断大模型 checkpoint 的真实冷启动曲线。
 
-### 组件
-
-- `logd`：分段 append-only shared log，支持 stream 读写、idempotent append、启动恢复和不同 fsync 策略。
-- `control`：任务、workflow、actor、model、backpressure 的控制面；维护 materialized metadata view。
-- `worker`：注册、心跳、poll，将 task/actor/LLM 分发到本地 executor pool，并写回完成事件。
-- Python SDK：提供 `@task`、`@workflow`、`@actor`、LLM API；优先使用 gRPC，缺少依赖时 fallback 到 CLI。
-- Result store：大结果和 actor snapshot 通过本地/S3-compatible MinIO 边界保存，日志只保留引用。
-- Dashboard API：导出 queue、task、workflow、actor、worker、model cache 的当前视图。
-
-### Workflow Runtime
-
-Workflow 由 Python `@workflow` DSL 转成 DAG step model。控制面根据依赖关系调度 ready steps，step 状态为：
-
-```text
-SCHEDULED -> STARTED -> SUCCEEDED | FAILED
-```
-
-系统支持 retry、timeout、result ref、replay 校验和 step 级幂等。幂等键使用：
-
-```text
-workflow_id + step_id + input_hash
-```
-
-语义是 exactly-once-ish：worker 可能至少执行一次，但控制面避免重复提交同一 step 的最终结果。系统不声明严格 distributed exactly-once。
-
-### Actor Runtime
-
-Actor 以 `actor:<actor_id>` stream 为状态真相。控制面写入：
-
-```text
-ActorCreated -> ActorOwnershipGranted -> ActorCommandSubmitted -> ActorCommandApplied -> ActorSnapshotCreated
-```
-
-每个 actor command 分配单调递增 `command_seq`。同一 actor 的请求通过 mailbox 串行化，只有 `command_seq == actor.command_count + 1` 的命令可以被应用。Actor ownership 使用 `owner_worker_id + epoch` 做 fencing，旧 worker 或旧 epoch 的完成会被拒绝。
-
-Snapshot 定期写入 result store；replay 优先从 snapshot 恢复，再回放 snapshot 之后的 command。Actor snapshot 创建后，控制面会调用 logstore 的 logical trim，将 actor stream 中 snapshot 之前的记录标记为 compactable。默认 `ReadLog` 从 trim point 之后读取，因此 actor replay 从 `ActorSnapshotCreated`、snapshot object 和 tail log 开始。目前没有物理删除 segment；系统会报告 compactable records/bytes，作为 physical compaction 的输入。
-
-### LLM Serving
-
-LLM 模块实现：
-
-- Model Registry：记录模型名、版本、大小、路径和 adapter。
-- Mock LLM：无 GPU 环境下模拟 model load 和 first token latency。
-- vLLM Adapter：可调用 OpenAI-compatible `/v1/chat/completions`。
-- Model Cache Manager：worker 注册/心跳上报本地模型缓存。
-- Checkpoint Cache：冷启动从 `--model-source-dir` 拷贝 checkpoint 到 worker-local cache，热启动命中本地缓存。
-- Scheduler：实现 `RESOURCE_ONLY`、`LOCALITY_AWARE`、`PREDICTED_LATENCY` 三种策略。`PREDICTED_LATENCY` 使用由 `LLMCompleted` 事件增量维护的 materialized stats，按 `(model_name, model_version, worker_id)` 记录 request count、cache-hit count、EWMA total/model-load/checkpoint-fetch latency 和 last update time，调度时只做 `O(number_of_workers)` 查询，不在热路径扫描 `llm:*` streams。控制面现在还支持 metadata checkpoint：后台写入 `system:checkpoints` 后，重启优先从 checkpoint 恢复 LLM stats、task specs/terminal state、workflow state 和 actor state，再从各 stream 的 `last_seq+1` 读取 tail；没有可用 checkpoint 时回退 full replay。
-
-LLM 请求写入 `llm:<task_id>` stream：
-
-```text
-ModelLoadStarted -> ModelLoaded -> LLMCompleted
-```
-
-`ReplayLLM` 可重建模型版本、worker、cache hit、checkpoint fetch、cache bytes、model load、first-token 和 total latency。
-
-Predicted-latency 的估算公式为：
-
-```text
-predicted_latency =
-  ewma_total_latency_ms
-  + queue_penalty
-  + cold_start_penalty
-  + eviction_penalty
-```
-
-## 实验环境
-
-实验在用户单机 Ubuntu 服务器上完成，使用 Docker Compose 在一台机器上模拟多 worker 部署：
+## 验收环境
 
 ```text
 Project path: /home/lab2439/Work/lzww/LogServe
-Run directory: reports/experiment-exp1782144454
-Package: reports/experiment-exp1782144454/experiment-package.tar.gz
-Mode: compose
-Runtime: PostgreSQL, MinIO, logd, control, 3 workers
+Run directory: reports/ubuntu-project-accepted
+Package: reports/ubuntu-project-accepted/ubuntu-project-acceptance-package.tar.gz
+Runtime: Docker Compose, PostgreSQL, MinIO, logd, control, 3 workers
 LLM: mock LLM, worker-local file-backed checkpoint cache
 Scheduler: LOGSERVE_SCHEDULER_V2=1
+Verdict: PASS
 ```
 
-这组实验用于验证单机多进程环境中的机制正确性和可复现性，覆盖 log-first、replay、redelivery、actor recovery、snapshot、typed/indexed scheduler、LLM locality、checkpoint cache 和 dashboard materialization。它不用于声明多机生产性能，也不等价于真实 GPU/vLLM 压测。
-
-## 验证结果
-
-### 基础验证
-
-最终实验判定为 `PASS`。自动汇总脚本给出的验收项如下：
-
-| 验收项 | 结果 |
-|---|---:|
-| all recorded commands pass | PASS |
-| logstore relaxed fsync faster than always | PASS |
-| locality cache hit not worse than resource-only | PASS |
-| checkpoint warm cache hit | PASS |
-| actor snapshot replay less than full replay | PASS |
-| dashboard has three workers | PASS |
-
-主要命令和探针均通过：
-
-| 验证项 | 结果 | 用时 |
-|---|---:|---:|
-| Python venv create | PASS | 2 s |
-| Python dependency install | PASS | 3 s |
-| `go test -count=1 ./...` | PASS | 27 s |
-| `go vet ./...` | PASS | 1 s |
-| `go test -race -count=1 ./internal/control ./internal/metadata ./internal/worker` | PASS | 7 s |
-| Python unittest | PASS | 0 s |
-| Python compileall | PASS | 0 s |
-| gRPC dependency check | PASS | 0 s |
-| `logservectl` build | PASS | 1 s |
-| scheduler benchmark | PASS | 7 s |
-| metadata benchmark | PASS | 9 s |
-| logstore benchmark | PASS | 12 s |
-| fault injection tests | PASS | 6 s |
-| compose build | PASS | 2 s |
-| runtime compose start | PASS | 1 s |
-| runtime logd/control/workers ready | PASS | 0 s |
-| runtime benchmark | PASS | 45 s |
-| checkpoint cache probe | PASS | 1 s |
-| checkpoint artifact check | PASS | 0 s |
-| dashboard snapshot | PASS | 0 s |
-| summary and package generation | PASS | 0 s |
-
-### PostgreSQL Async Materializer Acceptance
-
-PostgreSQL metadata view 的 async materializer 在单机 Ubuntu Docker Compose 环境下完成了 sync/async 对比验收。对比结果来自：
-
-```text
-Run directory: reports/ubuntu-postgres-async-20260623T121546Z/postgres_async_compare
-Summary: reports/ubuntu-postgres-async-20260623T121546Z/postgres_async_compare/summary.md
-Mode: sync vs async PostgreSQL metadata materialization
-Acceptance: PASS
-Thresholds: task throughput ratio >= 0.99, task p99 ratio <= 1.0
-```
-
-核心指标如下：
-
-| Metric | Sync | Async | Async/Sync |
-|---|---:|---:|---:|
-| Task throughput | 5.08 tasks/s | 5.03 tasks/s | 0.9902 |
-| Task submit p99 | 209 ms | 209 ms | 1.0000 |
-| PostgreSQL tx/s | 72.629 | 1.329 | 0.0183 |
-| PostgreSQL row writes/s | 101.423 | 17.083 | 0.1684 |
-
-验收项全部通过：
+## 顶层验收项
 
 | Check | Result |
 |---|---:|
-| task throughput within tolerance | PASS |
-| task submit p99 within tolerance | PASS |
-| PostgreSQL transactions per second reduced | PASS |
-| PostgreSQL row writes per second reduced | PASS |
-| async materializer mode observed | PASS |
-| async materializer flush errors zero | PASS |
+| `go_baseline_tests` | pass |
+| `physical_compaction_tests` | pass |
+| `logstore_race_tests` | pass |
+| `python_script_tests` | pass |
+| `python_compileall` | pass |
+| `compose_experiment_pass` | pass |
+| `checkpoint_acceptance_pass` | pass |
+| `postgres_async_acceptance_pass` | pass |
 
-Dashboard replay consistency 也通过：sync 和 async 两组均检查了 5 个 workflow 与 2 个 actor，共 7 个对象，`failures=[]`。async dashboard snapshot 中 materializer 状态为 `mode=async`、`pending_deltas=6`、`flush_errors=0`、`eventual_lag_estimate_ms=840`。这说明 PostgreSQL view 在 async 模式下保持 eventual consistency，且未出现后台 flush error。
+主要命令也全部通过：
 
-结论是：async materializer 明显降低 PostgreSQL 同步写压力，事务速率降到 sync 的 1.83%，行写入速率降到 16.84%；task throughput 和 p99 在默认非退化容差内保持稳定。本轮没有观察到 task throughput 或 p99 的严格改善，因此应表述为“数据库写入压力显著降低，主路径性能未明显退化”，而不是“任务吞吐显著提升”。
+| Command | Status | Seconds |
+|---|---:|---:|
+| `go_test_all` | PASS | 27 |
+| `go_vet` | PASS | 0 |
+| `go_test_physical_compaction` | PASS | 1 |
+| `go_race_logstore` | PASS | 1 |
+| `go_race_core` | PASS | 3 |
+| `python_script_tests` | PASS | 0 |
+| `python_sdk_tests` | PASS | 0 |
+| `python_compileall` | PASS | 0 |
+| `compose_experiment` | PASS | 80 |
+| `checkpoint_acceptance` | PASS | 2 |
+| `postgres_async_acceptance` | PASS | 116 |
 
-### Metadata Checkpoint Bootstrap Acceptance
+## Compose 端到端实验
 
-metadata checkpoint 的单机 Ubuntu 验收已经通过。该测试用 in-memory shared-log harness 生成 task、workflow、actor 和 LLM metadata history，写入 `system:checkpoints`，再追加 tail 事件，对比 full replay 与 checkpoint-plus-tail replay。
+Compose 子实验结果为 `PASS`，路径为：
 
 ```text
-Run directory: reports/ubuntu-checkpoint-20260623T154803Z/checkpoint_acceptance
-Summary: reports/ubuntu-checkpoint-20260623T154803Z/checkpoint_acceptance/summary.md
-Acceptance: PASS
-Workload: 120 tasks, 12 workflows, 12 actors, 40 llm streams, 68 tail events
+reports/ubuntu-project-accepted/compose_experiment
 ```
 
-核心结果如下：
+通过的关键检查：
 
-| Metric | Full replay | Checkpoint replay | Checkpoint/Full |
-|---|---:|---:|---:|
-| Records read | 614 | 71 | 0.1156 |
-| ReadLog calls | 224 | 201 | 0.8973 |
-| Duration | 3.759 ms | 2.327 ms | 0.6190 |
-
-checkpoint payload 覆盖 196 个 stream、132 个 task、12 个 workflow、12 个 actor 和 2 条 LLM stats entry。一致性检查结果为 `consistent=true`，共检查 156 个对象。`checkpoint_created`、`checkpoint_read_records_reduced`、`checkpoint_replay_consistent`、`checkpoint_tail_only_reads`、`corrupt_checkpoint_fallback` 和 `checkpoint_retention` 全部通过。
-
-结论是：metadata checkpoint 可以把 control restart 从全量历史扫描改为 checkpoint + log tail replay，并保持 metadata view 与 replay snapshot 一致。这次 workload 中读取记录数从 614 降到 71，说明历史记录扫描量明显下降。`ReadLog` 调用数只从 224 降到 201，因为重启路径仍要检查各 stream tail；因此这里的收益应表述为“减少历史 records 读取”，而不是“消除 stream 访问”。duration 从 3.759 ms 降到 2.327 ms，可作为本轮单机结果，但不应外推为多机生产恢复延迟。
-
-### Runtime Benchmark
-
-本次 compose 端到端 benchmark 结果如下：
-
-| 指标 | 结果 |
+| Check | Result |
 |---|---:|
-| Workflow p95 latency | 1244 ms |
-| Workflow p99 latency | 1244 ms |
-| Task throughput | 4.870 tasks/s |
-| Task p99 latency | 521 ms |
+| all recorded commands pass | PASS |
+| relaxed fsync faster than always | PASS |
+| locality cache hit not worse than resource-only | PASS |
+| warm checkpoint request hit cache | PASS |
+| actor snapshot replay less than full replay | PASS |
+| dashboard has at least three workers | PASS |
+| dashboard replay consistent | PASS |
+
+核心结果：
+
+| Metric | Result |
+|---|---:|
+| Workflow p95 / p99 latency | 924 ms / 924 ms |
+| Task throughput | 5.110 tasks/s |
+| Task p99 latency | 209 ms |
 | Actor full replay commands | 21 |
 | Actor no-snapshot replay commands | 21 |
 | Actor snapshot replay commands | 1 |
 | Actor trimmed replay commands | 1 |
 | Actor compactable log records | 45 |
-| Actor compactable log bytes | 18,283 |
-| LLM cold total latency | 98 ms |
-| LLM warm total latency | 18 ms |
-| LLM warm cache hit | true |
-| LLM cold checkpoint fetch | 1 ms |
-| LLM warm checkpoint fetch | 0 ms |
+| Actor compactable log bytes | 18,382 |
+| LLM cold / warm total latency | 111 ms / 17 ms |
+| LLM cold / warm checkpoint fetch | 1 ms / 0 ms |
+| Dashboard workers | 3 |
+| Dashboard replay consistency | true |
 
-Actor snapshot ablation 显示 snapshot 和 logical trim 生效：同样 20 次 command 后，snapshot replay 和 trimmed replay 只需回放 1 条 command，而无 snapshot 需要回放 21 条。Dashboard 和 benchmark 同时报告 compactable records/bytes，用于衡量 snapshot-aware retention 可以释放的日志空间。
+这里最重要的不是绝对延迟，而是机制是否成立。actor snapshot 把 replay work 从 21 条 command 降到 1 条；checkpoint cache 的 warm request 命中本地缓存；dashboard 当前视图和 replay 结果一致。
 
-### Locality Scheduling Ablation
+## Logstore benchmark
 
-| 策略 | Cache hit rate | p95 latency |
-|---|---:|---:|
-| Resource-only | 1.000 | 209 ms |
-| Locality-aware | 1.000 | 209 ms |
-| Predicted-latency | 1.000 | 209 ms |
-
-这次 workload 中三种策略都命中缓存，因此 locality-aware 和 predicted-latency 没有表现出额外 latency 差距。验收意义是：在 typed scheduler 和模型缓存索引开启后，locality-aware 的 cache hit 不低于 resource-only，且不会破坏 LLM 任务调度。若要证明 locality 策略在冷/热缓存不均衡场景下的收益，需要增加更强的冷启动扰动、模型分布差异或更大的 checkpoint。
-
-### Checkpoint Cache Probe
-
-checkpoint cache 探针结果如下：
-
-| 指标 | Cold | Warm |
-|---|---:|---:|
-| cache hit | false | true |
-| checkpoint fetch | 1 ms | 0 ms |
-| worker | worker-a | worker-a |
-| cache used | 2,097,152 bytes | 2,097,152 bytes |
-| cache capacity | 16,777,216 bytes | 16,777,216 bytes |
-| validation errors | none | none |
-
-Artifact check 也通过，说明 file-backed checkpoint cache 写到了 worker-local cache，而不是只创建 source checkpoint。由于测试 checkpoint 较小，fetch/load 延迟主要用于确认功能路径，不用于推断大模型真实冷启动时间。
-
-### Logstore Benchmark
-
-20,000 records、16 streams、256-byte payload 的单机结果：
+这轮 logstore benchmark 使用 20,000 records、16 streams、256-byte payload。
 
 | fsync policy | Append records/s | Read records/s | Recover ms | Segments |
 |---|---:|---:|---:|---:|
-| always | 1,734.660 | 448,881.025 | 42 | 7 |
-| batch | 285,940.289 | 656,219.478 | 44 | 7 |
-| interval | 334,596.961 | 700,969.374 | 41 | 7 |
+| always | 1,760.664 | 656,928.533 | 36 | 7 |
+| batch | 293,717.448 | 906,235.115 | 36 | 7 |
+| interval | 296,456.268 | 999,045.612 | 31 | 7 |
 
-结果和写入策略一致：`always` 强同步写入最慢；`batch` 和 `interval` 的 append throughput 明显更高。恢复时间保持在几十毫秒量级。
+结论：`always` 强同步写入最慢；`batch` 和 `interval` 的 append throughput 明显更高。恢复时间在这次 workload 下仍是几十毫秒量级。
 
-### Scheduler And Metadata Microbenchmarks
+## Scheduler benchmark
 
-Scheduler mixed backlog microbenchmark 覆盖 `queue_depth = 1k/10k/100k` 和 `worker = 1/10/100`：
+Scheduler mixed backlog benchmark 覆盖 `queue_depth = 1k/10k/100k` 和 `workers = 1/10/100`。
 
-| queue depth | workers | ns/op | B/op | allocs/op |
+| Queue depth | Workers | ns/op | B/op | allocs/op |
 |---:|---:|---:|---:|---:|
-| 1,000 | 1 | 537.1 | 105 | 2 |
-| 1,000 | 10 | 2,305 | 367 | 4 |
-| 1,000 | 100 | 16,946 | 2,480 | 6 |
-| 10,000 | 1 | 534.2 | 128 | 2 |
-| 10,000 | 10 | 1,759 | 344 | 3 |
-| 10,000 | 100 | 16,121 | 2,500 | 6 |
-| 100,000 | 1 | 487.4 | 151 | 2 |
-| 100,000 | 10 | 1,501 | 346 | 3 |
-| 100,000 | 100 | 3,910 | 2,464 | 5 |
+| 1,000 | 1 | 554.3 | 105 | 2 |
+| 1,000 | 10 | 2,003 | 367 | 4 |
+| 1,000 | 100 | 17,887 | 2,480 | 6 |
+| 10,000 | 1 | 476.9 | 128 | 2 |
+| 10,000 | 10 | 1,795 | 345 | 3 |
+| 10,000 | 100 | 15,502 | 2,497 | 6 |
+| 100,000 | 1 | 451.6 | 151 | 2 |
+| 100,000 | 10 | 1,481 | 345 | 3 |
+| 100,000 | 100 | 4,078 | 2,468 | 5 |
 
-结果说明 Assign 路径没有随 backlog 深度线性恶化，主要成本来自 worker 维度和可用队列/索引判断，这符合 typed/indexed scheduler 的优化目标。
+结果说明 Assign 路径没有跟 backlog 深度一起线性恶化。主要成本来自 worker 维度和队列/索引判断，这符合 typed/indexed scheduler 的设计目标。
 
-Metadata microbenchmark 的结果是混合的：
+## Metadata benchmark
 
-| 指标 | Legacy | V2 |
+Metadata benchmark 的结果是混合的。
+
+| Metric | Legacy | V2 |
 |---|---:|---:|
-| GetTask | 69.44 ns/op | 27.54 ns/op |
-| LeaseComplete | 1,400 ns/op | 4,243 ns/op |
-| Heartbeat | 1,487 ns/op | 195 ns/op |
-| HeartbeatUnderCompleteP99 heartbeat p99 | 5,505,106 ns | 26,323 ns |
-| HeartbeatUnderCompleteP99 ns/op | 10,079 | 7,040 |
-| ActiveWorkers | 59,624 ns/op | 67,272 ns/op |
-| UpdateWorkflow | 15,336 ns/op | 21,143 ns/op |
+| GetTask | 66.30 ns/op | 28.44 ns/op |
+| LeaseComplete | 1,715 ns/op | 3,767 ns/op |
+| Heartbeat | 1,526 ns/op | 169.1 ns/op |
+| HeartbeatUnderCompleteP99 heartbeat p99 | 5,382,126 ns | 17,242 ns |
+| ActiveWorkers | 59,066 ns/op | 71,933 ns/op |
+| UpdateWorkflow | 12,664 ns/op | 20,912 ns/op |
 
-V2 明显改善了 heartbeat 路径，尤其是 complete 并发下的 heartbeat p99；GetTask 也更快。但 LeaseComplete、ActiveWorkers 和 UpdateWorkflow 在当前实现中更慢，后续优化应继续关注这些写路径和 view 更新成本。
+V2 明显改善了 heartbeat 和 GetTask，尤其是 complete 并发下的 heartbeat p99。LeaseComplete、ActiveWorkers 和 UpdateWorkflow 在当前实现中更慢，后续优化应继续看这些写路径和 view 更新成本。
 
-### Fault Injection
+## Metadata checkpoint 验收
 
-| 故障项 | 结果 |
+Checkpoint 子验收路径为：
+
+```text
+reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance
+```
+
+Workload：
+
+| Item | Count |
+|---|---:|
+| Tasks | 120 |
+| Workflows | 12 |
+| Actors | 12 |
+| LLM streams | 40 |
+| Tail events | 68 |
+
+Replay work：
+
+| Metric | Full replay | Checkpoint replay | Checkpoint/Full |
+|---|---:|---:|---:|
+| Records read | 614 | 71 | 0.1156 |
+| ReadLog calls | 224 | 201 | 0.8973 |
+| Duration ms | 6.463 | 5.506 | 0.8519 |
+
+checkpoint payload 覆盖 196 个 stream、132 个 task、12 个 workflow、12 个 actor 和 2 条 LLM stats entry。一致性检查结果为 `consistent=true`，检查对象数为 156。
+
+通过的检查：
+
+| Check | Result |
+|---|---:|
+| `checkpoint_created` | pass |
+| `checkpoint_read_records_reduced` | pass |
+| `checkpoint_replay_consistent` | pass |
+| `checkpoint_retention` | pass |
+| `checkpoint_tail_only_reads` | pass |
+| `corrupt_checkpoint_fallback` | pass |
+
+正确表述：metadata checkpoint 把 control restart 从全量历史扫描改成 checkpoint + tail replay，历史 records 读取量明显下降。不要说它消除了 stream 访问，因为每个 stream tail 仍要检查。
+
+## PostgreSQL async materializer 验收
+
+PostgreSQL async 子验收路径为：
+
+```text
+reports/ubuntu-project-accepted/postgres_async_acceptance/postgres_async_compare
+```
+
+结果：
+
+| Metric | Sync | Async | Async/Sync |
+|---|---:|---:|---:|
+| Task throughput | 5.0 tps | 5.0 tps | 1.0 |
+| Task submit p99 | 209 ms | 207 ms | 0.9904 |
+| PostgreSQL tx/s | 72.382 | 1.304 | 0.018 |
+| PostgreSQL row writes/s | 100.519 | 16.57 | 0.1648 |
+
+通过的检查：
+
+| Check | Result |
+|---|---:|
+| `task_throughput_within_tolerance` | pass |
+| `task_submit_p99_within_tolerance` | pass |
+| `postgres_transactions_per_sec_reduced` | pass |
+| `postgres_row_writes_per_sec_reduced` | pass |
+| `async_materializer_mode_observed` | pass |
+| `async_materializer_flush_errors_zero` | pass |
+
+async dashboard 中观察到 `materializer_mode=async`、`pending_deltas=6`、`flush_errors=0`、`eventual_lag_ms=746`。
+
+正确表述：async materializer 大幅降低 PostgreSQL 写入压力，任务吞吐和 p99 在验收阈值内没有退化。这一轮不能说吞吐显著提升。
+
+## Fault injection 和 dashboard
+
+Fault injection 覆盖：
+
+| Fault | Result |
 |---|---|
 | worker kill recovery | passed |
 | queue redelivery | passed |
 | control restart probe | passed |
 | logd restart probe | covered by logstore recovery and process logs |
 
-故障恢复测试包括 worker 丢失后的 task redelivery、workflow 已完成 step 不重跑、actor recovery、control 从 shared log bootstrap metadata view 等路径。
+Dashboard snapshot：
 
-### Dashboard Snapshot
-
-Dashboard snapshot 包含：
-
-| 项 | 数量 |
+| Item | Count |
 |---|---:|
-| tasks | 218 |
+| tasks | 84 |
 | workflows | 3 |
 | actors | 2 |
 | workers | 3 |
 | models | 3 |
 | compactable log records | 45 |
-| compactable log bytes | 18,283 |
+| compactable log bytes | 18,382 |
 
-Dashboard 用来查看 materialized view 中的 workflow DAG、task 状态、actor 状态、worker 和 model cache。Compose 实验中 dashboard 至少观测到 3 个 worker，满足多 worker 模拟验收条件。
+Dashboard replay consistency 为 `true`，检查了 3 个 workflow 和 2 个 actor，没有失败项。
 
-### Ubuntu Project Acceptance（2026-06-24）
+## 总结
 
-2026-06-24 在 Ubuntu 服务器上执行的顶层验收已经通过：
+当前可以稳妥说明三点：
 
-```text
-Run directory: /home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-20260624T025707Z
-Verdict: PASS
-Package: /home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-20260624T025707Z/ubuntu-project-acceptance-package.tar.gz
-```
-
-这次运行覆盖了 baseline Go/Python 测试、`go vet`、physical compaction 专项测试、logstore/control race 测试、Docker Compose 端到端实验、metadata checkpoint 验收和 PostgreSQL async materializer 验收。顶层 acceptance checks 全部为 `pass`，其中包括 `physical_compaction_tests`、`logstore_race_tests`、`compose_experiment_pass`、`checkpoint_acceptance_pass` 和 `postgres_async_acceptance_pass`。
-
-Compose 实验的关键结果如下：
-
-| 指标 | 结果 |
-|---|---:|
-| Workflow p95 / p99 latency | 924 ms / 924 ms |
-| Task throughput | 5.11 tasks/s |
-| Task p99 latency | 209 ms |
-| Actor full replay commands | 21 |
-| Actor snapshot replay commands | 1 |
-| Actor compactable log records / bytes | 45 / 18,382 |
-| LLM cold / warm total latency | 111 ms / 17 ms |
-| LLM cold / warm checkpoint fetch | 1 ms / 0 ms |
-| Dashboard workers | 3 |
-| Dashboard replay consistency | true |
-
-这组数值和预期一致。actor snapshot 后 replay work 从 21 条 command 降到 1 条，并且 dashboard 报告了 compactable records/bytes，说明 logical trim 后已有可供 physical compaction 处理的空间回收输入。physical compaction 的 Go 专项和 logstore race 测试也通过，证明 delete/copy/crash window 下没有破坏 replay 语义。
-
-metadata checkpoint 子验收在同一轮顶层运行中再次通过。workload 包含 120 个 task、12 个 workflow、12 个 actor、40 条 LLM stream 和 68 条 tail event；full replay 读取 614 条 records，checkpoint-plus-tail replay 读取 71 条，比例为 0.1156。一致性检查覆盖 156 个对象，结果为 `consistent=true`。这次嵌套运行中的 duration 从 6.463 ms 降到 5.506 ms，属于单机小样本观测；更稳的结论仍然是历史 records 读取量明显下降。
-
-PostgreSQL async materializer 子验收也通过。sync 与 async 的任务吞吐都为 5.0 tasks/s，task p99 从 209 ms 到 207 ms；PostgreSQL transaction rate 从 72.382 tx/s 降到 1.304 tx/s，row writes rate 从 100.519 rows/s 降到 16.570 rows/s。async run 的 `flush_errors=0`，dashboard 中观察到 `materializer_mode=async`，同时保留少量 pending deltas 和约 746 ms 的 eventual lag。这里应表述为写数据库压力显著下降且任务路径没有退化，不应表述为吞吐显著提升。
-
-本轮验收的边界不变：它验证的是单台 Ubuntu 服务器上的多进程、Docker Compose 和 mock LLM 机制正确性。它不能替代多节点部署、真实 GPU/vLLM 负载或大 checkpoint 冷启动曲线。
-
-## 结论
-
-Ubuntu project acceptance 的完整包装器已经在 2026-06-24 通过，覆盖 baseline 测试、physical compaction、Compose 端到端实验、metadata checkpoint bootstrap 和 PostgreSQL async materializer。结果说明当前实现可以在单台 Ubuntu 服务器上稳定复现主要机制：shared log 仍是状态源，metadata 和 dashboard 是可重建 view；checkpoint + tail replay 能减少历史 records 读取；async materializer 能降低 PostgreSQL 写入压力；physical compaction 的 delete/copy/crash 路径没有破坏 log replay。
-
-当前 Ubuntu 单机实验的自动汇总结果为 `PASS`。这说明 LogServe 的核心机制能在可复现的单机多进程环境中稳定跑通：
-
-- shared log 是系统状态源，metadata 是可重建视图。
-- Workflow 支持 DAG、retry、timeout、replay 和 exactly-once-ish 结果提交。
-- Actor 支持 mailbox 串行化、command sequence、snapshot replay、logical trim 和 epoch fencing。
-- Typed/indexed scheduler 能避免按 backlog 深度线性扫描，普通 task、target worker task、actor task 和 LLM task 可以通过不同队列/索引调度。
-- LLM serving 支持模型注册、mock/vLLM adapter、worker cache 上报、checkpoint cache 和 locality-aware scheduling。
-- Benchmark、fault injection、dashboard 和实验报告脚本已经能在单机 Ubuntu 环境复现实验并自动打包结果。
-
-实验边界也需要明确：这组结果验证的是单机机制和回归门禁，不代表生产级多机性能；mock LLM 不能替代真实 GPU/vLLM 延迟；小 checkpoint 只能证明 cache 路径正确，不能反映大模型真实冷启动曲线。下一步更有价值的实验是多节点部署、真实 vLLM/GPU 负载、更大 checkpoint 下的 cold-start 曲线，以及针对 metadata V2 写路径的进一步优化。
+1. 核心机制已经跑通：shared log、workflow replay、actor mailbox/epoch fencing、LLM cache-aware scheduling、checkpoint cache、dashboard materialization 都在单机多进程环境中通过验收。
+2. 优化有证据：scheduler v2 不随 backlog 深度线性恶化；metadata checkpoint 减少历史 records 读取；PostgreSQL async materializer 降低数据库写入压力；actor snapshot 把 replay command 数降到 1。
+3. 边界清楚：还没有多节点生产压测、真实 GPU/vLLM 压测和大 checkpoint 冷启动曲线。

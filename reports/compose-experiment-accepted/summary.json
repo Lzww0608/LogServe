@@ -1,0 +1,485 @@
+{
+  "verdict": "pass",
+  "checks": [
+    {
+      "name": "all_recorded_commands_pass",
+      "status": "pass",
+      "detail": "all recorded commands passed"
+    },
+    {
+      "name": "logstore_relaxed_fsync_faster_than_always",
+      "status": "pass",
+      "detail": "batch and interval append throughput are greater than always",
+      "actual": {
+        "always": 1734.6603801527913,
+        "batch": 285940.28883371863,
+        "interval": 334596.96106325276
+      },
+      "expected": "batch > always and interval > always"
+    },
+    {
+      "name": "locality_cache_hit_not_worse_than_resource_only",
+      "status": "pass",
+      "detail": "locality-aware cache hit rate should not be lower than resource-only",
+      "actual": {
+        "resource_only": 1.0,
+        "locality_aware": 1.0
+      },
+      "expected": "locality_aware >= resource_only"
+    },
+    {
+      "name": "checkpoint_warm_cache_hit",
+      "status": "pass",
+      "detail": "warm checkpoint request hit cache"
+    },
+    {
+      "name": "actor_snapshot_replay_less_than_full",
+      "status": "pass",
+      "detail": "snapshot replay should use fewer commands than full replay",
+      "actual": {
+        "snapshot": 1,
+        "full": 21
+      },
+      "expected": "snapshot < full"
+    },
+    {
+      "name": "dashboard_has_three_workers",
+      "status": "pass",
+      "detail": "dashboard contains at least three workers",
+      "actual": 3,
+      "expected": ">= 3"
+    }
+  ],
+  "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-accepted",
+  "package": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-accepted/experiment-package.tar.gz",
+  "environment": {
+    "run_id": "exp1782144454",
+    "mode": "compose",
+    "root": "/home/lab2439/Work/lzww/LogServe",
+    "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-accepted",
+    "data_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-accepted/runtime",
+    "log_addr": "127.0.0.1:57667",
+    "control_addr": "127.0.0.1:56277",
+    "postgres_port": "33511",
+    "nats_port": "34623",
+    "minio_api_port": "50143",
+    "minio_console_port": "47637",
+    "checkpoint_source_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-accepted/runtime/checkpoints",
+    "checkpoint_cache_bytes": "16777216",
+    "worker_capacity": "1",
+    "task_pool_size": "0",
+    "llm_pool_size": "0",
+    "actor_pool_size": "0",
+    "generated_at_utc": "2026-06-22T16:07:34Z"
+  },
+  "commands": [
+    {
+      "name": "python_venv_create",
+      "exit_code": 0,
+      "duration_sec": 2,
+      "log": "python_venv_create.log"
+    },
+    {
+      "name": "python_pip_install",
+      "exit_code": 0,
+      "duration_sec": 3,
+      "log": "python_pip_install.log"
+    },
+    {
+      "name": "go_test_all",
+      "exit_code": 0,
+      "duration_sec": 27,
+      "log": "go_test_all.log"
+    },
+    {
+      "name": "go_vet",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "go_vet.log"
+    },
+    {
+      "name": "go_race_control_metadata_worker",
+      "exit_code": 0,
+      "duration_sec": 7,
+      "log": "go_race_control_metadata_worker.log"
+    },
+    {
+      "name": "python_unittest",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_unittest.log"
+    },
+    {
+      "name": "python_compileall",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_compileall.log"
+    },
+    {
+      "name": "python_grpc_deps",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_grpc_deps.log"
+    },
+    {
+      "name": "build_logservectl",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "build_logservectl.log"
+    },
+    {
+      "name": "scheduler_benchmark",
+      "exit_code": 0,
+      "duration_sec": 7,
+      "log": "scheduler_benchmark.log"
+    },
+    {
+      "name": "metadata_benchmark",
+      "exit_code": 0,
+      "duration_sec": 9,
+      "log": "metadata_benchmark.log"
+    },
+    {
+      "name": "logstore_benchmark",
+      "exit_code": 0,
+      "duration_sec": 12,
+      "log": "logstore_benchmark.log"
+    },
+    {
+      "name": "fault_injection_go_tests",
+      "exit_code": 0,
+      "duration_sec": 6,
+      "log": "fault_injection_go_tests.log"
+    },
+    {
+      "name": "compose_build",
+      "exit_code": 0,
+      "duration_sec": 2,
+      "log": "compose_build.log"
+    },
+    {
+      "name": "runtime_compose_start",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "compose_up.log"
+    },
+    {
+      "name": "runtime_logd_ready",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "compose.log"
+    },
+    {
+      "name": "runtime_control_ready",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "compose.log"
+    },
+    {
+      "name": "runtime_workers_ready",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "runtime_workers_ready.log"
+    },
+    {
+      "name": "benchmark",
+      "exit_code": 0,
+      "duration_sec": 45,
+      "log": "benchmark.stderr.log"
+    },
+    {
+      "name": "checkpoint_cache_probe",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "checkpoint_cache_probe.stderr.log"
+    },
+    {
+      "name": "checkpoint_cache_artifact",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "checkpoint_cache_artifact.log"
+    },
+    {
+      "name": "dashboard_snapshot",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "dashboard_snapshot.stderr.log"
+    },
+    {
+      "name": "summarize_experiment",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "summarize_experiment.log"
+    },
+    {
+      "name": "package_results",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "package.log"
+    }
+  ],
+  "benchmark": {
+    "workflow_p95_ms": 1244,
+    "workflow_p99_ms": 1244,
+    "task_throughput_tps": 4.87,
+    "task_p99_latency_ms": 521,
+    "actor_snapshot_replay_commands": 1,
+    "actor_trimmed_replay_commands": 1,
+    "actor_full_replay_commands": 21,
+    "actor_no_snapshot_replay_commands": 21,
+    "actor_compactable_log_records": 45,
+    "actor_compactable_log_bytes": 18283,
+    "llm_cold_total_latency_ms": 98,
+    "llm_warm_total_latency_ms": 18,
+    "llm_warm_cache_hit": true,
+    "llm_cold_checkpoint_fetch_ms": 1,
+    "llm_warm_checkpoint_fetch_ms": 0,
+    "resource_only_cache_hit_rate": 1.0,
+    "locality_aware_cache_hit_rate": 1.0,
+    "predicted_latency_cache_hit_rate": 1.0,
+    "resource_only_p95_latency_ms": 209,
+    "locality_aware_p95_latency_ms": 209,
+    "predicted_latency_p95_latency_ms": 209
+  },
+  "logstore": {
+    "logstore_always_append_tps": 1734.6603801527913,
+    "logstore_always_read_tps": 448881.02489233814,
+    "logstore_always_recover_ms": 42,
+    "logstore_always_segments": 7,
+    "logstore_batch_append_tps": 285940.28883371863,
+    "logstore_batch_read_tps": 656219.4775915486,
+    "logstore_batch_recover_ms": 44,
+    "logstore_batch_segments": 7,
+    "logstore_interval_append_tps": 334596.96106325276,
+    "logstore_interval_read_tps": 700969.3740522236,
+    "logstore_interval_recover_ms": 41,
+    "logstore_interval_segments": 7
+  },
+  "checkpoint_cache": {
+    "checkpoint_model": "model-D",
+    "checkpoint_cold_cache_hit": false,
+    "checkpoint_warm_cache_hit": true,
+    "checkpoint_cold_worker_id": "worker-a",
+    "checkpoint_warm_worker_id": "worker-a",
+    "checkpoint_cold_fetch_ms": 1,
+    "checkpoint_warm_fetch_ms": 0,
+    "checkpoint_cache_used_bytes": 2097152,
+    "checkpoint_cache_capacity_bytes": 16777216,
+    "checkpoint_validation_errors": []
+  },
+  "fault_injection": {
+    "worker_kill_recovery": "passed",
+    "queue_redelivery": "passed",
+    "control_restart_probe": "passed",
+    "logd_restart_probe": "covered_by_logstore_recovery_and_process_logs",
+    "source": "go test ./tests/integration fault and recovery subset"
+  },
+  "dashboard": {
+    "dashboard_queue_depth": null,
+    "dashboard_tasks": 218,
+    "dashboard_workflows": 3,
+    "dashboard_actors": 2,
+    "dashboard_workers": 3,
+    "dashboard_models": 3,
+    "dashboard_compactable_log_records": 45,
+    "dashboard_compactable_log_bytes": 18283
+  },
+  "go_benchmarks": {
+    "scheduler_benchmark.log": [
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=1-32",
+        "metrics": {
+          "ns_per_op": 537.1,
+          "bytes_per_op": 105.0,
+          "allocs_per_op": 2.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=1-32         \t  630523\t       537.1 ns/op\t     105 B/op\t       2 allocs/op"
+      },
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=10-32",
+        "metrics": {
+          "ns_per_op": 2305.0,
+          "bytes_per_op": 367.0,
+          "allocs_per_op": 4.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=10-32        \t  196646\t      2305 ns/op\t     367 B/op\t       4 allocs/op"
+      },
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=100-32",
+        "metrics": {
+          "ns_per_op": 16946.0,
+          "bytes_per_op": 2480.0,
+          "allocs_per_op": 6.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=100-32       \t   18987\t     16946 ns/op\t    2480 B/op\t       6 allocs/op"
+      },
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=1-32",
+        "metrics": {
+          "ns_per_op": 534.2,
+          "bytes_per_op": 128.0,
+          "allocs_per_op": 2.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=1-32        \t  731811\t       534.2 ns/op\t     128 B/op\t       2 allocs/op"
+      },
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=10-32",
+        "metrics": {
+          "ns_per_op": 1759.0,
+          "bytes_per_op": 344.0,
+          "allocs_per_op": 3.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=10-32       \t  256084\t      1759 ns/op\t     344 B/op\t       3 allocs/op"
+      },
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=100-32",
+        "metrics": {
+          "ns_per_op": 16121.0,
+          "bytes_per_op": 2500.0,
+          "allocs_per_op": 6.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=100-32      \t   88296\t     16121 ns/op\t    2500 B/op\t       6 allocs/op"
+      },
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=1-32",
+        "metrics": {
+          "ns_per_op": 487.4,
+          "bytes_per_op": 151.0,
+          "allocs_per_op": 2.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=1-32       \t  802599\t       487.4 ns/op\t     151 B/op\t       2 allocs/op"
+      },
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=10-32",
+        "metrics": {
+          "ns_per_op": 1501.0,
+          "bytes_per_op": 346.0,
+          "allocs_per_op": 3.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=10-32      \t  396897\t      1501 ns/op\t     346 B/op\t       3 allocs/op"
+      },
+      {
+        "name": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=100-32",
+        "metrics": {
+          "ns_per_op": 3910.0,
+          "bytes_per_op": 2464.0,
+          "allocs_per_op": 5.0
+        },
+        "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=100-32     \t   90016\t      3910 ns/op\t    2464 B/op\t       5 allocs/op"
+      }
+    ],
+    "metadata_benchmark.log": [
+      {
+        "name": "BenchmarkMemoryStoreConcurrentGetTask/legacy-32",
+        "metrics": {
+          "ns_per_op": 69.44,
+          "bytes_per_op": 0.0,
+          "allocs_per_op": 0.0
+        },
+        "raw": "BenchmarkMemoryStoreConcurrentGetTask/legacy-32     \t 5007236\t        69.44 ns/op\t       0 B/op\t       0 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreConcurrentGetTask/v2-32",
+        "metrics": {
+          "ns_per_op": 27.54,
+          "bytes_per_op": 0.0,
+          "allocs_per_op": 0.0
+        },
+        "raw": "BenchmarkMemoryStoreConcurrentGetTask/v2-32         \t12111748\t        27.54 ns/op\t       0 B/op\t       0 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreConcurrentLeaseComplete/legacy-32",
+        "metrics": {
+          "ns_per_op": 1400.0,
+          "bytes_per_op": 0.0,
+          "allocs_per_op": 0.0
+        },
+        "raw": "BenchmarkMemoryStoreConcurrentLeaseComplete/legacy-32         \t  799129\t      1400 ns/op\t       0 B/op\t       0 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreConcurrentLeaseComplete/v2-32",
+        "metrics": {
+          "ns_per_op": 4243.0,
+          "bytes_per_op": 296.0,
+          "allocs_per_op": 3.0
+        },
+        "raw": "BenchmarkMemoryStoreConcurrentLeaseComplete/v2-32             \t  131136\t      4243 ns/op\t     296 B/op\t       3 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreConcurrentHeartbeat/legacy-32",
+        "metrics": {
+          "ns_per_op": 1487.0,
+          "bytes_per_op": 560.0,
+          "allocs_per_op": 5.0
+        },
+        "raw": "BenchmarkMemoryStoreConcurrentHeartbeat/legacy-32             \t  476785\t      1487 ns/op\t     560 B/op\t       5 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreConcurrentHeartbeat/v2-32",
+        "metrics": {
+          "ns_per_op": 195.0,
+          "bytes_per_op": 560.0,
+          "allocs_per_op": 5.0
+        },
+        "raw": "BenchmarkMemoryStoreConcurrentHeartbeat/v2-32                 \t 2092255\t       195.0 ns/op\t     560 B/op\t       5 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreHeartbeatUnderCompleteP99/legacy-32",
+        "metrics": {
+          "ns_per_op": 10079.0,
+          "heartbeat_p99_batch_ns": 5505106.0,
+          "bytes_per_op": 3360.0,
+          "allocs_per_op": 30.0
+        },
+        "raw": "BenchmarkMemoryStoreHeartbeatUnderCompleteP99/legacy-32       \t   45356\t     10079 ns/op\t   5505106 heartbeat-p99-batch-ns\t    3360 B/op\t      30 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreHeartbeatUnderCompleteP99/v2-32",
+        "metrics": {
+          "ns_per_op": 7040.0,
+          "heartbeat_p99_batch_ns": 26323.0,
+          "bytes_per_op": 3820.0,
+          "allocs_per_op": 36.0
+        },
+        "raw": "BenchmarkMemoryStoreHeartbeatUnderCompleteP99/v2-32           \t   96302\t      7040 ns/op\t     26323 heartbeat-p99-batch-ns\t    3820 B/op\t      36 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreActiveWorkers/legacy-32",
+        "metrics": {
+          "ns_per_op": 59624.0,
+          "bytes_per_op": 369537.0,
+          "allocs_per_op": 3001.0
+        },
+        "raw": "BenchmarkMemoryStoreActiveWorkers/legacy-32                   \t    6074\t     59624 ns/op\t  369537 B/op\t    3001 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreActiveWorkers/v2-32",
+        "metrics": {
+          "ns_per_op": 67272.0,
+          "bytes_per_op": 369540.0,
+          "allocs_per_op": 3001.0
+        },
+        "raw": "BenchmarkMemoryStoreActiveWorkers/v2-32                       \t    5004\t     67272 ns/op\t  369540 B/op\t    3001 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreUpdateWorkflow/legacy-32",
+        "metrics": {
+          "ns_per_op": 15336.0,
+          "bytes_per_op": 14067.0,
+          "allocs_per_op": 45.0
+        },
+        "raw": "BenchmarkMemoryStoreUpdateWorkflow/legacy-32                  \t   25664\t     15336 ns/op\t   14067 B/op\t      45 allocs/op"
+      },
+      {
+        "name": "BenchmarkMemoryStoreUpdateWorkflow/v2-32",
+        "metrics": {
+          "ns_per_op": 21143.0,
+          "bytes_per_op": 18590.0,
+          "allocs_per_op": 40.0
+        },
+        "raw": "BenchmarkMemoryStoreUpdateWorkflow/v2-32                      \t   26266\t     21143 ns/op\t   18590 B/op\t      40 allocs/op"
+      }
+    ]
+  },
+  "notes": []
+}

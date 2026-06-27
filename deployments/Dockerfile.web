@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-bookworm AS web-build
+
+WORKDIR /src/web
+COPY web/package*.json ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+COPY web/ ./
+RUN npm run build
+
+FROM golang:1.25-bookworm AS go-build
+
+WORKDIR /src
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOSUMDB=sum.golang.org
+ENV GOPROXY=$GOPROXY
+ENV GOSUMDB=$GOSUMDB
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build go build -o /out/logserve-web ./cmd/logserve-web
+
+FROM debian:bookworm-slim
+
+RUN adduser --system --uid 10001 --group logserve \
+    && mkdir -p /app/web/dist \
+    && chown -R logserve:logserve /app
+
+WORKDIR /app
+COPY --from=go-build /out/logserve-web /usr/local/bin/logserve-web
+COPY --from=web-build /src/web/dist /app/web/dist
+
+USER logserve
+CMD ["logserve-web", "--addr", "0.0.0.0:8080", "--static-dir", "/app/web/dist"]

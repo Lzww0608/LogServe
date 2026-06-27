@@ -2,8 +2,11 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ID="${LOGSERVE_POSTGRES_COMPARE_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+. "$ROOT/scripts/naming_guard.sh"
+RUN_ID="${LOGSERVE_POSTGRES_COMPARE_ID:-latest}"
+logserve_reject_dated_name "$RUN_ID" "LOGSERVE_POSTGRES_COMPARE_ID"
 COMPARE_DIR="${LOGSERVE_POSTGRES_COMPARE_DIR:-"$ROOT/reports/postgres-async-compare-$RUN_ID"}"
+logserve_reject_dated_name "$COMPARE_DIR" "LOGSERVE_POSTGRES_COMPARE_DIR"
 TASKS="${LOGSERVE_COMPARE_BENCH_TASKS:-32}"
 WORKFLOWS="${LOGSERVE_COMPARE_BENCH_WORKFLOWS:-3}"
 LLM_REQUESTS="${LOGSERVE_COMPARE_BENCH_LLM_REQUESTS:-6}"

@@ -18,3 +18,7 @@ dashboard/snapshot.json
 *.test.exe
 *.out
 *.pprof
+
+web/node_modules
+web/dist
+*.tsbuildinfo

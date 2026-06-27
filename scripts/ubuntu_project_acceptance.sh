@@ -2,8 +2,11 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_ID="${LOGSERVE_UBUNTU_PROJECT_ACCEPTANCE_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+. "$ROOT/scripts/naming_guard.sh"
+RUN_ID="${LOGSERVE_UBUNTU_PROJECT_ACCEPTANCE_ID:-latest}"
+logserve_reject_dated_name "$RUN_ID" "LOGSERVE_UBUNTU_PROJECT_ACCEPTANCE_ID"
 RESULT_DIR="${LOGSERVE_UBUNTU_PROJECT_ACCEPTANCE_DIR:-"$ROOT/reports/ubuntu-project-$RUN_ID"}"
+logserve_reject_dated_name "$RESULT_DIR" "LOGSERVE_UBUNTU_PROJECT_ACCEPTANCE_DIR"
 STATUS_FILE="$RESULT_DIR/command_status.jsonl"
 PACKAGE_PATH="$RESULT_DIR/ubuntu-project-acceptance-package.tar.gz"
 COMPOSE_DIR="$RESULT_DIR/compose_experiment"

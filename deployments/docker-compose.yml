@@ -99,6 +99,31 @@ services:
     mem_limit: 512m
     cpus: 1.0
 
+  web:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.web
+      args:
+        GOPROXY: ${LOGSERVE_DOCKER_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
+    command: ["logserve-web", "--addr", "0.0.0.0:8080", "--control-addr", "control:50052", "--log-addr", "logd:50051", "--static-dir", "/app/web/dist"]
+    environment:
+      LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
+    ports:
+      - "127.0.0.1:${LOGSERVE_WEB_PORT:-8080}:8080"
+    depends_on:
+      - control
+      - logd
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    cpus: 0.5
+
   worker:
     build:
       context: ..

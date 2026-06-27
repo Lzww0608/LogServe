@@ -1,0 +1,131 @@
+{
+  "verdict": "fail",
+  "checks": [
+    {
+      "name": "all_recorded_commands_pass",
+      "status": "fail",
+      "detail": "one or more recorded commands failed",
+      "actual": [
+        "compose_build"
+      ],
+      "expected": "no failed commands"
+    },
+    {
+      "name": "logstore_relaxed_fsync_faster_than_always",
+      "status": "warn",
+      "detail": "logstore benchmark policy data is missing",
+      "actual": {},
+      "expected": "always, batch, interval"
+    },
+    {
+      "name": "locality_cache_hit_not_worse_than_resource_only",
+      "status": "warn",
+      "detail": "locality benchmark did not run"
+    },
+    {
+      "name": "checkpoint_warm_cache_hit",
+      "status": "warn",
+      "detail": "warm checkpoint cache-hit proof is missing or false",
+      "expected": true
+    },
+    {
+      "name": "actor_snapshot_replay_less_than_full",
+      "status": "warn",
+      "detail": "actor replay ablation data is missing"
+    },
+    {
+      "name": "dashboard_has_three_workers",
+      "status": "fail",
+      "detail": "dashboard has fewer than three workers",
+      "actual": 0,
+      "expected": ">= 3"
+    }
+  ],
+  "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-06",
+  "package": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-06/experiment-package.tar.gz",
+  "environment": {
+    "run_id": "exp1782142989",
+    "mode": "compose",
+    "root": "/home/lab2439/Work/lzww/LogServe",
+    "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-06",
+    "data_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-06/runtime",
+    "log_addr": "127.0.0.1:51117",
+    "control_addr": "127.0.0.1:48989",
+    "postgres_port": "41985",
+    "nats_port": "46007",
+    "minio_api_port": "33841",
+    "minio_console_port": "47297",
+    "checkpoint_source_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-06/runtime/checkpoints",
+    "checkpoint_cache_bytes": "16777216",
+    "worker_capacity": "1",
+    "task_pool_size": "0",
+    "llm_pool_size": "0",
+    "actor_pool_size": "0",
+    "generated_at_utc": "2026-06-22T15:43:09Z"
+  },
+  "commands": [
+    {
+      "name": "python_venv_create",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "python_venv_create.log"
+    },
+    {
+      "name": "python_pip_install",
+      "exit_code": 0,
+      "duration_sec": 2,
+      "log": "python_pip_install.log"
+    },
+    {
+      "name": "python_unittest",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_unittest.log"
+    },
+    {
+      "name": "python_compileall",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_compileall.log"
+    },
+    {
+      "name": "python_grpc_deps",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_grpc_deps.log"
+    },
+    {
+      "name": "build_logservectl",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "build_logservectl.log"
+    },
+    {
+      "name": "compose_build",
+      "exit_code": 17,
+      "duration_sec": 60,
+      "log": "compose_build.log"
+    },
+    {
+      "name": "summarize_experiment",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "summarize_experiment.log"
+    },
+    {
+      "name": "package_results",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "package.log"
+    }
+  ],
+  "benchmark": {},
+  "logstore": {},
+  "checkpoint_cache": {},
+  "fault_injection": {},
+  "dashboard": {},
+  "go_benchmarks": {},
+  "notes": [
+    "verdict is not pass; inspect checks and failed command logs before using the numbers in a report."
+  ]
+}

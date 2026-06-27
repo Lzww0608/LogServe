@@ -1,0 +1,878 @@
+{
+  "verdict": "PASS",
+  "result_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted",
+  "package": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/ubuntu-project-acceptance-package.tar.gz",
+  "failed_commands": [],
+  "failed_checks": [],
+  "commands": [
+    {
+      "name": "prerequisite_check",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "prerequisite_check.log"
+    },
+    {
+      "name": "python_venv_create",
+      "exit_code": 0,
+      "duration_sec": 2,
+      "log": "python_venv_create.log"
+    },
+    {
+      "name": "python_pip_install",
+      "exit_code": 0,
+      "duration_sec": 3,
+      "log": "python_pip_install.log"
+    },
+    {
+      "name": "go_test_all",
+      "exit_code": 0,
+      "duration_sec": 27,
+      "log": "go_test_all.log"
+    },
+    {
+      "name": "go_vet",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "go_vet.log"
+    },
+    {
+      "name": "go_test_physical_compaction",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "go_test_physical_compaction.log"
+    },
+    {
+      "name": "go_race_logstore",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "go_race_logstore.log"
+    },
+    {
+      "name": "go_race_core",
+      "exit_code": 0,
+      "duration_sec": 3,
+      "log": "go_race_core.log"
+    },
+    {
+      "name": "python_script_tests",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_script_tests.log"
+    },
+    {
+      "name": "python_sdk_tests",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_sdk_tests.log"
+    },
+    {
+      "name": "python_compileall",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_compileall.log"
+    },
+    {
+      "name": "compose_experiment",
+      "exit_code": 0,
+      "duration_sec": 80,
+      "log": "compose_experiment.log"
+    },
+    {
+      "name": "checkpoint_acceptance",
+      "exit_code": 0,
+      "duration_sec": 2,
+      "log": "checkpoint_acceptance.log"
+    },
+    {
+      "name": "postgres_async_acceptance",
+      "exit_code": 0,
+      "duration_sec": 116,
+      "log": "postgres_async_acceptance.log"
+    },
+    {
+      "name": "package_results",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "package.log"
+    }
+  ],
+  "checks": {
+    "go_baseline_tests": true,
+    "physical_compaction_tests": true,
+    "logstore_race_tests": true,
+    "python_script_tests": true,
+    "python_compileall": true,
+    "compose_experiment_pass": true,
+    "checkpoint_acceptance_pass": true,
+    "postgres_async_acceptance_pass": true
+  },
+  "subsuites": {
+    "compose_experiment": {
+      "enabled": true,
+      "state": "PASS",
+      "summary_path": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment/summary.json",
+      "markdown_path": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment/summary.md",
+      "summary": {
+        "verdict": "pass",
+        "checks": [
+          {
+            "name": "all_recorded_commands_pass",
+            "status": "pass",
+            "detail": "all recorded commands passed"
+          },
+          {
+            "name": "logstore_relaxed_fsync_faster_than_always",
+            "status": "pass",
+            "detail": "batch and interval append throughput are greater than always",
+            "actual": {
+              "always": 1760.663885361773,
+              "batch": 293717.4483966346,
+              "interval": 296456.2684907186
+            },
+            "expected": "batch > always and interval > always"
+          },
+          {
+            "name": "locality_cache_hit_not_worse_than_resource_only",
+            "status": "pass",
+            "detail": "locality-aware cache hit rate should not be lower than resource-only",
+            "actual": {
+              "resource_only": 1.0,
+              "locality_aware": 1.0
+            },
+            "expected": "locality_aware >= resource_only"
+          },
+          {
+            "name": "checkpoint_warm_cache_hit",
+            "status": "pass",
+            "detail": "warm checkpoint request hit cache"
+          },
+          {
+            "name": "actor_snapshot_replay_less_than_full",
+            "status": "pass",
+            "detail": "snapshot replay should use fewer commands than full replay",
+            "actual": {
+              "snapshot": 1,
+              "full": 21
+            },
+            "expected": "snapshot < full"
+          },
+          {
+            "name": "dashboard_has_three_workers",
+            "status": "pass",
+            "detail": "dashboard contains at least three workers",
+            "actual": 3,
+            "expected": ">= 3"
+          },
+          {
+            "name": "dashboard_replay_consistent",
+            "status": "pass",
+            "detail": "dashboard workflow/actor entries match replay state",
+            "actual": 5,
+            "expected": "all checked entries consistent"
+          }
+        ],
+        "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment",
+        "package": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment/experiment-package.tar.gz",
+        "environment": {
+          "run_id": "20260624T025745026030240Z",
+          "mode": "compose",
+          "postgres_mode": "sync",
+          "root": "/home/lab2439/Work/lzww/LogServe",
+          "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment",
+          "data_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment/runtime",
+          "log_addr": "127.0.0.1:56107",
+          "control_addr": "127.0.0.1:38069",
+          "postgres_port": "38609",
+          "nats_port": "33005",
+          "minio_api_port": "50413",
+          "minio_console_port": "60125",
+          "checkpoint_source_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment/runtime/checkpoints",
+          "checkpoint_cache_bytes": "16777216",
+          "worker_capacity": "1",
+          "task_pool_size": "0",
+          "llm_pool_size": "0",
+          "actor_pool_size": "0",
+          "generated_at_utc": "2026-06-24T02:57:45Z"
+        },
+        "commands": [
+          {
+            "name": "python_venv_create",
+            "exit_code": 0,
+            "duration_sec": 1,
+            "log": "python_venv_create.log"
+          },
+          {
+            "name": "python_pip_install",
+            "exit_code": 0,
+            "duration_sec": 3,
+            "log": "python_pip_install.log"
+          },
+          {
+            "name": "python_unittest",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "python_unittest.log"
+          },
+          {
+            "name": "python_compileall",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "python_compileall.log"
+          },
+          {
+            "name": "python_grpc_deps",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "python_grpc_deps.log"
+          },
+          {
+            "name": "build_logservectl",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "build_logservectl.log"
+          },
+          {
+            "name": "scheduler_benchmark",
+            "exit_code": 0,
+            "duration_sec": 7,
+            "log": "scheduler_benchmark.log"
+          },
+          {
+            "name": "metadata_benchmark",
+            "exit_code": 0,
+            "duration_sec": 10,
+            "log": "metadata_benchmark.log"
+          },
+          {
+            "name": "logstore_benchmark",
+            "exit_code": 0,
+            "duration_sec": 12,
+            "log": "logstore_benchmark.log"
+          },
+          {
+            "name": "fault_injection_go_tests",
+            "exit_code": 0,
+            "duration_sec": 6,
+            "log": "fault_injection_go_tests.log"
+          },
+          {
+            "name": "compose_build",
+            "exit_code": 0,
+            "duration_sec": 15,
+            "log": "compose_build.log"
+          },
+          {
+            "name": "runtime_compose_start",
+            "exit_code": 0,
+            "duration_sec": 1,
+            "log": "compose_up.log"
+          },
+          {
+            "name": "runtime_logd_ready",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "compose.log"
+          },
+          {
+            "name": "runtime_control_ready",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "compose.log"
+          },
+          {
+            "name": "runtime_workers_ready",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "runtime_workers_ready.log"
+          },
+          {
+            "name": "postgres_before_benchmark",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "postgres_before_benchmark.stderr.log"
+          },
+          {
+            "name": "benchmark",
+            "exit_code": 0,
+            "duration_sec": 17,
+            "log": "benchmark.stderr.log"
+          },
+          {
+            "name": "postgres_after_benchmark",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "postgres_after_benchmark.stderr.log"
+          },
+          {
+            "name": "postgres_benchmark_stats",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "postgres_benchmark_stats.stderr.log"
+          },
+          {
+            "name": "checkpoint_cache_probe",
+            "exit_code": 0,
+            "duration_sec": 1,
+            "log": "checkpoint_cache_probe.stderr.log"
+          },
+          {
+            "name": "checkpoint_cache_artifact",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "checkpoint_cache_artifact.log"
+          },
+          {
+            "name": "dashboard_snapshot",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "dashboard_snapshot.stderr.log"
+          },
+          {
+            "name": "dashboard_replay_consistency",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "dashboard_replay_consistency.stderr.log"
+          },
+          {
+            "name": "summarize_experiment",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "summarize_experiment.log"
+          },
+          {
+            "name": "package_results",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "package.log"
+          }
+        ],
+        "benchmark": {
+          "workflow_p95_ms": 924,
+          "workflow_p99_ms": 924,
+          "task_throughput_tps": 5.11,
+          "task_p99_latency_ms": 209,
+          "actor_snapshot_replay_commands": 1,
+          "actor_trimmed_replay_commands": 1,
+          "actor_full_replay_commands": 21,
+          "actor_no_snapshot_replay_commands": 21,
+          "actor_compactable_log_records": 45,
+          "actor_compactable_log_bytes": 18382,
+          "llm_cold_total_latency_ms": 111,
+          "llm_warm_total_latency_ms": 17,
+          "llm_warm_cache_hit": true,
+          "llm_cold_checkpoint_fetch_ms": 1,
+          "llm_warm_checkpoint_fetch_ms": 0,
+          "resource_only_cache_hit_rate": 1.0,
+          "locality_aware_cache_hit_rate": 1.0,
+          "predicted_latency_cache_hit_rate": 1.0,
+          "resource_only_p95_latency_ms": 208,
+          "locality_aware_p95_latency_ms": 207,
+          "predicted_latency_p95_latency_ms": 208
+        },
+        "logstore": {
+          "logstore_always_append_tps": 1760.663885361773,
+          "logstore_always_read_tps": 656928.5332704084,
+          "logstore_always_recover_ms": 36,
+          "logstore_always_segments": 7,
+          "logstore_batch_append_tps": 293717.4483966346,
+          "logstore_batch_read_tps": 906235.1150882347,
+          "logstore_batch_recover_ms": 36,
+          "logstore_batch_segments": 7,
+          "logstore_interval_append_tps": 296456.2684907186,
+          "logstore_interval_read_tps": 999045.6117271172,
+          "logstore_interval_recover_ms": 31,
+          "logstore_interval_segments": 7
+        },
+        "checkpoint_cache": {
+          "checkpoint_model": "model-D",
+          "checkpoint_cold_cache_hit": false,
+          "checkpoint_warm_cache_hit": true,
+          "checkpoint_cold_worker_id": "worker-a",
+          "checkpoint_warm_worker_id": "worker-a",
+          "checkpoint_cold_fetch_ms": 1,
+          "checkpoint_warm_fetch_ms": 0,
+          "checkpoint_cache_used_bytes": 2097152,
+          "checkpoint_cache_capacity_bytes": 16777216,
+          "checkpoint_validation_errors": []
+        },
+        "fault_injection": {
+          "worker_kill_recovery": "passed",
+          "queue_redelivery": "passed",
+          "control_restart_probe": "passed",
+          "logd_restart_probe": "covered_by_logstore_recovery_and_process_logs",
+          "source": "go test ./tests/integration fault and recovery subset"
+        },
+        "dashboard": {
+          "dashboard_queue_depth": null,
+          "dashboard_tasks": 84,
+          "dashboard_workflows": 3,
+          "dashboard_actors": 2,
+          "dashboard_workers": 3,
+          "dashboard_models": 3,
+          "dashboard_compactable_log_records": 45,
+          "dashboard_compactable_log_bytes": 18382,
+          "metadata_materializer_mode": "sync",
+          "metadata_materializer_pending_deltas": null,
+          "metadata_materializer_flush_count": null,
+          "metadata_materializer_flush_errors": null,
+          "metadata_materializer_lag_ms": null
+        },
+        "postgres": {
+          "postgres_mode": "sync",
+          "postgres_elapsed_ms": 16816,
+          "postgres_transactions_delta": 1250,
+          "postgres_row_writes_delta": 1630,
+          "postgres_transactions_per_sec": 74.334,
+          "postgres_row_writes_per_sec": 96.931
+        },
+        "dashboard_replay": {
+          "dashboard_replay_consistent": true,
+          "dashboard_replay_workflows": 3,
+          "dashboard_replay_actors": 2,
+          "dashboard_replay_checked": 5,
+          "dashboard_replay_failures": []
+        },
+        "go_benchmarks": {
+          "scheduler_benchmark.log": [
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=1-32",
+              "metrics": {
+                "ns_per_op": 554.3,
+                "bytes_per_op": 105.0,
+                "allocs_per_op": 2.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=1-32         \t  689923\t       554.3 ns/op\t     105 B/op\t       2 allocs/op"
+            },
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=10-32",
+              "metrics": {
+                "ns_per_op": 2003.0,
+                "bytes_per_op": 367.0,
+                "allocs_per_op": 4.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=10-32        \t  151677\t      2003 ns/op\t     367 B/op\t       4 allocs/op"
+            },
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=100-32",
+              "metrics": {
+                "ns_per_op": 17887.0,
+                "bytes_per_op": 2480.0,
+                "allocs_per_op": 6.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=1000/workers=100-32       \t   21144\t     17887 ns/op\t    2480 B/op\t       6 allocs/op"
+            },
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=1-32",
+              "metrics": {
+                "ns_per_op": 476.9,
+                "bytes_per_op": 128.0,
+                "allocs_per_op": 2.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=1-32        \t  721171\t       476.9 ns/op\t     128 B/op\t       2 allocs/op"
+            },
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=10-32",
+              "metrics": {
+                "ns_per_op": 1795.0,
+                "bytes_per_op": 345.0,
+                "allocs_per_op": 3.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=10-32       \t  323968\t      1795 ns/op\t     345 B/op\t       3 allocs/op"
+            },
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=100-32",
+              "metrics": {
+                "ns_per_op": 15502.0,
+                "bytes_per_op": 2497.0,
+                "allocs_per_op": 6.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=10000/workers=100-32      \t   65155\t     15502 ns/op\t    2497 B/op\t       6 allocs/op"
+            },
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=1-32",
+              "metrics": {
+                "ns_per_op": 451.6,
+                "bytes_per_op": 151.0,
+                "allocs_per_op": 2.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=1-32       \t  795085\t       451.6 ns/op\t     151 B/op\t       2 allocs/op"
+            },
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=10-32",
+              "metrics": {
+                "ns_per_op": 1481.0,
+                "bytes_per_op": 345.0,
+                "allocs_per_op": 3.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=10-32      \t  385712\t      1481 ns/op\t     345 B/op\t       3 allocs/op"
+            },
+            {
+              "name": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=100-32",
+              "metrics": {
+                "ns_per_op": 4078.0,
+                "bytes_per_op": 2468.0,
+                "allocs_per_op": 5.0
+              },
+              "raw": "BenchmarkSchedulerAssignMixedBacklog/depth=100000/workers=100-32     \t   78120\t      4078 ns/op\t    2468 B/op\t       5 allocs/op"
+            }
+          ],
+          "metadata_benchmark.log": [
+            {
+              "name": "BenchmarkMemoryStoreConcurrentGetTask/legacy-32",
+              "metrics": {
+                "ns_per_op": 66.3,
+                "bytes_per_op": 0.0,
+                "allocs_per_op": 0.0
+              },
+              "raw": "BenchmarkMemoryStoreConcurrentGetTask/legacy-32     \t 5305657\t        66.30 ns/op\t       0 B/op\t       0 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreConcurrentGetTask/v2-32",
+              "metrics": {
+                "ns_per_op": 28.44,
+                "bytes_per_op": 0.0,
+                "allocs_per_op": 0.0
+              },
+              "raw": "BenchmarkMemoryStoreConcurrentGetTask/v2-32         \t12041756\t        28.44 ns/op\t       0 B/op\t       0 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreConcurrentLeaseComplete/legacy-32",
+              "metrics": {
+                "ns_per_op": 1715.0,
+                "bytes_per_op": 0.0,
+                "allocs_per_op": 0.0
+              },
+              "raw": "BenchmarkMemoryStoreConcurrentLeaseComplete/legacy-32         \t  894925\t      1715 ns/op\t       0 B/op\t       0 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreConcurrentLeaseComplete/v2-32",
+              "metrics": {
+                "ns_per_op": 3767.0,
+                "bytes_per_op": 295.0,
+                "allocs_per_op": 3.0
+              },
+              "raw": "BenchmarkMemoryStoreConcurrentLeaseComplete/v2-32             \t  226578\t      3767 ns/op\t     295 B/op\t       3 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreConcurrentHeartbeat/legacy-32",
+              "metrics": {
+                "ns_per_op": 1526.0,
+                "bytes_per_op": 560.0,
+                "allocs_per_op": 5.0
+              },
+              "raw": "BenchmarkMemoryStoreConcurrentHeartbeat/legacy-32             \t  420002\t      1526 ns/op\t     560 B/op\t       5 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreConcurrentHeartbeat/v2-32",
+              "metrics": {
+                "ns_per_op": 169.1,
+                "bytes_per_op": 560.0,
+                "allocs_per_op": 5.0
+              },
+              "raw": "BenchmarkMemoryStoreConcurrentHeartbeat/v2-32                 \t 2088639\t       169.1 ns/op\t     560 B/op\t       5 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreHeartbeatUnderCompleteP99/legacy-32",
+              "metrics": {
+                "ns_per_op": 9995.0,
+                "heartbeat_p99_batch_ns": 5382126.0,
+                "bytes_per_op": 3361.0,
+                "allocs_per_op": 30.0
+              },
+              "raw": "BenchmarkMemoryStoreHeartbeatUnderCompleteP99/legacy-32       \t   37318\t      9995 ns/op\t   5382126 heartbeat-p99-batch-ns\t    3361 B/op\t      30 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreHeartbeatUnderCompleteP99/v2-32",
+              "metrics": {
+                "ns_per_op": 4601.0,
+                "heartbeat_p99_batch_ns": 17242.0,
+                "bytes_per_op": 3817.0,
+                "allocs_per_op": 36.0
+              },
+              "raw": "BenchmarkMemoryStoreHeartbeatUnderCompleteP99/v2-32           \t   72951\t      4601 ns/op\t     17242 heartbeat-p99-batch-ns\t    3817 B/op\t      36 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreActiveWorkers/legacy-32",
+              "metrics": {
+                "ns_per_op": 59066.0,
+                "bytes_per_op": 369538.0,
+                "allocs_per_op": 3001.0
+              },
+              "raw": "BenchmarkMemoryStoreActiveWorkers/legacy-32                   \t    6192\t     59066 ns/op\t  369538 B/op\t    3001 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreActiveWorkers/v2-32",
+              "metrics": {
+                "ns_per_op": 71933.0,
+                "bytes_per_op": 369537.0,
+                "allocs_per_op": 3001.0
+              },
+              "raw": "BenchmarkMemoryStoreActiveWorkers/v2-32                       \t    4369\t     71933 ns/op\t  369537 B/op\t    3001 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreUpdateWorkflow/legacy-32",
+              "metrics": {
+                "ns_per_op": 12664.0,
+                "bytes_per_op": 14067.0,
+                "allocs_per_op": 45.0
+              },
+              "raw": "BenchmarkMemoryStoreUpdateWorkflow/legacy-32                  \t   34108\t     12664 ns/op\t   14067 B/op\t      45 allocs/op"
+            },
+            {
+              "name": "BenchmarkMemoryStoreUpdateWorkflow/v2-32",
+              "metrics": {
+                "ns_per_op": 20912.0,
+                "bytes_per_op": 18590.0,
+                "allocs_per_op": 40.0
+              },
+              "raw": "BenchmarkMemoryStoreUpdateWorkflow/v2-32                      \t   18334\t     20912 ns/op\t   18590 B/op\t      40 allocs/op"
+            }
+          ]
+        },
+        "notes": []
+      }
+    },
+    "checkpoint_acceptance": {
+      "enabled": true,
+      "state": "PASS",
+      "summary_path": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/acceptance_summary.json",
+      "markdown_path": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/acceptance_summary.md",
+      "summary": {
+        "verdict": "PASS",
+        "result_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance",
+        "package": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/ubuntu-checkpoint-acceptance-package.tar.gz",
+        "checkpoint_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance",
+        "failed_commands": [],
+        "commands": [
+          {
+            "name": "prerequisite_check",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "prerequisite_check.log"
+          },
+          {
+            "name": "checkpoint_acceptance",
+            "exit_code": 0,
+            "duration_sec": 1,
+            "log": "checkpoint_acceptance.log"
+          },
+          {
+            "name": "package_results",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "package.log"
+          }
+        ],
+        "checkpoint_acceptance": {
+          "verdict": "PASS",
+          "result_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance",
+          "failed_commands": [],
+          "failed_checks": [],
+          "commands": [
+            {
+              "name": "checkpoint_unit_tests",
+              "exit_code": 0,
+              "duration_sec": 0,
+              "log": "checkpoint_unit_tests.log"
+            },
+            {
+              "name": "checkpoint_acceptance_go_test",
+              "exit_code": 0,
+              "duration_sec": 1,
+              "log": "checkpoint_acceptance_go_test.log"
+            }
+          ],
+          "acceptance": {
+            "verdict": "PASS",
+            "generated_at_utc": "2026-06-24T02:59:07Z",
+            "workload": {
+              "tasks": 120,
+              "workflows": 12,
+              "actors": 12,
+              "llm_streams": 40,
+              "tail_events": 68
+            },
+            "checkpoint": {
+              "id": "checkpoint-2bbb3c2a631ca39d",
+              "stream_count": 196,
+              "task_count": 132,
+              "workflow_count": 12,
+              "actor_count": 12,
+              "llm_stats_count": 2
+            },
+            "full_replay": {
+              "duration_ms": 6.463,
+              "read_log_calls": 224,
+              "records_read": 614
+            },
+            "checkpoint_replay": {
+              "duration_ms": 5.506,
+              "read_log_calls": 201,
+              "records_read": 71
+            },
+            "ratios": {
+              "checkpoint_duration_over_full": 0.8519,
+              "checkpoint_read_calls_over_full": 0.8973,
+              "checkpoint_records_over_full": 0.1156
+            },
+            "consistency": {
+              "consistent": true,
+              "checked_count": 156,
+              "checkpoint_id": "checkpoint-2bbb3c2a631ca39d",
+              "checkpoint_age_ms": 28
+            },
+            "checks": {
+              "checkpoint_created": true,
+              "checkpoint_read_records_reduced": true,
+              "checkpoint_replay_consistent": true,
+              "checkpoint_retention": true,
+              "checkpoint_tail_only_reads": true,
+              "corrupt_checkpoint_fallback": true
+            }
+          },
+          "send_back": [
+            "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance/summary.md",
+            "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance/summary.json",
+            "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance/checkpoint_acceptance.json"
+          ]
+        },
+        "send_back": [
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/acceptance_summary.md",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/acceptance_summary.json",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance/summary.md",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance/summary.json",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/checkpoint_acceptance/checkpoint_acceptance.json",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/ubuntu-checkpoint-acceptance-package.tar.gz"
+        ]
+      }
+    },
+    "postgres_async_acceptance": {
+      "enabled": true,
+      "state": "PASS",
+      "summary_path": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/acceptance_summary.json",
+      "markdown_path": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/acceptance_summary.md",
+      "summary": {
+        "verdict": "pass",
+        "result_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance",
+        "package": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/ubuntu-acceptance-package.tar.gz",
+        "compare_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/postgres_async_compare",
+        "failed_commands": [],
+        "commands": [
+          {
+            "name": "prerequisite_check",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "prerequisite_check.log"
+          },
+          {
+            "name": "python_venv_create",
+            "exit_code": 0,
+            "duration_sec": 2,
+            "log": "python_venv_create.log"
+          },
+          {
+            "name": "python_pip_install",
+            "exit_code": 0,
+            "duration_sec": 3,
+            "log": "python_pip_install.log"
+          },
+          {
+            "name": "postgres_async_compare",
+            "exit_code": 0,
+            "duration_sec": 110,
+            "log": "postgres_async_compare.log"
+          },
+          {
+            "name": "package_results",
+            "exit_code": 0,
+            "duration_sec": 0,
+            "log": "package.log"
+          }
+        ],
+        "comparison": {
+          "modes": {
+            "sync": {
+              "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/postgres_async_compare/sync",
+              "verdict": "warn",
+              "task_throughput_tps": 5.0,
+              "task_p99_latency_ms": 209,
+              "postgres_transactions_per_sec": 72.382,
+              "postgres_row_writes_per_sec": 100.519,
+              "postgres_transactions_delta": 2889,
+              "postgres_row_writes_delta": 4012,
+              "metadata_materializer_mode": "sync",
+              "metadata_materializer_pending_deltas": null,
+              "metadata_materializer_flush_errors": 0,
+              "metadata_materializer_lag_ms": null
+            },
+            "async": {
+              "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/postgres_async_compare/async",
+              "verdict": "warn",
+              "task_throughput_tps": 5.0,
+              "task_p99_latency_ms": 207,
+              "postgres_transactions_per_sec": 1.304,
+              "postgres_row_writes_per_sec": 16.57,
+              "postgres_transactions_delta": 52,
+              "postgres_row_writes_delta": 661,
+              "metadata_materializer_mode": "async",
+              "metadata_materializer_pending_deltas": 6,
+              "metadata_materializer_flush_errors": 0,
+              "metadata_materializer_lag_ms": 746
+            }
+          },
+          "ratios": {
+            "task_throughput_async_over_sync": 1.0,
+            "task_p99_async_over_sync": 0.9904,
+            "postgres_transactions_per_sec_async_over_sync": 0.018,
+            "postgres_row_writes_per_sec_async_over_sync": 0.1648
+          },
+          "thresholds": {
+            "task_throughput_min_ratio": 0.99,
+            "task_p99_max_ratio": 1.0
+          },
+          "observations": {
+            "task_throughput_strictly_improved": false,
+            "task_submit_p99_strictly_improved": true
+          },
+          "acceptance": {
+            "pass": true,
+            "require_improvement": true,
+            "checks": {
+              "task_throughput_within_tolerance": true,
+              "task_submit_p99_within_tolerance": true,
+              "postgres_transactions_per_sec_reduced": true,
+              "postgres_row_writes_per_sec_reduced": true,
+              "async_materializer_mode_observed": true,
+              "async_materializer_flush_errors_zero": true
+            }
+          }
+        },
+        "send_back": [
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/acceptance_summary.md",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/acceptance_summary.json",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/postgres_async_compare/summary.md",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/postgres_async_compare/comparison.json",
+          "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/ubuntu-acceptance-package.tar.gz"
+        ]
+      }
+    }
+  },
+  "run_config": {
+    "run_compose_experiment": true,
+    "run_checkpoint_acceptance": true,
+    "run_postgres_async_acceptance": true
+  },
+  "send_back": [
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/acceptance_summary.md",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/acceptance_summary.json",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/command_status.jsonl",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/server_environment.txt",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/ubuntu-project-acceptance-package.tar.gz",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment/summary.md",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/compose_experiment/summary.json",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/acceptance_summary.md",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/checkpoint_acceptance/acceptance_summary.json",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/acceptance_summary.md",
+    "/home/lab2439/Work/lzww/LogServe/reports/ubuntu-project-accepted/postgres_async_acceptance/acceptance_summary.json"
+  ]
+}

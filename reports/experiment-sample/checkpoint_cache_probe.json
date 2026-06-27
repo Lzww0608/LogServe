@@ -1,0 +1,1 @@
+﻿{"model":"model-D","cold":{"cache_hit":false,"checkpoint_fetch_ms":4,"cache_used_bytes":1048576,"cache_capacity_bytes":16777216},"warm":{"cache_hit":true,"checkpoint_fetch_ms":0,"cache_used_bytes":1048576,"cache_capacity_bytes":16777216}}

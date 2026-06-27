@@ -1,0 +1,198 @@
+{
+  "verdict": "fail",
+  "checks": [
+    {
+      "name": "all_recorded_commands_pass",
+      "status": "fail",
+      "detail": "one or more recorded commands failed",
+      "actual": [
+        "benchmark"
+      ],
+      "expected": "no failed commands"
+    },
+    {
+      "name": "logstore_relaxed_fsync_faster_than_always",
+      "status": "warn",
+      "detail": "logstore benchmark policy data is missing",
+      "actual": {},
+      "expected": "always, batch, interval"
+    },
+    {
+      "name": "locality_cache_hit_not_worse_than_resource_only",
+      "status": "warn",
+      "detail": "locality benchmark did not run"
+    },
+    {
+      "name": "checkpoint_warm_cache_hit",
+      "status": "pass",
+      "detail": "warm checkpoint request hit cache"
+    },
+    {
+      "name": "actor_snapshot_replay_less_than_full",
+      "status": "warn",
+      "detail": "actor replay ablation data is missing"
+    },
+    {
+      "name": "dashboard_has_three_workers",
+      "status": "pass",
+      "detail": "dashboard contains at least three workers",
+      "actual": 3,
+      "expected": ">= 3"
+    }
+  ],
+  "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-07",
+  "package": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-07/experiment-package.tar.gz",
+  "environment": {
+    "run_id": "exp1782143704",
+    "mode": "compose",
+    "root": "/home/lab2439/Work/lzww/LogServe",
+    "run_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-07",
+    "data_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-07/runtime",
+    "log_addr": "127.0.0.1:39589",
+    "control_addr": "127.0.0.1:41483",
+    "postgres_port": "47099",
+    "nats_port": "59329",
+    "minio_api_port": "58185",
+    "minio_console_port": "56681",
+    "checkpoint_source_dir": "/home/lab2439/Work/lzww/LogServe/reports/compose-experiment-failed-07/runtime/checkpoints",
+    "checkpoint_cache_bytes": "16777216",
+    "worker_capacity": "1",
+    "task_pool_size": "0",
+    "llm_pool_size": "0",
+    "actor_pool_size": "0",
+    "generated_at_utc": "2026-06-22T15:55:04Z"
+  },
+  "commands": [
+    {
+      "name": "python_venv_create",
+      "exit_code": 0,
+      "duration_sec": 2,
+      "log": "python_venv_create.log"
+    },
+    {
+      "name": "python_pip_install",
+      "exit_code": 0,
+      "duration_sec": 3,
+      "log": "python_pip_install.log"
+    },
+    {
+      "name": "python_unittest",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_unittest.log"
+    },
+    {
+      "name": "python_compileall",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_compileall.log"
+    },
+    {
+      "name": "python_grpc_deps",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "python_grpc_deps.log"
+    },
+    {
+      "name": "build_logservectl",
+      "exit_code": 0,
+      "duration_sec": 2,
+      "log": "build_logservectl.log"
+    },
+    {
+      "name": "compose_build",
+      "exit_code": 0,
+      "duration_sec": 11,
+      "log": "compose_build.log"
+    },
+    {
+      "name": "runtime_compose_start",
+      "exit_code": 0,
+      "duration_sec": 73,
+      "log": "compose_up.log"
+    },
+    {
+      "name": "runtime_logd_ready",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "compose.log"
+    },
+    {
+      "name": "runtime_control_ready",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "compose.log"
+    },
+    {
+      "name": "runtime_workers_ready",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "runtime_workers_ready.log"
+    },
+    {
+      "name": "benchmark",
+      "exit_code": 1,
+      "duration_sec": 1,
+      "log": "benchmark.stderr.log"
+    },
+    {
+      "name": "checkpoint_cache_probe",
+      "exit_code": 0,
+      "duration_sec": 1,
+      "log": "checkpoint_cache_probe.stderr.log"
+    },
+    {
+      "name": "checkpoint_cache_artifact",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "checkpoint_cache_artifact.log"
+    },
+    {
+      "name": "dashboard_snapshot",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "dashboard_snapshot.stderr.log"
+    },
+    {
+      "name": "summarize_experiment",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "summarize_experiment.log"
+    },
+    {
+      "name": "package_results",
+      "exit_code": 0,
+      "duration_sec": 0,
+      "log": "package.log"
+    }
+  ],
+  "benchmark": {},
+  "logstore": {},
+  "checkpoint_cache": {
+    "checkpoint_model": "model-D",
+    "checkpoint_cold_cache_hit": false,
+    "checkpoint_warm_cache_hit": true,
+    "checkpoint_cold_worker_id": "worker-a",
+    "checkpoint_warm_worker_id": "worker-a",
+    "checkpoint_cold_fetch_ms": 1,
+    "checkpoint_warm_fetch_ms": 0,
+    "checkpoint_cache_used_bytes": 1048576,
+    "checkpoint_cache_capacity_bytes": 16777216,
+    "checkpoint_validation_errors": []
+  },
+  "fault_injection": {},
+  "dashboard": {
+    "dashboard_queue_depth": null,
+    "dashboard_tasks": 5,
+    "dashboard_workflows": 1,
+    "dashboard_actors": 0,
+    "dashboard_workers": 3,
+    "dashboard_models": 3,
+    "dashboard_compactable_log_records": null,
+    "dashboard_compactable_log_bytes": null
+  },
+  "go_benchmarks": {},
+  "notes": [
+    "verdict is not pass; inspect checks and failed command logs before using the numbers in a report."
+  ]
+}

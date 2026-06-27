@@ -1,0 +1,1 @@
+﻿{"policies":[{"policy":"always","append_records_sec":123.4,"read_records_sec":567.8,"recover_ms":9,"segment_count":2}]}
