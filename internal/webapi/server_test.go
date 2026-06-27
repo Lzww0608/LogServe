@@ -18,13 +18,19 @@ import (
 )
 
 type fakeClientConn struct {
-	dashboard  *logservepb.DashboardSnapshot
-	taskStatus *logservepb.GetTaskStatusResponse
-	submitTask *logservepb.SubmitTaskResponse
-	calls      []string
+	dashboard      *logservepb.DashboardSnapshot
+	taskStatus     *logservepb.GetTaskStatusResponse
+	submitTask     *logservepb.SubmitTaskResponse
+	streams        *logservepb.ListStreamsResponse
+	readLog        *logservepb.ReadLogResponse
+	stats          *logservepb.GetStreamStatsResponse
+	listStreamsReq *logservepb.ListStreamsRequest
+	readLogReq     *logservepb.ReadLogRequest
+	statsReqs      []*logservepb.GetStreamStatsRequest
+	calls          []string
 }
 
-func (f *fakeClientConn) Invoke(_ context.Context, method string, _ any, reply any, _ ...grpc.CallOption) error {
+func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply any, _ ...grpc.CallOption) error {
 	f.calls = append(f.calls, method)
 	switch method {
 	case logservepb.ControlService_GetDashboardSnapshot_FullMethodName:
@@ -52,6 +58,42 @@ func (f *fakeClientConn) Invoke(_ context.Context, method string, _ any, reply a
 		}
 		if f.submitTask != nil {
 			proto.Merge(out, f.submitTask)
+		}
+		return nil
+	case logservepb.LogService_ListStreams_FullMethodName:
+		if in, ok := req.(*logservepb.ListStreamsRequest); ok {
+			f.listStreamsReq = proto.Clone(in).(*logservepb.ListStreamsRequest)
+		}
+		out, ok := reply.(*logservepb.ListStreamsResponse)
+		if !ok {
+			return errors.New("unexpected list streams reply type")
+		}
+		if f.streams != nil {
+			proto.Merge(out, f.streams)
+		}
+		return nil
+	case logservepb.LogService_ReadLog_FullMethodName:
+		if in, ok := req.(*logservepb.ReadLogRequest); ok {
+			f.readLogReq = proto.Clone(in).(*logservepb.ReadLogRequest)
+		}
+		out, ok := reply.(*logservepb.ReadLogResponse)
+		if !ok {
+			return errors.New("unexpected read log reply type")
+		}
+		if f.readLog != nil {
+			proto.Merge(out, f.readLog)
+		}
+		return nil
+	case logservepb.LogService_GetStreamStats_FullMethodName:
+		if in, ok := req.(*logservepb.GetStreamStatsRequest); ok {
+			f.statsReqs = append(f.statsReqs, proto.Clone(in).(*logservepb.GetStreamStatsRequest))
+		}
+		out, ok := reply.(*logservepb.GetStreamStatsResponse)
+		if !ok {
+			return errors.New("unexpected stream stats reply type")
+		}
+		if f.stats != nil {
+			proto.Merge(out, f.stats)
 		}
 		return nil
 	default:
@@ -221,6 +263,153 @@ func TestGetTaskMergesDashboardMetadata(t *testing.T) {
 	}
 	if task.TaskName != "console_add" || task.WorkerID != "worker-1" || task.WorkflowID != "workflow-1" || task.StepID != "step-1" {
 		t.Fatalf("metadata was not merged into task response: %+v", task)
+	}
+}
+
+func TestWorkflowStepsExposeDependenciesForDAGRendering(t *testing.T) {
+	conn := &fakeClientConn{
+		dashboard: &logservepb.DashboardSnapshot{
+			Workflows: []*logservepb.DashboardWorkflow{{
+				WorkflowId:   "wf-1",
+				WorkflowName: "rag",
+				Status:       logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING,
+				Steps: []*logservepb.WorkflowStepState{{
+					StepId: "search",
+					Status: logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED,
+					DependsOn: []string{
+						"embed",
+					},
+				}},
+			}},
+		},
+	}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/workflows", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Workflows []WorkflowDTO `json:"workflows"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode workflows response: %v", err)
+	}
+	if got := payload.Workflows[0].Steps[0].DependsOn; len(got) != 1 || got[0] != "embed" {
+		t.Fatalf("depends_on = %v, want [embed]", got)
+	}
+}
+
+func TestLogExplorerListsStreamsAndReadsRecords(t *testing.T) {
+	conn := &fakeClientConn{
+		streams: &logservepb.ListStreamsResponse{StreamIds: []string{"system:functions"}},
+		readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
+			StreamId:       "system:functions",
+			Seq:            1,
+			EventType:      "FunctionRegistered",
+			IdempotencyKey: "fn-1",
+			Payload:        []byte(`{"function_hash":"abc"}`),
+			TimestampMs:    1234,
+			Crc32:          99,
+		}}},
+		stats: &logservepb.GetStreamStatsResponse{Streams: []*logservepb.StreamStats{{
+			StreamId:           "system:functions",
+			FirstSeq:           1,
+			NextSeq:            2,
+			TrimmedBeforeSeq:   0,
+			CompactableRecords: 0,
+			CompactableBytes:   0,
+		}}},
+	}
+	srv := newTestServer(conn, "secret-token", false)
+
+	listResp := httptest.NewRecorder()
+	listReq := httptest.NewRequest(http.MethodGet, "/api/logs/streams?prefix=system:", nil)
+	listReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(listResp, listReq)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body %s", listResp.Code, listResp.Body.String())
+	}
+	if !strings.Contains(listResp.Body.String(), `"stream_ids":["system:functions"]`) {
+		t.Fatalf("list response missing stream id: %s", listResp.Body.String())
+	}
+	if conn.listStreamsReq.GetPrefix() != "system:" {
+		t.Fatalf("list prefix = %q, want system:", conn.listStreamsReq.GetPrefix())
+	}
+
+	readResp := httptest.NewRecorder()
+	readReq := httptest.NewRequest(http.MethodGet, "/api/logs/streams/system%3Afunctions?from_seq=1&limit=10", nil)
+	readReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(readResp, readReq)
+	if readResp.Code != http.StatusOK {
+		t.Fatalf("read status = %d, body %s", readResp.Code, readResp.Body.String())
+	}
+	body := readResp.Body.String()
+	for _, want := range []string{
+		`"stream_id":"system:functions"`,
+		`"event_type":"FunctionRegistered"`,
+		`"payload_json":{"function_hash":"abc"}`,
+		`"stats":{"stream_id":"system:functions"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("read response missing %s: %s", want, body)
+		}
+	}
+	if conn.readLogReq.GetStreamId() != "system:functions" || conn.readLogReq.GetFromSeq() != 1 || conn.readLogReq.GetLimit() != 10 {
+		t.Fatalf("read request = %+v, want stream system:functions from_seq 1 limit 10", conn.readLogReq)
+	}
+	if got := conn.statsReqs[len(conn.statsReqs)-1].GetStreamId(); got != "system:functions" {
+		t.Fatalf("stats stream_id = %q, want system:functions", got)
+	}
+}
+
+func TestLogExplorerRejectsHugeLimit(t *testing.T) {
+	conn := &fakeClientConn{}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/logs/streams/system%3Afunctions?limit=1001", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	if len(conn.calls) != 0 {
+		t.Fatalf("invalid request reached backend: %v", conn.calls)
+	}
+}
+
+func TestLogExplorerDoesNotDoubleDecodeStreamID(t *testing.T) {
+	streamID := "system:%2Fraw"
+	conn := &fakeClientConn{
+		readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
+			StreamId:  streamID,
+			Seq:       1,
+			EventType: "RawPercent",
+		}}},
+		stats: &logservepb.GetStreamStatsResponse{Streams: []*logservepb.StreamStats{{
+			StreamId: streamID,
+			FirstSeq: 1,
+			NextSeq:  2,
+		}}},
+	}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/logs/streams/system%3A%252Fraw?from_seq=2&limit=7", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	if conn.readLogReq.GetStreamId() != streamID || conn.readLogReq.GetFromSeq() != 2 || conn.readLogReq.GetLimit() != 7 {
+		t.Fatalf("read request = %+v, want stream %q from_seq 2 limit 7", conn.readLogReq, streamID)
 	}
 }
 

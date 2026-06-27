@@ -20,6 +20,7 @@ export interface Task {
 
 export interface WorkflowStep {
   step_id: string;
+  depends_on?: string[];
   task_name?: string;
   status: string;
   attempts?: number;
@@ -126,4 +127,38 @@ export interface LLMTrace {
   cache_capacity_bytes?: number;
   eviction_count?: number;
   events?: Array<Record<string, unknown>>;
+}
+
+export interface StreamStats {
+  stream_id: string;
+  first_seq: number;
+  next_seq: number;
+  trimmed_before_seq: number;
+  compactable_records: number;
+  compactable_bytes: number;
+}
+
+export interface LogRecord {
+  stream_id: string;
+  seq: number;
+  event_type?: string;
+  idempotency_key?: string;
+  payload_json?: unknown;
+  payload_text?: string;
+  payload_base64?: string;
+  timestamp_ms?: number;
+  crc32?: number;
+}
+
+export interface LogStreamsResponse {
+  stream_ids: string[];
+  stats: StreamStats[];
+}
+
+export interface LogStreamDetail {
+  stream_id: string;
+  from_seq: number;
+  limit: number;
+  records: LogRecord[];
+  stats?: StreamStats | null;
 }

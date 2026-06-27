@@ -388,31 +388,57 @@ th {
   overflow-wrap: anywhere;
 }
 
+.dag-layout {
+  display: grid;
+  gap: 12px;
+}
+
 .dag {
   display: flex;
   gap: 8px;
-  align-items: center;
+  align-items: stretch;
   flex-wrap: wrap;
-}
-
-.dag-piece {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.dag-arrow {
-  color: var(--muted);
 }
 
 .dag-node {
   border: 1px solid var(--line-strong);
   border-radius: 8px;
   padding: 9px 10px;
-  min-width: 132px;
+  width: 150px;
+  min-height: 92px;
   display: grid;
   gap: 7px;
   background: #fff;
+}
+
+.dag-edges {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--muted);
+}
+
+.dag-edges span {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #f8fafc;
+}
+
+.compact-button {
+  min-height: 30px;
+  padding: 4px 8px;
+  max-width: 340px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  text-align: left;
+}
+
+.payload-cell {
+  display: inline-block;
+  max-width: 520px;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .empty {

@@ -195,6 +195,7 @@ message WorkflowStepState {
   int64 started_at_ms = 9;
   int64 completed_at_ms = 10;
   int64 latency_ms = 11;
+  repeated string depends_on = 12;
 }
 
 message SubmitWorkflowRequest {

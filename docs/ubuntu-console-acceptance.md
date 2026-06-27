@@ -18,6 +18,12 @@
    - `/` 和深链接返回前端页面
    - 通过 `/api/tasks?wait=true` 提交一个真实 Python task，并确认结果为 `3`
    - task detail、dashboard task 列表和 admin config 可读
+   - 通过 `/api/workflows?wait=true` 提交两步 workflow，并确认 detail 里保留 `depends_on` DAG 依赖
+   - 调用 workflow replay，并确认 `consistent_with_metadata=true`
+   - 通过 `/api/models` 注册 mock model，通过 `/api/llm?wait=true` 提交 LLM 请求，并读取 LLM replay trace latency
+   - 通过 `/api/workers` 确认 worker cache matrix 能看到已缓存模型
+   - 通过 `/api/actors` 创建 Counter actor，调用 actor method，并读取 actor status
+   - 通过 `/api/logs/streams` 和 `/api/logs/streams/{stream_id}` 查看 `system:functions`、`wf:<workflow_id>`、`actor:<actor_id>` stream 记录
 
 ## Ubuntu 准备
 
@@ -108,7 +114,7 @@ reports/ubuntu-console-latest/console_http_probe.json
 reports/ubuntu-console-latest/console-acceptance-package.tar.gz
 ```
 
-`acceptance_summary.json` 的 `verdict` 为 `PASS` 才表示 console 验收通过。失败时先不要删目录，把 `console-acceptance-package.tar.gz` 和 `acceptance_summary.md/json` 发回来，我会根据里面的命令状态、探针结果和日志判断是否符合预期，以及失败点是环境问题还是代码问题。
+`acceptance_summary.json` 的 `verdict` 为 `PASS` 才表示 console 验收通过。现在的 PASS 会同时覆盖 Console 1-10：基础 dashboard/task 链路、workflow DAG、LLM playground、worker cache matrix、actor create/call/status，以及 log stream explorer。失败时先不要删目录，把 `console-acceptance-package.tar.gz` 和 `acceptance_summary.md/json` 发回来，我会根据里面的命令状态、探针结果和日志判断是否符合预期，以及失败点是环境问题还是代码问题。
 
 ## 本地判定
 

@@ -1,6 +1,6 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
 import { api, APIError, getStoredToken, setStoredToken } from "./api/client";
-import type { Actor, Dashboard, LLMTrace, ModelInfo, Task, Worker, Workflow } from "./types/logserve";
+import type { Actor, Dashboard, LLMTrace, LogRecord, LogStreamDetail, LogStreamsResponse, ModelInfo, StreamStats, Task, Worker, Workflow } from "./types/logserve";
 
 const addSource = `def add(a: int, b: int) -> int:
     return a + b
@@ -88,6 +88,7 @@ export function App() {
           <NavLink path="/actors" current={path}>Actors</NavLink>
           <NavLink path="/llm" current={path}>LLM Serving</NavLink>
           <NavLink path="/workers" current={path}>Workers</NavLink>
+          <NavLink path="/logs" current={path}>Logs</NavLink>
           <NavLink path="/settings" current={path}>Settings</NavLink>
         </nav>
       </aside>
@@ -111,6 +112,7 @@ function route(path: string) {
   if (path.startsWith("/actors/")) return <ActorDetailPage actorID={decodeURIComponent(path.split("/")[2] ?? "")} />;
   if (path === "/llm") return <LLMPage />;
   if (path === "/workers") return <WorkersPage />;
+  if (path === "/logs") return <LogsPage />;
   if (path === "/settings") return <SettingsPage />;
   return <NotFoundPage />;
 }
@@ -159,6 +161,7 @@ function usePolling<T>(loader: () => Promise<T>, intervalMs: number, deps: unkno
         if (!cancelled) setState({ error: errorMessage(error), loading: false });
       }
     };
+    setState({ loading: true });
     void load();
     if (intervalMs > 0) {
       timer = window.setInterval(load, intervalMs);
@@ -643,6 +646,56 @@ function WorkersPage() {
   );
 }
 
+function LogsPage() {
+  const [prefix, setPrefix] = useState("system:");
+  const [selectedStream, setSelectedStream] = useState("");
+  const streamsState = usePolling(() => api.logStreams(prefix.trim()), 2000, [prefix]);
+
+  useEffect(() => {
+    const ids = streamsState.data?.stream_ids ?? [];
+    if (!ids.length) {
+      if (selectedStream) setSelectedStream("");
+      return;
+    }
+    if (!selectedStream || !ids.includes(selectedStream)) {
+      setSelectedStream(ids[0]);
+    }
+  }, [streamsState.data, selectedStream]);
+
+  const detailState = usePolling<LogStreamDetail>(() => {
+    if (!selectedStream) {
+      return Promise.resolve({ stream_id: "", from_seq: 1, limit: 100, records: [], stats: null });
+    }
+    return api.logStream(selectedStream, 1, 100);
+  }, 2000, [selectedStream]);
+
+  const statsByStream = useMemo(() => {
+    const entries = streamsState.data?.stats ?? [];
+    return new Map(entries.map((item) => [item.stream_id, item]));
+  }, [streamsState.data]);
+
+  return (
+    <div className="stack">
+      <section className="panel">
+        <div className="toolbar">
+          <input value={prefix} onChange={(event) => setPrefix(event.target.value)} placeholder="Stream prefix" />
+          <button className="ghost" onClick={() => setPrefix("")}>All</button>
+          <button className="ghost" onClick={() => setPrefix("system:")}>System</button>
+          <button className="ghost" onClick={() => setPrefix("wf:")}>Workflows</button>
+          <button className="ghost" onClick={() => setPrefix("actor:")}>Actors</button>
+        </div>
+        {streamsState.error && <InlineError message={streamsState.error} />}
+        <LogStreamTable streamIDs={streamsState.data?.stream_ids ?? []} stats={statsByStream} selected={selectedStream} onSelect={setSelectedStream} />
+      </section>
+      <section className="panel">
+        <PanelTitle title={selectedStream || "Stream Detail"} />
+        {detailState.error && <InlineError message={detailState.error} />}
+        <StreamStatsPanel stats={detailState.data?.stats ?? statsByStream.get(selectedStream)} />
+        <LogRecordTable rows={detailState.data?.records ?? []} />
+      </section>
+    </div>
+  );
+}
 function SettingsPage() {
   const [token, setToken] = useState(getStoredToken());
   const [message, setMessage] = useState("");
@@ -733,6 +786,37 @@ function WorkerTable({ rows }: { rows: Worker[] }) {
   ]} />;
 }
 
+function LogStreamTable({ streamIDs, stats, selected, onSelect }: { streamIDs: string[]; stats: Map<string, StreamStats>; selected: string; onSelect: (streamID: string) => void }) {
+  return <Table rows={streamIDs} empty="No streams" columns={[
+    { label: "Stream", render: (streamID) => <button type="button" className={streamID === selected ? "primary compact-button" : "ghost compact-button"} onClick={() => onSelect(streamID)}>{streamID}</button> },
+    { label: "First", render: (streamID) => stats.get(streamID)?.first_seq ?? "-" },
+    { label: "Next", render: (streamID) => stats.get(streamID)?.next_seq ?? "-" },
+    { label: "Trimmed", render: (streamID) => stats.get(streamID)?.trimmed_before_seq ?? "-" },
+    { label: "Compactable", render: (streamID) => stats.get(streamID)?.compactable_records ?? 0 }
+  ]} />;
+}
+
+function LogRecordTable({ rows }: { rows: LogRecord[] }) {
+  return <Table rows={rows} empty="No records" columns={[
+    { label: "Seq", render: (row) => row.seq },
+    { label: "Event", render: (row) => row.event_type || "-" },
+    { label: "Idempotency", render: (row) => row.idempotency_key || "-" },
+    { label: "Timestamp", render: (row) => formatTime(row.timestamp_ms) },
+    { label: "CRC32", render: (row) => row.crc32 ?? "-" },
+    { label: "Payload", render: (row) => <code className="payload-cell">{payloadPreview(row)}</code> }
+  ]} />;
+}
+
+function StreamStatsPanel({ stats }: { stats?: StreamStats | null }) {
+  if (!stats) return <div className="empty">No stream stats</div>;
+  return <DetailGrid items={[
+    ["First seq", stats.first_seq],
+    ["Next seq", stats.next_seq],
+    ["Trimmed before", stats.trimmed_before_seq],
+    ["Compactable records", stats.compactable_records],
+    ["Compactable bytes", stats.compactable_bytes]
+  ]} />;
+}
 function Table<T>({ rows, columns, empty }: { rows: T[]; columns: Column<T>[]; empty: string }) {
   if (!rows.length) return <div className="empty">{empty}</div>;
   return (
@@ -810,21 +894,31 @@ function DetailGrid({ items }: { items: Array<[string, ReactNode]> }) {
 
 function Dag({ steps }: { steps: NonNullable<Workflow["steps"]> }) {
   if (!steps.length) return <div className="empty">No steps</div>;
+  const edges = steps.flatMap((step) => (step.depends_on ?? []).map((dependency) => ({ dependency, step: step.step_id })));
   return (
-    <div className="dag">
-      {steps.map((step, index) => (
-        <div className="dag-piece" key={step.step_id}>
-          {index > 0 && <span className="dag-arrow">{"->"}</span>}
-          <div className="dag-node">
+    <div className="dag-layout">
+      <div className="dag">
+        {steps.map((step) => (
+          <div className="dag-node" key={step.step_id}>
             <strong>{step.step_id}</strong>
+            <span className="subtle">{step.depends_on?.length ? `after ${step.depends_on.join(", ")}` : "root"}</span>
             <StatusBadge value={step.status} />
           </div>
-        </div>
-      ))}
+        ))}
+      </div>
+      <div className="dag-edges">
+        {edges.length ? edges.map((edge) => <span key={`${edge.dependency}->${edge.step}`}>{edge.dependency} -&gt; {edge.step}</span>) : <span>No dependencies</span>}
+      </div>
     </div>
   );
 }
 
+function payloadPreview(record: LogRecord) {
+  if (record.payload_json !== undefined) return JSON.stringify(record.payload_json);
+  if (record.payload_text !== undefined) return record.payload_text;
+  if (record.payload_base64 !== undefined) return `base64:${record.payload_base64}`;
+  return "-";
+}
 function formatTime(value?: number) {
   if (!value) return "-";
   return new Date(value).toLocaleString();

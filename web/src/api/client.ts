@@ -1,4 +1,4 @@
-import type { Actor, Dashboard, LLMTrace, ModelInfo, Task, Worker, Workflow } from "../types/logserve";
+import type { Actor, Dashboard, LLMTrace, LogStreamDetail, LogStreamsResponse, ModelInfo, Task, Worker, Workflow } from "../types/logserve";
 
 export class APIError extends Error {
   code: string;
@@ -83,5 +83,11 @@ export const api = {
   submitLLM: (payload: unknown) => apiFetch<LLMTrace>("/api/llm", { method: "POST", json: payload }),
   replayLLM: (taskID: string) => apiFetch<LLMTrace>(`/api/llm/${encodeURIComponent(taskID)}/replay`, { method: "POST" }),
   workers: () => apiFetch<{ workers: Worker[] }>("/api/workers"),
+  logStreams: (prefix = "") => {
+    const query = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
+    return apiFetch<LogStreamsResponse>(`/api/logs/streams${query}`);
+  },
+  logStream: (streamID: string, fromSeq = 1, limit = 100) =>
+    apiFetch<LogStreamDetail>(`/api/logs/streams/${encodeURIComponent(streamID)}?from_seq=${fromSeq}&limit=${limit}`),
   setSchedulingPolicy: (policy: string) => apiFetch<{ policy: string }>("/api/admin/scheduling-policy", { method: "POST", json: { policy } })
 };

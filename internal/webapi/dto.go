@@ -59,6 +59,7 @@ type WorkflowDTO struct {
 
 type StepDTO struct {
 	StepID        string          `json:"step_id"`
+	DependsOn     []string        `json:"depends_on,omitempty"`
 	TaskName      string          `json:"task_name,omitempty"`
 	Status        string          `json:"status"`
 	Attempts      uint32          `json:"attempts,omitempty"`
@@ -302,6 +303,7 @@ func workflowStatusDTO(resp *logservepb.GetWorkflowStatusResponse) WorkflowDTO {
 func stepDTO(step *logservepb.WorkflowStepState) StepDTO {
 	return StepDTO{
 		StepID:        step.GetStepId(),
+		DependsOn:     append([]string(nil), step.GetDependsOn()...),
 		TaskName:      step.GetTaskName(),
 		Status:        workflowStepStatusString(step.GetStatus()),
 		Attempts:      step.GetAttempts(),

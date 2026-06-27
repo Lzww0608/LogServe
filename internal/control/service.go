@@ -1296,12 +1296,21 @@ func taskStatusResponse(task metadata.Task) *logservepb.GetTaskStatusResponse {
 	}
 }
 
+func workflowStepDependsOn(def workflow.Definition, stepID string) []string {
+	step, ok := workflow.StepDefinitionByID(def, stepID)
+	if !ok || len(step.DependsOn) == 0 {
+		return nil
+	}
+	return append([]string(nil), step.DependsOn...)
+}
+
 func workflowStatusResponse(state workflow.State) *logservepb.GetWorkflowStatusResponse {
 	stepStates := state.StepStatesInOrder()
 	steps := make([]*logservepb.WorkflowStepState, 0, len(stepStates))
 	for _, step := range stepStates {
 		steps = append(steps, &logservepb.WorkflowStepState{
 			StepId:        step.StepID,
+			DependsOn:     workflowStepDependsOn(state.Definition, step.StepID),
 			TaskName:      step.TaskName,
 			Status:        step.Status,
 			Attempts:      step.Attempts,
