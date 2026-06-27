@@ -441,6 +441,14 @@ th {
   overflow-wrap: anywhere;
 }
 
+.hash-cell,
+.actions-cell {
+  white-space: normal;
+}
+
+.table-actions {
+  min-width: 230px;
+}
 .empty {
   color: var(--muted);
   padding: 18px 0;

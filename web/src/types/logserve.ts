@@ -85,6 +85,43 @@ export interface Worker {
   last_heartbeat_ms?: number;
 }
 
+export interface MetadataMaterializerStats {
+  mode?: string;
+  pending_deltas?: number;
+  queued_deltas?: number;
+  batch_max?: number;
+  flush_interval_ms?: number;
+  flush_count?: number;
+  flush_error_count?: number;
+  last_flush_at_ms?: number;
+  last_success_at_ms?: number;
+  last_error_at_ms?: number;
+  last_flush_duration_ms?: number;
+  last_flush_deltas?: number;
+  last_error?: string;
+  eventual_lag_estimate_ms?: number;
+}
+
+export interface FunctionRegistryEntry {
+  function_hash: string;
+  source_ref: string;
+  entrypoint: string;
+  language: string;
+  timestamp_ms?: number;
+}
+export interface BackpressureConfig {
+  queue_high_watermark: number;
+  redelivery_timeout_ms: number;
+  log_append_slow_ms: number;
+}
+
+export interface AdminConfig extends BackpressureConfig {
+  scheduling_policy: string;
+  metadata_materializer?: MetadataMaterializerStats | null;
+  compactable_log_records: number;
+  compactable_log_bytes: number;
+}
+
 export interface Dashboard {
   queue_depth: number;
   queue_high_watermark: number;
@@ -99,15 +136,7 @@ export interface Dashboard {
   log_append_slow_ms: number;
   compactable_log_records: number;
   compactable_log_bytes: number;
-  metadata_materializer?: {
-    mode?: string;
-    pending_deltas?: number;
-    queued_deltas?: number;
-    flush_count?: number;
-    flush_error_count?: number;
-    eventual_lag_estimate_ms?: number;
-    last_error?: string;
-  };
+  metadata_materializer?: MetadataMaterializerStats | null;
 }
 
 export interface LLMTrace {

@@ -18,16 +18,18 @@ import (
 )
 
 type fakeClientConn struct {
-	dashboard      *logservepb.DashboardSnapshot
-	taskStatus     *logservepb.GetTaskStatusResponse
-	submitTask     *logservepb.SubmitTaskResponse
-	streams        *logservepb.ListStreamsResponse
-	readLog        *logservepb.ReadLogResponse
-	stats          *logservepb.GetStreamStatsResponse
-	listStreamsReq *logservepb.ListStreamsRequest
-	readLogReq     *logservepb.ReadLogRequest
-	statsReqs      []*logservepb.GetStreamStatsRequest
-	calls          []string
+	dashboard          *logservepb.DashboardSnapshot
+	taskStatus         *logservepb.GetTaskStatusResponse
+	submitTask         *logservepb.SubmitTaskResponse
+	streams            *logservepb.ListStreamsResponse
+	readLog            *logservepb.ReadLogResponse
+	stats              *logservepb.GetStreamStatsResponse
+	listStreamsReq     *logservepb.ListStreamsRequest
+	readLogReq         *logservepb.ReadLogRequest
+	readLogReqs        []*logservepb.ReadLogRequest
+	statsReqs          []*logservepb.GetStreamStatsRequest
+	setBackpressureReq *logservepb.SetBackpressureRequest
+	calls              []string
 }
 
 func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply any, _ ...grpc.CallOption) error {
@@ -60,6 +62,26 @@ func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply
 			proto.Merge(out, f.submitTask)
 		}
 		return nil
+	case logservepb.ControlService_SetBackpressure_FullMethodName:
+		in, ok := req.(*logservepb.SetBackpressureRequest)
+		if !ok {
+			return errors.New("unexpected set backpressure request type")
+		}
+		out, ok := reply.(*logservepb.SetBackpressureResponse)
+		if !ok {
+			return errors.New("unexpected set backpressure reply type")
+		}
+		f.setBackpressureReq = proto.Clone(in).(*logservepb.SetBackpressureRequest)
+		out.QueueHighWatermark = in.GetQueueHighWatermark()
+		out.RedeliveryTimeoutMs = in.GetRedeliveryTimeoutMs()
+		out.LogAppendSlowMs = in.GetLogAppendSlowMs()
+		if f.dashboard == nil {
+			f.dashboard = &logservepb.DashboardSnapshot{}
+		}
+		f.dashboard.QueueHighWatermark = out.GetQueueHighWatermark()
+		f.dashboard.RedeliveryTimeoutMs = out.GetRedeliveryTimeoutMs()
+		f.dashboard.LogAppendSlowMs = out.GetLogAppendSlowMs()
+		return nil
 	case logservepb.LogService_ListStreams_FullMethodName:
 		if in, ok := req.(*logservepb.ListStreamsRequest); ok {
 			f.listStreamsReq = proto.Clone(in).(*logservepb.ListStreamsRequest)
@@ -73,15 +95,30 @@ func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply
 		}
 		return nil
 	case logservepb.LogService_ReadLog_FullMethodName:
-		if in, ok := req.(*logservepb.ReadLogRequest); ok {
+		in, ok := req.(*logservepb.ReadLogRequest)
+		if ok {
 			f.readLogReq = proto.Clone(in).(*logservepb.ReadLogRequest)
+			f.readLogReqs = append(f.readLogReqs, proto.Clone(in).(*logservepb.ReadLogRequest))
 		}
 		out, ok := reply.(*logservepb.ReadLogResponse)
 		if !ok {
 			return errors.New("unexpected read log reply type")
 		}
 		if f.readLog != nil {
-			proto.Merge(out, f.readLog)
+			limit := int(in.GetLimit())
+			if limit <= 0 {
+				limit = len(f.readLog.GetRecords())
+			}
+			fromSeq := in.GetFromSeq()
+			for _, record := range f.readLog.GetRecords() {
+				if record.GetSeq() < fromSeq {
+					continue
+				}
+				out.Records = append(out.Records, proto.Clone(record).(*logservepb.LogRecord))
+				if len(out.Records) >= limit {
+					break
+				}
+			}
 		}
 		return nil
 	case logservepb.LogService_GetStreamStats_FullMethodName:
@@ -119,7 +156,8 @@ func newTestServer(conn *fakeClientConn, token string, allowUnauthenticated bool
 			Control: logservepb.NewControlServiceClient(conn),
 			Log:     logservepb.NewLogServiceClient(conn),
 		},
-		mux: http.NewServeMux(),
+		mux:                   http.NewServeMux(),
+		functionRegistryCache: newFunctionRegistryCache(),
 	}
 	s.registerRoutes()
 	return s
@@ -413,6 +451,364 @@ func TestLogExplorerDoesNotDoubleDecodeStreamID(t *testing.T) {
 	}
 }
 
+func TestListFunctionsFromRegistryStream(t *testing.T) {
+	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{
+		{
+			StreamId:    "system:functions",
+			Seq:         1,
+			EventType:   "TaskSubmitted",
+			Payload:     []byte(`{"task_id":"task-1"}`),
+			TimestampMs: 1000,
+		},
+		{
+			StreamId:    "system:functions",
+			Seq:         2,
+			EventType:   "FunctionRegistered",
+			Payload:     []byte(`{"function_hash":"sha256:old","source_ref":"s3://functions/old.py","entrypoint":"module:old","language":"python","timestamp_ms":2000}`),
+			TimestampMs: 2000,
+		},
+		{
+			StreamId:    "system:functions",
+			Seq:         3,
+			EventType:   "FunctionRegistered",
+			Payload:     []byte(`{"function_hash":"sha256:new","source_ref":"s3://functions/new.py","entrypoint":"module:new","language":"python"}`),
+			TimestampMs: 3000,
+		},
+		{
+			StreamId:    "system:functions",
+			Seq:         4,
+			EventType:   "FunctionRegistered",
+			Payload:     []byte(`{"function_hash":"sha256:old","source_ref":"s3://functions/old-v2.py","entrypoint":"module:old","language":"python","timestamp_ms":4000}`),
+			TimestampMs: 4000,
+		},
+	}}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/functions", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Functions []FunctionDTO `json:"functions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode functions response: %v", err)
+	}
+	if len(payload.Functions) != 2 {
+		t.Fatalf("functions length = %d, payload %+v", len(payload.Functions), payload.Functions)
+	}
+	if payload.Functions[0].FunctionHash != "sha256:old" || payload.Functions[0].SourceRef != "s3://functions/old-v2.py" {
+		t.Fatalf("first function = %+v, want latest old registration", payload.Functions[0])
+	}
+	if payload.Functions[1].FunctionHash != "sha256:new" || payload.Functions[1].TimestampMs != 3000 {
+		t.Fatalf("second function = %+v, want timestamp fallback from log record", payload.Functions[1])
+	}
+	if conn.readLogReq.GetStreamId() != "system:functions" || conn.readLogReq.GetFromSeq() != 1 || conn.readLogReq.GetLimit() != maxLogReadLimit {
+		t.Fatalf("read registry request = %+v", conn.readLogReq)
+	}
+}
+
+func TestFunctionRegistryCachesAndTailsRecords(t *testing.T) {
+	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
+		StreamId:    "system:functions",
+		Seq:         1,
+		EventType:   "FunctionRegistered",
+		Payload:     []byte(`{"function_hash":"sha256:a","source_ref":"s3://functions/a.py","entrypoint":"module:a","language":"python","timestamp_ms":1000}`),
+		TimestampMs: 1000,
+	}, {
+		StreamId:    "system:functions",
+		Seq:         2,
+		EventType:   "FunctionRegistered",
+		Payload:     []byte(`{"function_hash":"sha256:b","source_ref":"s3://functions/b.py","entrypoint":"module:b","language":"python","timestamp_ms":2000}`),
+		TimestampMs: 2000,
+	}}}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/functions", nil)
+	firstReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(first, firstReq)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body %s", first.Code, first.Body.String())
+	}
+
+	conn.readLog.Records = append(conn.readLog.Records, &logservepb.LogRecord{
+		StreamId:    "system:functions",
+		Seq:         3,
+		EventType:   "FunctionRegistered",
+		Payload:     []byte(`{"function_hash":"sha256:c","source_ref":"s3://functions/c.py","entrypoint":"module:c","language":"python","timestamp_ms":3000}`),
+		TimestampMs: 3000,
+	})
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/functions", nil)
+	secondReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(second, secondReq)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body %s", second.Code, second.Body.String())
+	}
+	if len(conn.readLogReqs) != 2 {
+		t.Fatalf("read log request count = %d, requests %+v", len(conn.readLogReqs), conn.readLogReqs)
+	}
+	if conn.readLogReqs[0].GetFromSeq() != 1 || conn.readLogReqs[1].GetFromSeq() != 3 {
+		t.Fatalf("read log from seqs = %d, %d; want 1 then 3", conn.readLogReqs[0].GetFromSeq(), conn.readLogReqs[1].GetFromSeq())
+	}
+	var payload struct {
+		Functions []FunctionDTO `json:"functions"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if len(payload.Functions) != 3 || payload.Functions[0].FunctionHash != "sha256:c" {
+		t.Fatalf("second functions = %+v, want cached a/b plus tailed c first", payload.Functions)
+	}
+}
+
+func TestListFunctionsSkipsMalformedRegistryRecord(t *testing.T) {
+	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
+		StreamId:  "system:functions",
+		Seq:       1,
+		EventType: "FunctionRegistered",
+		Payload:   []byte(`{"function_hash":`),
+	}, {
+		StreamId:    "system:functions",
+		Seq:         2,
+		EventType:   "FunctionRegistered",
+		Payload:     []byte(`{"function_hash":"sha256:valid","source_ref":"s3://functions/valid.py","entrypoint":"module:valid","language":"python"}`),
+		TimestampMs: 2000,
+	}}}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/functions", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Functions      []FunctionDTO `json:"functions"`
+		InvalidRecords uint64        `json:"invalid_records"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode functions response: %v", err)
+	}
+	if payload.InvalidRecords != 1 {
+		t.Fatalf("invalid_records = %d, want 1", payload.InvalidRecords)
+	}
+	if len(payload.Functions) != 1 || payload.Functions[0].FunctionHash != "sha256:valid" {
+		t.Fatalf("functions = %+v, want valid record only", payload.Functions)
+	}
+}
+func TestGetFunctionByHash(t *testing.T) {
+	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
+		StreamId:    "system:functions",
+		Seq:         1,
+		EventType:   "FunctionRegistered",
+		Payload:     []byte(`{"function_hash":"sha256:abc","source_ref":"s3://functions/abc.py","entrypoint":"module:add","language":"python","timestamp_ms":1234}`),
+		TimestampMs: 1234,
+	}}}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/functions/sha256%3Aabc", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	var function FunctionDTO
+	if err := json.Unmarshal(resp.Body.Bytes(), &function); err != nil {
+		t.Fatalf("decode function response: %v", err)
+	}
+	if function.FunctionHash != "sha256:abc" || function.SourceRef != "s3://functions/abc.py" || function.Entrypoint != "module:add" || function.Language != "python" {
+		t.Fatalf("function response = %+v", function)
+	}
+}
+
+func TestGetFunctionReturnsNotFound(t *testing.T) {
+	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
+		StreamId:  "system:functions",
+		Seq:       1,
+		EventType: "FunctionRegistered",
+		Payload:   []byte(`{"function_hash":"sha256:abc","source_ref":"s3://functions/abc.py","entrypoint":"module:add","language":"python"}`),
+	}}}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/functions/sha256%3Amissing", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestListFunctionsRequiresToken(t *testing.T) {
+	conn := &fakeClientConn{}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/functions", nil))
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	if len(conn.calls) != 0 {
+		t.Fatalf("unauthorized request reached backend: %v", conn.calls)
+	}
+}
+func TestAdminConfigExposesBackpressureFields(t *testing.T) {
+	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{
+		SchedulingPolicy:      logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE,
+		QueueHighWatermark:    1024,
+		RedeliveryTimeoutMs:   30000,
+		LogAppendSlowMs:       100,
+		CompactableLogRecords: 11,
+		CompactableLogBytes:   4096,
+		MetadataMaterializer: &logservepb.MetadataMaterializerStats{
+			Mode:                  "async",
+			PendingDeltas:         2,
+			EventualLagEstimateMs: 7,
+		},
+	}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/config", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	for _, want := range []string{
+		`"scheduling_policy":"LOCALITY_AWARE"`,
+		`"queue_high_watermark":1024`,
+		`"redelivery_timeout_ms":30000`,
+		`"log_append_slow_ms":100`,
+		`"compactable_log_records":11`,
+		`"compactable_log_bytes":4096`,
+		`"metadata_materializer":{"mode":"async"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("admin config missing %s: %s", want, body)
+		}
+	}
+}
+
+func TestSetBackpressureRequiresToken(t *testing.T) {
+	conn := &fakeClientConn{}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/api/admin/backpressure", strings.NewReader(`{"queue_high_watermark":1024,"redelivery_timeout_ms":30000,"log_append_slow_ms":100}`)))
+
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	if len(conn.calls) != 0 {
+		t.Fatalf("unauthorized request reached backend: %v", conn.calls)
+	}
+}
+
+func TestSetBackpressureRejectsInvalidValues(t *testing.T) {
+	cases := []string{
+		`{"queue_high_watermark":0,"redelivery_timeout_ms":30000,"log_append_slow_ms":100}`,
+		`{"queue_high_watermark":1024,"redelivery_timeout_ms":0,"log_append_slow_ms":100}`,
+		`{"queue_high_watermark":1024,"redelivery_timeout_ms":30000,"log_append_slow_ms":0}`,
+		`{"queue_high_watermark":1024,"redelivery_timeout_ms":-1,"log_append_slow_ms":100}`,
+	}
+	for _, body := range cases {
+		conn := &fakeClientConn{}
+		srv := newTestServer(conn, "secret-token", false)
+
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/backpressure", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret-token")
+		srv.Handler().ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusBadRequest {
+			t.Fatalf("body %s status = %d, response %s", body, resp.Code, resp.Body.String())
+		}
+		if conn.setBackpressureReq != nil {
+			t.Fatalf("invalid body %s reached backend: %+v", body, conn.setBackpressureReq)
+		}
+	}
+}
+
+func TestSetBackpressureUpdatesAdminConfigImmediately(t *testing.T) {
+	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{
+		SchedulingPolicy:    logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY,
+		QueueHighWatermark:  128,
+		RedeliveryTimeoutMs: 5000,
+		LogAppendSlowMs:     50,
+	}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	postResp := httptest.NewRecorder()
+	postReq := httptest.NewRequest(http.MethodPost, "/api/admin/backpressure", strings.NewReader(`{"queue_high_watermark":2048,"redelivery_timeout_ms":45000,"log_append_slow_ms":120}`))
+	postReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(postResp, postReq)
+
+	if postResp.Code != http.StatusOK {
+		t.Fatalf("post status = %d, body %s", postResp.Code, postResp.Body.String())
+	}
+	if conn.setBackpressureReq.GetQueueHighWatermark() != 2048 || conn.setBackpressureReq.GetRedeliveryTimeoutMs() != 45000 || conn.setBackpressureReq.GetLogAppendSlowMs() != 120 {
+		t.Fatalf("set backpressure request = %+v", conn.setBackpressureReq)
+	}
+
+	getResp := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "/api/admin/config", nil)
+	getReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(getResp, getReq)
+
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("get status = %d, body %s", getResp.Code, getResp.Body.String())
+	}
+	body := getResp.Body.String()
+	for _, want := range []string{`"queue_high_watermark":2048`, `"redelivery_timeout_ms":45000`, `"log_append_slow_ms":120`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("admin config after update missing %s: %s", want, body)
+		}
+	}
+}
+func TestDashboardReflectsBackpressureAfterPost(t *testing.T) {
+	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{
+		SchedulingPolicy: logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE,
+	}}
+	srv := newTestServer(conn, "secret-token", false)
+
+	postResp := httptest.NewRecorder()
+	postReq := httptest.NewRequest(http.MethodPost, "/api/admin/backpressure", strings.NewReader(`{"queue_high_watermark":4096,"redelivery_timeout_ms":60000,"log_append_slow_ms":150}`))
+	postReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(postResp, postReq)
+	if postResp.Code != http.StatusOK {
+		t.Fatalf("post status = %d, body %s", postResp.Code, postResp.Body.String())
+	}
+
+	dashboardResp := httptest.NewRecorder()
+	dashboardReq := httptest.NewRequest(http.MethodGet, "/api/dashboard", nil)
+	dashboardReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(dashboardResp, dashboardReq)
+	if dashboardResp.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d, body %s", dashboardResp.Code, dashboardResp.Body.String())
+	}
+	body := dashboardResp.Body.String()
+	for _, want := range []string{`"queue_high_watermark":4096`, `"redelivery_timeout_ms":60000`, `"log_append_slow_ms":150`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard after update missing %s: %s", want, body)
+		}
+	}
+}
 func TestStaticFallbackServesIndexForDeepLinks(t *testing.T) {
 	dir := t.TempDir()
 	index := []byte(`<!doctype html><title>LogServe Console</title><div id="root"></div>`)

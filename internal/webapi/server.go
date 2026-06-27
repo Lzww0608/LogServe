@@ -11,9 +11,10 @@ import (
 )
 
 type Server struct {
-	cfg     Config
-	clients *Clients
-	mux     *http.ServeMux
+	cfg                   Config
+	clients               *Clients
+	mux                   *http.ServeMux
+	functionRegistryCache *functionRegistryCache
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -26,9 +27,10 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:     cfg,
-		clients: clients,
-		mux:     http.NewServeMux(),
+		cfg:                   cfg,
+		clients:               clients,
+		mux:                   http.NewServeMux(),
+		functionRegistryCache: newFunctionRegistryCache(),
 	}
 	s.registerRoutes()
 	return s, nil
@@ -63,10 +65,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/llm", s.handleSubmitLLM)
 	s.mux.HandleFunc("POST /api/llm/{task_id}/replay", s.handleReplayLLM)
 	s.mux.HandleFunc("GET /api/workers", s.handleListWorkers)
+	s.mux.HandleFunc("GET /api/functions", s.handleListFunctions)
+	s.mux.HandleFunc("GET /api/functions/{function_hash}", s.handleGetFunction)
 	s.mux.HandleFunc("GET /api/logs/streams", s.handleListLogStreams)
 	s.mux.HandleFunc("GET /api/logs/streams/{stream_id}", s.handleReadLogStream)
 	s.mux.HandleFunc("GET /api/logs/stats", s.handleLogStats)
 	s.mux.HandleFunc("POST /api/admin/scheduling-policy", s.handleSetSchedulingPolicy)
+	s.mux.HandleFunc("POST /api/admin/backpressure", s.handleSetBackpressure)
 	s.mux.HandleFunc("GET /api/admin/config", s.handleAdminConfig)
 	s.mux.HandleFunc("/", s.handleStatic)
 }
