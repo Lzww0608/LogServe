@@ -148,9 +148,6 @@ def evaluate_result(root):
     for name in missing_or_failed(probe_checks, REQUIRED_PROBE_CHECKS):
         failures.append(f"required HTTP probe check failed or missing: {name}")
 
-    commands = {item.get("name"): item for item in summary.get("commands") or []}
-    if "package_results" not in commands:
-        warnings.append("package_results command is missing from final summary")
 
     return {
         "verdict": "FAIL" if failures else "PASS",

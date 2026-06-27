@@ -19,7 +19,7 @@ def load_module():
     return module
 
 
-def write_summary(root, run_docker=True, verdict="PASS", probe_verdict="PASS", probe_checks=None):
+def write_summary(root, run_docker=True, verdict="PASS", probe_verdict="PASS", probe_checks=None, include_package_command=True):
     if probe_checks is None:
         probe_checks = {
             "healthz_without_auth": True,
@@ -41,8 +41,9 @@ def write_summary(root, run_docker=True, verdict="PASS", probe_verdict="PASS", p
     }
     commands = [
         {"name": "go_test_web", "exit_code": 0, "duration_sec": 1, "log": "go_test_web.log"},
-        {"name": "package_results", "exit_code": 0, "duration_sec": 0, "log": "package.log"},
     ]
+    if include_package_command:
+        commands.append({"name": "package_results", "exit_code": 0, "duration_sec": 0, "log": "package.log"})
     if run_docker:
         checks.update(
             {
@@ -144,7 +145,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
             root = Path(tmp) / "result"
             root.mkdir()
-            write_summary(root)
+            write_summary(root, include_package_command=False)
             package = Path(tmp) / "console-acceptance-package.tar.gz"
             make_package(root, package)
 
@@ -152,6 +153,14 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
                 code = module.main([str(package)])
 
             self.assertEqual(0, code)
+
+            extracted, temp_dir = module.materialize_input(package)
+            try:
+                result = module.evaluate_result(extracted)
+                self.assertEqual([], result["warnings"])
+            finally:
+                if temp_dir is not None:
+                    module.shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
