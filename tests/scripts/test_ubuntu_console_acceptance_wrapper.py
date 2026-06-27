@@ -20,6 +20,10 @@ class UbuntuConsoleAcceptanceWrapperTest(unittest.TestCase):
         self.assertIn("console-acceptance-package.tar.gz", text)
         self.assertIn("--exclude './console.env'", text)
 
+        compose_up = 'run_step docker_compose_up "$RESULT_DIR/docker_compose_up.log" compose up -d postgres nats minio logd control web worker'
+        self.assertIn(compose_up + "\n      COMPOSE_STARTED=1", text)
+        self.assertNotIn(compose_up + '\n      if [ "$LAST_STEP_CODE" -eq 0 ]; then\n        COMPOSE_STARTED=1', text)
+
 
 if __name__ == "__main__":
     unittest.main()

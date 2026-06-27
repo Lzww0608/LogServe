@@ -384,9 +384,7 @@ if [ "$PREREQ_OK" -eq 1 ]; then
     fi
     if [ "$LAST_STEP_CODE" -eq 0 ]; then
       run_step docker_compose_up "$RESULT_DIR/docker_compose_up.log" compose up -d postgres nats minio logd control web worker
-      if [ "$LAST_STEP_CODE" -eq 0 ]; then
-        COMPOSE_STARTED=1
-      fi
+      COMPOSE_STARTED=1
     fi
     if [ "$COMPOSE_STARTED" -eq 1 ]; then
       run_step web_health_ready "$RESULT_DIR/web_health_ready.log" wait_web_health
