@@ -47,6 +47,10 @@ def safe_extract_tar(package_path, dest):
             target = (dest / member.name).resolve()
             if target != dest and dest not in target.parents:
                 raise ValueError(f"unsafe tar member path: {member.name}")
+            if member.issym() or member.islnk():
+                raise ValueError(f"unsafe tar link member: {member.name}")
+            if member.isdev():
+                raise ValueError(f"unsafe tar device member: {member.name}")
         archive.extractall(dest)
 
 
@@ -56,7 +60,11 @@ def materialize_input(path):
         return path, None
     if path.is_file() and path.suffixes[-2:] == [".tar", ".gz"]:
         tmp = Path(tempfile.mkdtemp(prefix="logserve-console-acceptance-"))
-        safe_extract_tar(path, tmp)
+        try:
+            safe_extract_tar(path, tmp)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
         return tmp, tmp
     raise ValueError(f"expected result directory or .tar.gz package: {path}")
 
@@ -114,6 +122,15 @@ def evaluate_result(root):
 
     run_docker = bool_config(run_config, "run_docker", False)
     if not run_docker:
+        if failures:
+            return {
+                "verdict": "FAIL",
+                "reason": "console acceptance did not match expectations",
+                "result_dir": str(root),
+                "failures": failures,
+                "warnings": warnings,
+                "summary": summary,
+            }
         return {
             "verdict": "INCOMPLETE",
             "reason": "Docker console runtime was not exercised",

@@ -97,6 +97,37 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("INCOMPLETE", result["verdict"])
             self.assertEqual("Docker console runtime was not exercised", result["reason"])
 
+    def test_lightweight_failed_local_check_is_fail(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            root = Path(tmp)
+            write_summary(root, run_docker=False)
+            summary_path = root / "acceptance_summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["verdict"] = "FAIL"
+            summary["checks"]["go_web_tests"] = False
+            summary["failed_commands"] = ["go_test_web"]
+            summary["failed_checks"] = ["go_web_tests"]
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+            result = module.evaluate_result(root)
+
+            self.assertEqual("FAIL", result["verdict"])
+            self.assertTrue(any("go_web_tests" in item for item in result["failures"]))
+
+    def test_rejects_unsafe_tar_link_member(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            package = Path(tmp) / "console-acceptance-package.tar.gz"
+            with tarfile.open(package, "w:gz") as archive:
+                link = tarfile.TarInfo("link")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "../outside"
+                archive.addfile(link)
+
+            with self.assertRaisesRegex(ValueError, "unsafe tar link member"):
+                module.materialize_input(package)
+
     def test_failed_probe_result_fails_expectations(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
