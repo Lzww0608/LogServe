@@ -1,14 +1,23 @@
-import { api } from "../api/client";
+import { useCallback, useState } from "react";
+import { parseEventData, type SSEMessage } from "../api/events";
 import { Kpi } from "../components/Kpi";
 import { ErrorPanel, Loading } from "../components/ErrorPanel";
 import { PanelTitle } from "../components/PanelTitle";
 import { TaskTable, WorkerTable, WorkflowTable } from "../components/domainTables";
-import { usePolling } from "../hooks/usePolling";
+import { useEventStream } from "../hooks/useEventStream";
+import type { Dashboard } from "../types/logserve";
 
 export function OverviewPage() {
-  const state = usePolling(() => api.dashboard(), 1000);
-  if (state.error) return <ErrorPanel message={state.error} />;
-  const dashboard = state.data;
+  const [dashboard, setDashboard] = useState<Dashboard>();
+  const [error, setError] = useState("");
+  const handleMessage = useCallback((message: SSEMessage) => {
+    if (message.event !== "dashboard") return;
+    const payload = parseEventData<{ dashboard: Dashboard }>(message);
+    setDashboard(payload.dashboard);
+    setError("");
+  }, []);
+  useEventStream({ intervalMs: 1000 }, { onMessage: handleMessage, onError: setError }, []);
+  if (error && !dashboard) return <ErrorPanel message={error} />;
   if (!dashboard) return <Loading />;
   const running = dashboard.tasks.filter((task) => task.status === "RUNNING").length;
   const queued = dashboard.tasks.filter((task) => task.status === "QUEUED").length;
@@ -17,6 +26,7 @@ export function OverviewPage() {
   const workerCapacity = dashboard.workers.reduce((sum, worker) => sum + (worker.capacity || 0), 0);
   return (
     <div className="stack">
+      {error && <ErrorPanel message={error} />}
       <div className="kpi-grid">
         <Kpi label="Queue Depth" value={dashboard.queue_depth} tone={dashboard.queue_depth >= dashboard.queue_high_watermark && dashboard.queue_high_watermark > 0 ? "bad" : "neutral"} />
         <Kpi label="Running Tasks" value={running} tone="info" />

@@ -54,6 +54,11 @@ async function apiFetch<T>(path: string, init: FetchInit = {}): Promise<T> {
   return payload as T;
 }
 
+export type TaskOperation = "retry" | "cancel" | "resubmit";
+
+export function taskActionURL(taskID: string, action: TaskOperation): string {
+  return `/api/tasks/${encodeURIComponent(taskID)}/${action}`;
+}
 function isAPIErrorPayload(value: unknown): value is { error: { code?: string; message?: string } } {
   return typeof value === "object" && value !== null && "error" in value;
 }
@@ -63,6 +68,9 @@ export const api = {
   dashboard: () => apiFetch<Dashboard>("/api/dashboard"),
   tasks: (query = "") => apiFetch<{ tasks: Task[] }>(`/api/tasks${query}`),
   task: (taskID: string) => apiFetch<Task>(`/api/tasks/${encodeURIComponent(taskID)}`),
+  retryTask: (taskID: string) => apiFetch<Task>(taskActionURL(taskID, "retry"), { method: "POST" }),
+  cancelTask: (taskID: string) => apiFetch<Task>(taskActionURL(taskID, "cancel"), { method: "POST" }),
+  resubmitTask: (taskID: string) => apiFetch<Task>(taskActionURL(taskID, "resubmit"), { method: "POST" }),
   submitTask: (payload: unknown) => apiFetch<Task>("/api/tasks", { method: "POST", json: payload }),
   workflows: () => apiFetch<{ workflows: Workflow[] }>("/api/workflows"),
   workflow: (workflowID: string) => apiFetch<Workflow>(`/api/workflows/${encodeURIComponent(workflowID)}`),

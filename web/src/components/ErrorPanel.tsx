@@ -6,6 +6,11 @@ export function InlineError({ message }: { message: string }) {
   return <div className="inline-error">{message}</div>;
 }
 
+export function FieldError({ message }: { message?: string }) {
+  if (!message) return null;
+  return <span className="field-error">{message}</span>;
+}
+
 export function Loading() {
   return <section className="panel">Loading</section>;
 }

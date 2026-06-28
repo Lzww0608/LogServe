@@ -234,3 +234,8 @@ dashboard 读取 materialized view，展示 task、workflow、actor、worker、m
 - 不能说明多机生产性能。
 - 不能用 mock LLM 结果代表真实 GPU/vLLM 性能。
 - 小 checkpoint cache 探针只能证明路径正确，不能推断大模型冷启动曲线。
+## Console task 操作边界
+
+Console 支持 `POST /api/tasks/{task_id}/retry` 和 `POST /api/tasks/{task_id}/resubmit`，但第一版只面向 standalone task。它们不会修改原 task 的终态，而是从原 `TaskSubmitted` spec 创建一个新的 task。workflow step、actor command 和 LLM 派生 task 会被拒绝，因为这些任务需要各自状态机维护 DAG、mailbox 或 LLM 统计语义。
+
+`POST /api/tasks/{task_id}/cancel` 当前明确不支持。后端还没有 `CANCELLED` 状态、`TaskCancelled` log event、队列删除、worker cooperative cancellation 和 replay 语义，所以 Console 前端保持 Cancel 按钮灰态；HTTP endpoint 返回 `501` 和 `UNSUPPORTED_OPERATION`，避免出现假取消。

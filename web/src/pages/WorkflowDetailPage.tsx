@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
+import { parseEventData, type SSEMessage } from "../api/events";
 import { Dag } from "../components/Dag";
 import { DetailGrid } from "../components/DetailGrid";
 import { ErrorPanel, InlineError, Loading } from "../components/ErrorPanel";
@@ -7,19 +8,35 @@ import { JsonViewer } from "../components/JsonViewer";
 import { PanelTitle } from "../components/PanelTitle";
 import { StatusBadge } from "../components/StatusBadge";
 import { StepTable } from "../components/domainTables";
-import { usePolling } from "../hooks/usePolling";
+import { useEventStream } from "../hooks/useEventStream";
+import type { Workflow } from "../types/logserve";
+import { applyWorkflowEvent } from "../utils/eventState";
 import { formatTime } from "../utils/format";
 import { errorMessage } from "../utils/status";
 
 export function WorkflowDetailPage({ workflowID }: { workflowID: string }) {
-  const state = usePolling(() => api.workflow(workflowID), 1000, [workflowID]);
+  const [workflow, setWorkflow] = useState<Workflow>();
+  const [error, setError] = useState("");
   const [replay, setReplay] = useState<unknown>(null);
   const [message, setMessage] = useState("");
-  if (state.error) return <ErrorPanel message={state.error} />;
-  const workflow = state.data;
+  useEffect(() => {
+    setWorkflow(undefined);
+    setError("");
+    setReplay(null);
+    setMessage("");
+  }, [workflowID]);
+  const handleMessage = useCallback((event: SSEMessage) => {
+    if (event.event !== "workflow") return;
+    const payload = parseEventData<{ workflow: Workflow }>(event);
+    setWorkflow((current) => applyWorkflowEvent(current, payload.workflow));
+    setError("");
+  }, []);
+  useEventStream({ stream: `wf:${workflowID}`, intervalMs: 1000 }, { onMessage: handleMessage, onError: setError }, [workflowID]);
+  if (error && !workflow) return <ErrorPanel message={error} />;
   if (!workflow) return <Loading />;
   return (
     <div className="stack">
+      {error && <ErrorPanel message={error} />}
       <section className="panel">
         <PanelTitle title={workflow.workflow_name || workflow.workflow_id} action={<StatusBadge value={workflow.status} />} />
         <DetailGrid items={[

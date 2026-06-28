@@ -1,21 +1,71 @@
-import { api } from "../api/client";
+import { useCallback, useEffect, useState } from "react";
+import { api, type TaskOperation } from "../api/client";
+import { parseEventData, type SSEMessage } from "../api/events";
 import { DetailGrid } from "../components/DetailGrid";
-import { ErrorPanel, Loading } from "../components/ErrorPanel";
+import { ErrorPanel, InlineError, Loading } from "../components/ErrorPanel";
 import { JsonViewer } from "../components/JsonViewer";
 import { PanelTitle } from "../components/PanelTitle";
 import { StatusBadge } from "../components/StatusBadge";
-import { usePolling } from "../hooks/usePolling";
+import { useEventStream } from "../hooks/useEventStream";
+import type { Task } from "../types/logserve";
+import { applyTaskEvent } from "../utils/eventState";
 import { formatTime, modelLabel } from "../utils/format";
+import { navigate } from "../utils/navigation";
+import { errorMessage } from "../utils/status";
+import { taskActionState } from "../utils/taskActions";
 
 export function TaskDetailPage({ taskID }: { taskID: string }) {
-  const state = usePolling(() => api.task(taskID), 1000, [taskID]);
-  if (state.error) return <ErrorPanel message={state.error} />;
-  const task = state.data;
+  const [task, setTask] = useState<Task>();
+  const [error, setError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [busyAction, setBusyAction] = useState<TaskOperation | "">("");
+  useEffect(() => {
+    setTask(undefined);
+    setError("");
+    setActionError("");
+    setBusyAction("");
+  }, [taskID]);
+  const handleMessage = useCallback((message: SSEMessage) => {
+    if (message.event !== "task") return;
+    const payload = parseEventData<{ task: Task }>(message);
+    setTask((current) => applyTaskEvent(current, payload.task));
+    setError("");
+  }, []);
+  useEventStream({ taskID, intervalMs: 1000 }, { onMessage: handleMessage, onError: setError }, [taskID]);
+
+  const runAction = async (action: TaskOperation) => {
+    if (!task) return;
+    const state = taskActionState(task, action);
+    if (!state.enabled) {
+      setActionError(state.reason ?? "Task action is unavailable.");
+      return;
+    }
+    setBusyAction(action);
+    setActionError("");
+    try {
+      const next = action === "retry"
+        ? await api.retryTask(task.task_id)
+        : action === "resubmit"
+          ? await api.resubmitTask(task.task_id)
+          : await api.cancelTask(task.task_id);
+      setTask((current) => applyTaskEvent(current, next));
+      if ((action === "retry" || action === "resubmit") && next.task_id) {
+        navigate(`/tasks/${encodeURIComponent(next.task_id)}`);
+      }
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setBusyAction("");
+    }
+  };
+
+  if (error && !task) return <ErrorPanel message={error} />;
   if (!task) return <Loading />;
   return (
     <div className="stack">
+      {error && <ErrorPanel message={error} />}
       <section className="panel">
-        <PanelTitle title={task.task_id} action={<StatusBadge value={task.status} />} />
+        <PanelTitle title={task.task_id} action={<TaskActions task={task} busyAction={busyAction} onRun={runAction} />} />
         <DetailGrid items={[
           ["Worker", task.worker_id],
           ["Created", formatTime(task.created_at_ms)],
@@ -24,6 +74,7 @@ export function TaskDetailPage({ taskID }: { taskID: string }) {
           ["Actor", task.actor_id],
           ["Model", modelLabel(task)]
         ]} />
+        {actionError && <InlineError message={actionError} />}
       </section>
       {task.error && <ErrorPanel message={task.error} />}
       <section className="panel">
@@ -32,4 +83,47 @@ export function TaskDetailPage({ taskID }: { taskID: string }) {
       </section>
     </div>
   );
+}
+
+function TaskActions({ task, busyAction, onRun }: { task: Task; busyAction: TaskOperation | ""; onRun: (action: TaskOperation) => void }) {
+  return (
+    <div className="task-header-actions">
+      <StatusBadge value={task.status} />
+      <div className="button-row task-action-row">
+        {(["retry", "resubmit", "cancel"] as TaskOperation[]).map((action) => (
+          <TaskActionButton key={action} task={task} action={action} busyAction={busyAction} onRun={onRun} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TaskActionButton({ task, action, busyAction, onRun }: { task: Task; action: TaskOperation; busyAction: TaskOperation | ""; onRun: (action: TaskOperation) => void }) {
+  const state = taskActionState(task, action);
+  const busy = busyAction === action;
+  const disabled = !state.enabled || busyAction !== "";
+  return (
+    <span className="task-action-control" title={state.reason ?? undefined}>
+      <button
+        type="button"
+        className={action === "retry" ? "primary" : "ghost"}
+        disabled={disabled}
+        aria-label={state.reason ? `${taskActionLabel(action)}: ${state.reason}` : taskActionLabel(action)}
+        onClick={() => onRun(action)}
+      >
+        {busy ? "Working" : taskActionLabel(action)}
+      </button>
+    </span>
+  );
+}
+
+function taskActionLabel(action: TaskOperation): string {
+  switch (action) {
+    case "retry":
+      return "Retry";
+    case "resubmit":
+      return "Resubmit";
+    case "cancel":
+      return "Cancel";
+  }
 }

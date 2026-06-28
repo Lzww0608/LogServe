@@ -1,14 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { parseEventData, type SSEMessage } from "../api/events";
 import { InlineError } from "../components/ErrorPanel";
 import { PanelTitle } from "../components/PanelTitle";
 import { LogRecordTable, LogStreamTable, StreamStatsPanel } from "../components/domainTables";
+import { useEventStream } from "../hooks/useEventStream";
 import { usePolling } from "../hooks/usePolling";
 import type { LogStreamDetail } from "../types/logserve";
+import { applyLogRecordsEvent, type LogRecordsEvent } from "../utils/eventState";
 
 export function LogsPage() {
   const [prefix, setPrefix] = useState("system:");
   const [selectedStream, setSelectedStream] = useState("");
+  const [detail, setDetail] = useState<LogStreamDetail>();
+  const [detailError, setDetailError] = useState("");
   const streamsState = usePolling(() => api.logStreams(prefix.trim()), 2000, [prefix]);
 
   useEffect(() => {
@@ -22,17 +27,28 @@ export function LogsPage() {
     }
   }, [streamsState.data, selectedStream]);
 
-  const detailState = usePolling<LogStreamDetail>(() => {
-    if (!selectedStream) {
-      return Promise.resolve({ stream_id: "", from_seq: 1, limit: 100, records: [], stats: null });
-    }
-    return api.logStream(selectedStream, 1, 100);
-  }, 2000, [selectedStream]);
+  useEffect(() => {
+    setDetailError("");
+    setDetail(selectedStream ? { stream_id: selectedStream, from_seq: 1, limit: 100, records: [], stats: null } : undefined);
+  }, [selectedStream]);
+
+  const handleLogEvent = useCallback((message: SSEMessage) => {
+    if (message.event !== "log_records") return;
+    const payload = parseEventData<LogRecordsEvent>(message);
+    setDetail((current) => applyLogRecordsEvent(current, payload));
+    setDetailError("");
+  }, []);
+  useEventStream(
+    { stream: selectedStream, fromSeq: 1, limit: 100, intervalMs: 1000, records: true, enabled: Boolean(selectedStream) },
+    { onMessage: handleLogEvent, onError: setDetailError },
+    [selectedStream]
+  );
 
   const statsByStream = useMemo(() => {
     const entries = streamsState.data?.stats ?? [];
     return new Map(entries.map((item) => [item.stream_id, item]));
   }, [streamsState.data]);
+  const stats = detail?.stats ?? statsByStream.get(selectedStream);
 
   return (
     <div className="stack">
@@ -49,9 +65,9 @@ export function LogsPage() {
       </section>
       <section className="panel">
         <PanelTitle title={selectedStream || "Stream Detail"} />
-        {detailState.error && <InlineError message={detailState.error} />}
-        <StreamStatsPanel stats={detailState.data?.stats ?? statsByStream.get(selectedStream)} />
-        <LogRecordTable rows={detailState.data?.records ?? []} />
+        {detailError && <InlineError message={detailError} />}
+        <StreamStatsPanel stats={stats} />
+        <LogRecordTable rows={detail?.records ?? []} />
       </section>
     </div>
   );

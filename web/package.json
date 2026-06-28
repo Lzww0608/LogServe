@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test:forms": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --outDir .tmp-form-tests --rootDir . src/utils/formValidation.ts && node --test tests/formValidation.test.mjs",
+    "test:events": "tsc --target ES2022 --module ES2022 --moduleResolution Bundler --strict --skipLibCheck --outDir .tmp-event-tests --rootDir . src/api/events.ts src/utils/eventState.ts && node --test tests/events.test.mjs",
+    "test:task-actions": "tsc --target ES2022 --module ES2022 --moduleResolution Bundler --strict --skipLibCheck --outDir .tmp-task-action-tests --rootDir . src/api/client.ts src/utils/taskActions.ts && node --test tests/taskActions.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -41,4 +41,7 @@ reports/**/server_environment.txt
 # Web console dependencies and build output
 web/node_modules/
 web/dist/
+web/.tmp-form-tests/
 *.tsbuildinfo
+web/.tmp-event-tests/
+web/.tmp-task-action-tests/

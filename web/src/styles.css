@@ -97,6 +97,21 @@ textarea.short {
   min-height: 78px;
 }
 
+
+.input-invalid,
+input[aria-invalid="true"],
+textarea[aria-invalid="true"],
+select[aria-invalid="true"] {
+  border-color: var(--bad);
+  outline-color: var(--bad);
+}
+
+.field-error {
+  color: var(--bad);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 a {
   color: var(--accent-dark);
   text-decoration: none;
@@ -488,4 +503,19 @@ th {
   .topbar {
     align-items: flex-start;
   }
+}
+.task-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.task-action-row {
+  gap: 6px;
+}
+
+.task-action-control {
+  display: inline-flex;
 }

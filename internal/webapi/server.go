@@ -47,9 +47,13 @@ func (s *Server) Close() error {
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
+	s.mux.HandleFunc("GET /api/events", s.handleEvents)
 	s.mux.HandleFunc("GET /api/tasks", s.handleListTasks)
 	s.mux.HandleFunc("POST /api/tasks", s.handleSubmitTask)
 	s.mux.HandleFunc("GET /api/tasks/{task_id}", s.handleGetTask)
+	s.mux.HandleFunc("POST /api/tasks/{task_id}/retry", s.handleRetryTask)
+	s.mux.HandleFunc("POST /api/tasks/{task_id}/cancel", s.handleCancelTask)
+	s.mux.HandleFunc("POST /api/tasks/{task_id}/resubmit", s.handleResubmitTask)
 	s.mux.HandleFunc("GET /api/workflows", s.handleListWorkflows)
 	s.mux.HandleFunc("POST /api/workflows", s.handleSubmitWorkflow)
 	s.mux.HandleFunc("POST /api/workflows/validate", s.handleValidateWorkflow)
