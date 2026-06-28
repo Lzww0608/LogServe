@@ -2,7 +2,7 @@ import type { Actor, FunctionRegistryEntry, LogRecord, ModelInfo, StreamStats, T
 import { formatTime, modelLabel, payloadPreview, submitTaskURLForFunction } from "../utils/format";
 import { DetailGrid } from "./DetailGrid";
 import { StatusBadge } from "./StatusBadge";
-import { Table } from "./Table";
+import { Table, type TablePagination } from "./Table";
 
 export function FunctionTable({ rows, onCopy }: { rows: FunctionRegistryEntry[]; onCopy: (functionHash: string) => void }) {
   return <Table rows={rows} empty="No functions" columns={[
@@ -18,8 +18,8 @@ export function FunctionTable({ rows, onCopy }: { rows: FunctionRegistryEntry[];
   ]} />;
 }
 
-export function TaskTable({ rows }: { rows: Task[] }) {
-  return <Table rows={rows} empty="No tasks" columns={[
+export function TaskTable({ rows, pagination }: { rows: Task[]; pagination?: TablePagination }) {
+  return <Table rows={rows} empty="No tasks" pagination={pagination} columns={[
     { label: "Task", render: (row) => <a data-nav href={`/tasks/${row.task_id}`}>{row.task_id}</a> },
     { label: "Name", render: (row) => row.task_name || "-" },
     { label: "Status", render: (row) => <StatusBadge value={row.status} /> },
@@ -30,8 +30,8 @@ export function TaskTable({ rows }: { rows: Task[] }) {
   ]} />;
 }
 
-export function WorkflowTable({ rows }: { rows: Workflow[] }) {
-  return <Table rows={rows} empty="No workflows" columns={[
+export function WorkflowTable({ rows, pagination }: { rows: Workflow[]; pagination?: TablePagination }) {
+  return <Table rows={rows} empty="No workflows" pagination={pagination} columns={[
     { label: "Workflow", render: (row) => <a data-nav href={`/workflows/${row.workflow_id}`}>{row.workflow_name || row.workflow_id}</a> },
     { label: "Status", render: (row) => <StatusBadge value={row.status} /> },
     { label: "Steps", render: (row) => row.step_count ?? row.steps?.length ?? 0 },
@@ -92,8 +92,8 @@ export function LogStreamTable({ streamIDs, stats, selected, onSelect }: { strea
   ]} />;
 }
 
-export function LogRecordTable({ rows }: { rows: LogRecord[] }) {
-  return <Table rows={rows} empty="No records" columns={[
+export function LogRecordTable({ rows, pagination }: { rows: LogRecord[]; pagination?: TablePagination }) {
+  return <Table rows={rows} empty="No records" pagination={pagination} columns={[
     { label: "Seq", render: (row) => row.seq },
     { label: "Event", render: (row) => row.event_type || "-" },
     { label: "Idempotency", render: (row) => row.idempotency_key || "-" },

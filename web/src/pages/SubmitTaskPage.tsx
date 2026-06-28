@@ -42,7 +42,7 @@ export function SubmitTaskPage() {
     function_name: functionName,
     function_source: mode === "source" ? source : "",
     function_ref: mode === "ref" ? functionRef : "",
-    function_hash: mode === "hash" ? functionHash : "",
+    function_hash: mode === "ref" || mode === "hash" ? functionHash : "",
     args: validation.parsedArgs ?? safePreview(args),
     kwargs: validation.parsedKwargs ?? safePreview(kwargs),
     idempotency_key: idempotencyKey
@@ -62,7 +62,7 @@ export function SubmitTaskPage() {
         task_name: taskName.trim(),
         function_name: functionName.trim(),
         function_ref: mode === "ref" ? functionRef.trim() : "",
-        function_hash: mode === "hash" ? functionHash.trim() : "",
+        function_hash: mode === "ref" || mode === "hash" ? functionHash.trim() : "",
         args: validation.parsedArgs ?? [],
         kwargs: validation.parsedKwargs ?? {}
       });
@@ -85,7 +85,7 @@ export function SubmitTaskPage() {
           </select></label>
           <label>Task name<input value={taskName} onChange={(event) => setTaskName(event.target.value)} aria-invalid={Boolean(validation.errors.taskName)} className={validation.errors.taskName ? "input-invalid" : undefined} /><FieldError message={validation.errors.taskName} /></label>
           <label>Function name<input value={functionName} onChange={(event) => setFunctionName(event.target.value)} aria-invalid={Boolean(validation.errors.functionName)} className={validation.errors.functionName ? "input-invalid" : undefined} /><FieldError message={validation.errors.functionName} /></label>
-          {mode === "ref" && <label>Function ref<input value={functionRef} onChange={(event) => setFunctionRef(event.target.value)} aria-invalid={Boolean(validation.errors.functionRef)} className={validation.errors.functionRef ? "input-invalid" : undefined} /><FieldError message={validation.errors.functionRef} /></label>}
+          {mode === "ref" && <div className="workflow-subgrid"><label>Function ref<input value={functionRef} onChange={(event) => setFunctionRef(event.target.value)} aria-invalid={Boolean(validation.errors.functionRef)} className={validation.errors.functionRef ? "input-invalid" : undefined} /><FieldError message={validation.errors.functionRef} /></label><label>Function hash<input value={functionHash} onChange={(event) => setFunctionHash(event.target.value)} aria-invalid={Boolean(validation.errors.functionHash)} className={validation.errors.functionHash ? "input-invalid" : undefined} /><FieldError message={validation.errors.functionHash} /></label></div>}
           {mode === "hash" && <label>Function hash<input value={functionHash} onChange={(event) => setFunctionHash(event.target.value)} aria-invalid={Boolean(validation.errors.functionHash)} className={validation.errors.functionHash ? "input-invalid" : undefined} /><FieldError message={validation.errors.functionHash} /></label>}
           <label>Args JSON<textarea className={`short${validation.errors.args ? " input-invalid" : ""}`} value={args} onChange={(event) => setArgs(event.target.value)} aria-invalid={Boolean(validation.errors.args)} /><FieldError message={validation.errors.args} /></label>
           <label>Kwargs JSON<textarea className={`short${validation.errors.kwargs ? " input-invalid" : ""}`} value={kwargs} onChange={(event) => setKwargs(event.target.value)} aria-invalid={Boolean(validation.errors.kwargs)} /><FieldError message={validation.errors.kwargs} /></label>

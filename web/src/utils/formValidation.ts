@@ -41,6 +41,12 @@ export interface WorkflowFormValidation {
   parsedDefinition?: unknown;
 }
 
+export interface WorkflowDefinitionAnalysis {
+  valid: boolean;
+  errors: string[];
+  order: string[];
+}
+
 export interface ArgsFormValidation {
   valid: boolean;
   errors: {
@@ -85,6 +91,7 @@ export function validateTaskForm(input: TaskFormInput): TaskFormValidation {
   if (!input.functionName.trim()) errors.functionName = "Function name is required.";
   if (input.mode === "source" && !input.functionSource.trim()) errors.functionSource = "Function source is required.";
   if (input.mode === "ref" && !input.functionRef.trim()) errors.functionRef = "Function ref is required.";
+  if (input.mode === "ref" && !input.functionHash.trim()) errors.functionHash = "Function hash is required with function ref.";
   if (input.mode === "hash" && !input.functionHash.trim()) errors.functionHash = "Function hash is required.";
 
   const args = parseArgsField(input.argsText);
@@ -109,10 +116,110 @@ export function validateWorkflowForm(workflowName: string, definitionText: strin
     errors.definition = "Workflow definition JSON is required.";
   } else {
     const definition = parseJSONField<unknown>("Workflow definition JSON", definitionText, {});
-    if (definition.valid) parsedDefinition = definition.value;
-    else errors.definition = definition.message;
+    if (definition.valid) {
+      parsedDefinition = definition.value;
+      const analysis = analyzeWorkflowDefinition(definition.value);
+      if (!analysis.valid) errors.definition = analysis.errors[0];
+    } else {
+      errors.definition = definition.message;
+    }
   }
   return { valid: noErrors(errors), errors, parsedDefinition };
+}
+
+export function analyzeWorkflowDefinition(definition: unknown): WorkflowDefinitionAnalysis {
+  const errors: string[] = [];
+  if (!isPlainObject(definition)) {
+    return { valid: false, errors: ["Workflow definition must be a JSON object."], order: [] };
+  }
+
+  const rawSteps = definition.steps;
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0) {
+    return { valid: false, errors: ["Workflow must contain at least one step."], order: [] };
+  }
+
+  const stepIDs: string[] = [];
+  const stepSet = new Set<string>();
+  const duplicateSet = new Set<string>();
+  const dependencies = new Map<string, string[]>();
+
+  rawSteps.forEach((rawStep, index) => {
+    if (!isPlainObject(rawStep)) {
+      errors.push(`Step ${index + 1} must be a JSON object.`);
+      return;
+    }
+
+    const stepID = stringField(rawStep.step_id);
+    const label = stepID || `step ${index + 1}`;
+    if (!stepID) {
+      errors.push(`Step ${index + 1} requires step_id.`);
+    } else if (stepSet.has(stepID)) {
+      duplicateSet.add(stepID);
+    } else {
+      stepSet.add(stepID);
+      stepIDs.push(stepID);
+    }
+
+    const functionName = stringField(rawStep.function_name);
+    const isLLMStep = Boolean(stringField(rawStep.llm_model_name)) || functionName === "__logserve_llm__";
+    if (!stringField(rawStep.task_name)) errors.push(`Step ${label} requires task_name.`);
+    if (!functionName) errors.push(`Step ${label} requires function_name.`);
+    if (!isLLMStep && !stringField(rawStep.function_source) && !stringField(rawStep.function_ref) && !stringField(rawStep.function_hash)) {
+      errors.push(`Step ${label} requires function_source, function_ref, or function_hash.`);
+    }
+    if (isLLMStep && !stringField(rawStep.llm_model_name)) errors.push(`Step ${label} requires llm_model_name.`);
+
+    if (rawStep.max_attempts !== undefined && !positiveInteger(rawStep.max_attempts)) {
+      errors.push(`Step ${label} max_attempts must be a positive integer.`);
+    }
+    if (rawStep.timeout_ms !== undefined && !positiveInteger(rawStep.timeout_ms)) {
+      errors.push(`Step ${label} timeout_ms must be a positive integer.`);
+    }
+    if (rawStep.llm_max_tokens !== undefined && !positiveInteger(rawStep.llm_max_tokens)) {
+      errors.push(`Step ${label} llm_max_tokens must be a positive integer.`);
+    }
+
+    const dependsOn = rawStep.depends_on;
+    if (dependsOn === undefined) {
+      if (stepID && !dependencies.has(stepID)) dependencies.set(stepID, []);
+    } else if (!Array.isArray(dependsOn)) {
+      errors.push(`Step ${label} depends_on must be an array.`);
+      if (stepID && !dependencies.has(stepID)) dependencies.set(stepID, []);
+    } else {
+      const deps = dependsOn.map((dep) => stringField(dep)).filter((dep) => dep !== "");
+      if (deps.length !== dependsOn.length) errors.push(`Step ${label} depends_on entries must be strings.`);
+      if (stepID && !dependencies.has(stepID)) dependencies.set(stepID, [...new Set(deps)]);
+    }
+  });
+
+  for (const duplicate of duplicateSet) {
+    errors.push(`Duplicate workflow step_id "${duplicate}".`);
+  }
+
+  const resultStepID = stringField(definition.result_step_id);
+  if (!resultStepID) {
+    errors.push("result_step_id is required.");
+  } else if (!stepSet.has(resultStepID)) {
+    errors.push(`result_step_id "${resultStepID}" does not match any step.`);
+  }
+
+  for (const [stepID, deps] of dependencies) {
+    if (!stepID) continue;
+    for (const dep of deps) {
+      if (dep === stepID) {
+        errors.push(`Step ${stepID} cannot depend on itself.`);
+      } else if (!stepSet.has(dep)) {
+        errors.push(`Step ${stepID} depends on unknown step "${dep}".`);
+      }
+    }
+  }
+
+  const order = topologicalStepOrder(stepIDs, dependencies);
+  if (stepIDs.length > 0 && order.length !== stepIDs.length) {
+    errors.push("Workflow dependency cycle detected.");
+  }
+
+  return { valid: errors.length === 0, errors, order };
 }
 
 export function validateActorCreateForm(className: string, classSource: string, initArgsText: string): ActorCreateFormValidation {
@@ -159,6 +266,43 @@ function parseKwargsField(text: string): JSONFieldResult<Record<string, unknown>
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringField(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function positiveInteger(value: unknown): boolean {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+function topologicalStepOrder(stepIDs: string[], dependencies: Map<string, string[]>): string[] {
+  const indegree = new Map<string, number>();
+  const outgoing = new Map<string, string[]>();
+  for (const stepID of stepIDs) {
+    indegree.set(stepID, 0);
+    outgoing.set(stepID, []);
+  }
+  for (const [stepID, deps] of dependencies) {
+    if (!indegree.has(stepID)) continue;
+    for (const dep of deps) {
+      if (!indegree.has(dep)) continue;
+      indegree.set(stepID, (indegree.get(stepID) ?? 0) + 1);
+      outgoing.get(dep)?.push(stepID);
+    }
+  }
+  const queue = stepIDs.filter((stepID) => (indegree.get(stepID) ?? 0) === 0);
+  const order: string[] = [];
+  for (let head = 0; head < queue.length; head += 1) {
+    const stepID = queue[head];
+    order.push(stepID);
+    for (const next of outgoing.get(stepID) ?? []) {
+      const remaining = (indegree.get(next) ?? 0) - 1;
+      indegree.set(next, remaining);
+      if (remaining === 0) queue.push(next);
+    }
+  }
+  return order;
 }
 
 function noErrors(errors: FieldErrors): boolean {

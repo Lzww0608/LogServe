@@ -1,19 +1,24 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import { parseEventData, type SSEMessage } from "../api/events";
 import { InlineError } from "../components/ErrorPanel";
 import { PanelTitle } from "../components/PanelTitle";
 import { LogRecordTable, LogStreamTable, StreamStatsPanel } from "../components/domainTables";
-import { useEventStream } from "../hooks/useEventStream";
 import { usePolling } from "../hooks/usePolling";
 import type { LogStreamDetail } from "../types/logserve";
-import { applyLogRecordsEvent, type LogRecordsEvent } from "../utils/eventState";
+import { errorMessage } from "../utils/status";
+
+const defaultRecordPageSize = 50;
+const detailPollIntervalMs = 1000;
 
 export function LogsPage() {
   const [prefix, setPrefix] = useState("system:");
   const [selectedStream, setSelectedStream] = useState("");
   const [detail, setDetail] = useState<LogStreamDetail>();
   const [detailError, setDetailError] = useState("");
+  const [recordPageSize, setRecordPageSize] = useState(defaultRecordPageSize);
+  const [recordPageIndex, setRecordPageIndex] = useState(0);
+  const [recordFromSeqs, setRecordFromSeqs] = useState<number[]>([1]);
+  const currentFromSeq = recordFromSeqs[recordPageIndex] ?? 1;
   const streamsState = usePolling(() => api.logStreams(prefix.trim()), 2000, [prefix]);
 
   useEffect(() => {
@@ -28,27 +33,46 @@ export function LogsPage() {
   }, [streamsState.data, selectedStream]);
 
   useEffect(() => {
+    setDetail(undefined);
     setDetailError("");
-    setDetail(selectedStream ? { stream_id: selectedStream, from_seq: 1, limit: 100, records: [], stats: null } : undefined);
-  }, [selectedStream]);
+    setRecordPageIndex(0);
+    setRecordFromSeqs([1]);
+  }, [selectedStream, recordPageSize]);
 
-  const handleLogEvent = useCallback((message: SSEMessage) => {
-    if (message.event !== "log_records") return;
-    const payload = parseEventData<LogRecordsEvent>(message);
-    setDetail((current) => applyLogRecordsEvent(current, payload));
-    setDetailError("");
-  }, []);
-  useEventStream(
-    { stream: selectedStream, fromSeq: 1, limit: 100, intervalMs: 1000, records: true, enabled: Boolean(selectedStream) },
-    { onMessage: handleLogEvent, onError: setDetailError },
-    [selectedStream]
-  );
+  useEffect(() => {
+    if (!selectedStream) {
+      setDetail(undefined);
+      return;
+    }
+    let cancelled = false;
+    let timer: number | undefined;
+    const loadDetail = async () => {
+      try {
+        const next = await api.logStream(selectedStream, currentFromSeq, recordPageSize);
+        if (!cancelled) {
+          setDetail(next);
+          setDetailError("");
+        }
+      } catch (error) {
+        if (!cancelled) setDetailError(errorMessage(error));
+      }
+    };
+    void loadDetail();
+    timer = window.setInterval(loadDetail, detailPollIntervalMs);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [selectedStream, currentFromSeq, recordPageSize]);
 
   const statsByStream = useMemo(() => {
     const entries = streamsState.data?.stats ?? [];
     return new Map(entries.map((item) => [item.stream_id, item]));
   }, [streamsState.data]);
-  const stats = detail?.stats ?? statsByStream.get(selectedStream);
+  const stats = statsByStream.get(selectedStream) ?? detail?.stats;
+  const rows = detail?.records ?? [];
+  const nextSeq = detail?.next_seq ?? nextSeqFromRows(rows, currentFromSeq);
+  const canNext = nextSeq > currentFromSeq && (Boolean(detail?.has_more) || (stats?.next_seq !== undefined && nextSeq < stats.next_seq));
 
   return (
     <div className="stack">
@@ -67,8 +91,32 @@ export function LogsPage() {
         <PanelTitle title={selectedStream || "Stream Detail"} />
         {detailError && <InlineError message={detailError} />}
         <StreamStatsPanel stats={stats} />
-        <LogRecordTable rows={detail?.records ?? []} />
+        <LogRecordTable rows={rows} pagination={{
+          label: logPageLabel(rows, currentFromSeq, stats?.next_seq),
+          pageSize: recordPageSize,
+          canPrevious: recordPageIndex > 0,
+          canNext,
+          onPrevious: () => setRecordPageIndex((current) => Math.max(0, current - 1)),
+          onNext: () => {
+            if (!canNext) return;
+            setRecordFromSeqs((current) => [...current.slice(0, recordPageIndex + 1), nextSeq]);
+            setRecordPageIndex((current) => current + 1);
+          },
+          onPageSizeChange: setRecordPageSize
+        }} />
       </section>
     </div>
   );
+}
+
+function nextSeqFromRows(rows: LogStreamDetail["records"], fallback: number): number {
+  if (!rows.length) return fallback;
+  return rows[rows.length - 1].seq + 1;
+}
+
+function logPageLabel(rows: LogStreamDetail["records"], requestedFromSeq: number, streamNextSeq?: number): string {
+  if (rows.length === 0) return streamNextSeq ? `No records from seq ${requestedFromSeq}` : "No records";
+  const startSeq = rows[0].seq;
+  const endSeq = rows[rows.length - 1].seq;
+  return streamNextSeq === undefined ? `Seq ${startSeq}-${endSeq}` : `Seq ${startSeq}-${endSeq} before ${streamNextSeq}`;
 }

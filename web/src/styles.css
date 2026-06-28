@@ -278,6 +278,10 @@ h2 {
   margin-bottom: 12px;
 }
 
+.filter-toolbar {
+  flex-wrap: wrap;
+}
+
 .toolbar input {
   max-width: 280px;
 }
@@ -331,6 +335,47 @@ th {
   color: var(--muted);
   font-weight: 700;
   background: #f8fafc;
+}
+
+.table-shell {
+  display: grid;
+  gap: 10px;
+}
+
+.sticky-table {
+  max-height: min(62vh, 720px);
+}
+
+.sticky-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  box-shadow: 0 1px 0 var(--line);
+}
+
+.table-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pagination-controls,
+.page-size-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.page-size-control select {
+  width: auto;
+  min-width: 76px;
+}
+
+.pagination-summary {
+  min-width: 180px;
 }
 
 .badge {
@@ -518,4 +563,130 @@ th {
 
 .task-action-control {
   display: inline-flex;
+}
+
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.workflow-builder-layout {
+  grid-template-columns: minmax(300px, 0.72fr) minmax(360px, 1fr);
+}
+
+.workflow-json-preview {
+  min-width: 0;
+}
+
+.workflow-builder-split {
+  grid-template-columns: minmax(360px, 0.9fr) minmax(420px, 1fr);
+}
+
+.workflow-subgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.workflow-source {
+  min-height: 190px;
+}
+
+.multi-select {
+  min-height: 96px;
+}
+
+.workflow-dag-editor {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.workflow-connector {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflow-dag-canvas {
+  position: relative;
+  min-height: 330px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.workflow-dag-lines {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.workflow-dag-lines line {
+  stroke: var(--line-strong);
+  stroke-width: 2;
+}
+
+.workflow-dag-node {
+  position: absolute;
+  width: 160px;
+  min-height: 88px;
+  align-items: flex-start;
+  justify-content: flex-start;
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  white-space: normal;
+  touch-action: none;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+
+.workflow-dag-node.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.16);
+}
+
+.workflow-dag-node strong,
+.workflow-dag-node span,
+.workflow-dag-node small {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.workflow-dag-node small {
+  color: var(--muted);
+}
+
+.edge-remove {
+  min-height: 22px;
+  width: 22px;
+  padding: 0;
+  margin-left: 6px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.topology-order {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.topology-order code {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .workflow-builder-layout,
+  .workflow-builder-split,
+  .workflow-connector {
+    grid-template-columns: 1fr;
+  }
 }

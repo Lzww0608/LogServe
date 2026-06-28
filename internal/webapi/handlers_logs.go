@@ -86,16 +86,36 @@ func (s *Server) handleReadLogStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	recordDTOs := logRecordDTOs(records.GetRecords())
+	nextSeq := fromSeq
+	for _, record := range recordDTOs {
+		if record.Seq >= nextSeq {
+			nextSeq = record.Seq + 1
+		}
+	}
 	var stat any
+	var statDTO streamStatsDTO
+	hasStat := false
 	if items := streamStatsDTOs(stats.GetStreams()); len(items) > 0 {
-		stat = items[0]
+		statDTO = items[0]
+		stat = statDTO
+		hasStat = true
+	}
+	if len(recordDTOs) == 0 && hasStat && nextSeq < statDTO.FirstSeq && nextSeq < statDTO.NextSeq {
+		nextSeq = statDTO.FirstSeq
+	}
+	hasMore := false
+	if hasStat {
+		hasMore = nextSeq < statDTO.NextSeq
 	}
 	writeJSON(w, map[string]any{
 		"stream_id": streamID,
 		"from_seq":  fromSeq,
 		"limit":     limit,
-		"records":   logRecordDTOs(records.GetRecords()),
+		"records":   recordDTOs,
 		"stats":     stat,
+		"next_seq":  nextSeq,
+		"has_more":  hasMore,
 	})
 }
 

@@ -320,6 +320,76 @@ func TestGetTaskMergesDashboardMetadata(t *testing.T) {
 	}
 }
 
+func TestListTasksFiltersAndPaginates(t *testing.T) {
+	conn := &fakeClientConn{
+		dashboard: &logservepb.DashboardSnapshot{Tasks: []*logservepb.DashboardTask{
+			{TaskId: "task-1", TaskName: "alpha", Status: logservepb.TaskStatus_TASK_STATUS_QUEUED, WorkerId: "worker-a", WorkflowId: "wf-1"},
+			{TaskId: "task-2", TaskName: "needle", Status: logservepb.TaskStatus_TASK_STATUS_SUCCEEDED, WorkerId: "worker-a", WorkflowId: "wf-1"},
+			{TaskId: "task-3", TaskName: "needle-second", Status: logservepb.TaskStatus_TASK_STATUS_SUCCEEDED, WorkerId: "worker-a", WorkflowId: "wf-1"},
+			{TaskId: "task-4", TaskName: "needle", Status: logservepb.TaskStatus_TASK_STATUS_SUCCEEDED, WorkerId: "worker-b", WorkflowId: "wf-1"},
+			{TaskId: "task-5", TaskName: "needle", Status: logservepb.TaskStatus_TASK_STATUS_SUCCEEDED, WorkerId: "worker-a", WorkflowId: "wf-2"},
+		}},
+	}
+	srv := newTestServer(conn, "secret-token", false)
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/tasks?status=succeeded&q=needle&worker_id=worker-a&workflow_id=wf-1&limit=1", nil)
+	firstReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(first, firstReq)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body %s", first.Code, first.Body.String())
+	}
+	var firstPayload struct {
+		Tasks         []TaskDTO `json:"tasks"`
+		Limit         int       `json:"limit"`
+		TotalCount    int       `json:"total_count"`
+		NextPageToken string    `json:"next_page_token"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPayload); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if len(firstPayload.Tasks) != 1 || firstPayload.Tasks[0].TaskID != "task-2" || firstPayload.Limit != 1 || firstPayload.TotalCount != 2 || firstPayload.NextPageToken != "1" {
+		t.Fatalf("first page = %+v", firstPayload)
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/tasks?status=succeeded&q=needle&worker_id=worker-a&workflow_id=wf-1&limit=1&page_token="+firstPayload.NextPageToken, nil)
+	secondReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(second, secondReq)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body %s", second.Code, second.Body.String())
+	}
+	var secondPayload struct {
+		Tasks         []TaskDTO `json:"tasks"`
+		TotalCount    int       `json:"total_count"`
+		NextPageToken string    `json:"next_page_token"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondPayload); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if len(secondPayload.Tasks) != 1 || secondPayload.Tasks[0].TaskID != "task-3" || secondPayload.TotalCount != 2 || secondPayload.NextPageToken != "" {
+		t.Fatalf("second page = %+v", secondPayload)
+	}
+}
+func TestListPaginationRejectsInvalidQuery(t *testing.T) {
+	cases := []string{
+		"/api/tasks?limit=0",
+		"/api/tasks?limit=101",
+		"/api/workflows?page_token=-1",
+		"/api/workflows?page_token=not-a-number",
+	}
+	for _, target := range cases {
+		conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{}}
+		srv := newTestServer(conn, "secret-token", false)
+		resp := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("Authorization", "Bearer secret-token")
+		srv.Handler().ServeHTTP(resp, req)
+		if resp.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, body %s", target, resp.Code, resp.Body.String())
+		}
+	}
+}
 func TestTaskOperationRequiresToken(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newTestServer(conn, "secret-token", false)
@@ -499,6 +569,55 @@ func taskSubmittedRecord(t *testing.T, spec *logservepb.TaskSpec) *logservepb.Lo
 		Payload:   payload,
 	}
 }
+func TestListWorkflowsFiltersAndPaginates(t *testing.T) {
+	conn := &fakeClientConn{
+		dashboard: &logservepb.DashboardSnapshot{Workflows: []*logservepb.DashboardWorkflow{
+			{WorkflowId: "wf-1", WorkflowName: "running", Status: logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING},
+			{WorkflowId: "wf-2", WorkflowName: "done-a", Status: logservepb.WorkflowStatus_WORKFLOW_STATUS_COMPLETED},
+			{WorkflowId: "wf-3", WorkflowName: "done-b", Status: logservepb.WorkflowStatus_WORKFLOW_STATUS_COMPLETED},
+		}},
+	}
+	srv := newTestServer(conn, "secret-token", false)
+
+	first := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/workflows?status=completed&limit=1", nil)
+	firstReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(first, firstReq)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body %s", first.Code, first.Body.String())
+	}
+	var firstPayload struct {
+		Workflows     []WorkflowDTO `json:"workflows"`
+		Limit         int           `json:"limit"`
+		TotalCount    int           `json:"total_count"`
+		NextPageToken string        `json:"next_page_token"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPayload); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if len(firstPayload.Workflows) != 1 || firstPayload.Workflows[0].WorkflowID != "wf-2" || firstPayload.Limit != 1 || firstPayload.TotalCount != 2 || firstPayload.NextPageToken != "1" {
+		t.Fatalf("first workflow page = %+v", firstPayload)
+	}
+
+	second := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/workflows?status=completed&limit=1&page_token="+firstPayload.NextPageToken, nil)
+	secondReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(second, secondReq)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body %s", second.Code, second.Body.String())
+	}
+	var secondPayload struct {
+		Workflows     []WorkflowDTO `json:"workflows"`
+		TotalCount    int           `json:"total_count"`
+		NextPageToken string        `json:"next_page_token"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondPayload); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if len(secondPayload.Workflows) != 1 || secondPayload.Workflows[0].WorkflowID != "wf-3" || secondPayload.TotalCount != 2 || secondPayload.NextPageToken != "" {
+		t.Fatalf("second workflow page = %+v", secondPayload)
+	}
+}
 func TestWorkflowStepsExposeDependenciesForDAGRendering(t *testing.T) {
 	conn := &fakeClientConn{
 		dashboard: &logservepb.DashboardSnapshot{
@@ -600,6 +719,40 @@ func TestLogExplorerListsStreamsAndReadsRecords(t *testing.T) {
 	}
 }
 
+func TestLogExplorerReturnsPaginationMetadata(t *testing.T) {
+	conn := &fakeClientConn{
+		readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{
+			{StreamId: "system:functions", Seq: 1, EventType: "A"},
+			{StreamId: "system:functions", Seq: 2, EventType: "B"},
+			{StreamId: "system:functions", Seq: 3, EventType: "C"},
+		}},
+		stats: &logservepb.GetStreamStatsResponse{Streams: []*logservepb.StreamStats{{
+			StreamId: "system:functions",
+			FirstSeq: 1,
+			NextSeq:  4,
+		}}},
+	}
+	srv := newTestServer(conn, "secret-token", false)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/logs/streams/system%3Afunctions?from_seq=1&limit=2", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Records []logRecordDTO `json:"records"`
+		NextSeq uint64         `json:"next_seq"`
+		HasMore bool           `json:"has_more"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode log response: %v", err)
+	}
+	if len(payload.Records) != 2 || payload.Records[0].Seq != 1 || payload.Records[1].Seq != 2 || payload.NextSeq != 3 || !payload.HasMore {
+		t.Fatalf("log page = %+v", payload)
+	}
+}
 func TestLogExplorerRejectsHugeLimit(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newTestServer(conn, "secret-token", false)

@@ -186,6 +186,78 @@ func TestSubmitTaskRejectsMismatchedFunctionHash(t *testing.T) {
 	}
 }
 
+func TestSubmitWorkflowRejectsUnregisteredLLMModel(t *testing.T) {
+	meta := metadata.NewMemoryStore()
+	service := NewServiceWithResultStore(meta, newFunctionRegistryLogClient(), nil, 0)
+
+	_, err := service.SubmitWorkflow(context.Background(), &logservepb.SubmitWorkflowRequest{
+		WorkflowName: "llm_workflow",
+		DefinitionJson: []byte(`{
+			"workflow_name":"llm_workflow",
+			"steps":[{
+				"step_id":"generate",
+				"task_name":"llm:model-A",
+				"function_name":"__logserve_llm__",
+				"args_json":{"args":["hello"],"kwargs":{}},
+				"depends_on":[],
+				"llm_model_name":"model-A"
+			}],
+			"result_step_id":"generate"
+		}`),
+	})
+	if err == nil {
+		t.Fatal("SubmitWorkflow succeeded with unregistered LLM model")
+	}
+	if workflows := meta.ListWorkflows(); len(workflows) != 0 {
+		t.Fatalf("workflows = %d, want 0 after rejected LLM workflow", len(workflows))
+	}
+}
+
+func TestSubmitWorkflowNormalizesRegisteredLLMModelStep(t *testing.T) {
+	ctx := context.Background()
+	meta := metadata.NewMemoryStore()
+	logClient := newFunctionRegistryLogClient()
+	service := NewServiceWithResultStore(meta, logClient, nil, 0)
+	if _, err := service.RegisterModel(ctx, &logservepb.RegisterModelRequest{Model: &logservepb.ModelInfo{Name: "model-A", Adapter: "vllm"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := service.SubmitWorkflow(ctx, &logservepb.SubmitWorkflowRequest{
+		WorkflowName: "llm_workflow",
+		DefinitionJson: []byte(`{
+			"workflow_name":"llm_workflow",
+			"steps":[{
+				"step_id":"generate",
+				"task_name":"llm:model-A",
+				"function_name":"custom_llm_wrapper",
+				"function_source":"def ignored():\n    return 'bad'\n",
+				"args_json":{"args":["hello"],"kwargs":{}},
+				"depends_on":[],
+				"llm_model_name":"model-A"
+			}],
+			"result_step_id":"generate"
+		}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := meta.ListTasks()
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %d, want 1", len(tasks))
+	}
+	taskRecords := logClient.records[taskStream(tasks[0].TaskID)]
+	if len(taskRecords) == 0 {
+		t.Fatal("missing TaskSubmitted record")
+	}
+	spec := taskSpecFromSubmittedRecord(t, taskRecords[0])
+	if spec.GetFunctionName() != "__logserve_llm__" || spec.GetFunctionSource() != "" || spec.GetFunctionRef() != "" || spec.GetFunctionHash() != "" {
+		t.Fatalf("normalized function identity = name:%q source:%q ref:%q hash:%q", spec.GetFunctionName(), spec.GetFunctionSource(), spec.GetFunctionRef(), spec.GetFunctionHash())
+	}
+	if spec.GetLlmModelName() != "model-A" || spec.GetLlmModelVersion() != "v1" || spec.GetLlmAdapter() != "vllm" || spec.GetLlmMaxTokens() != 64 {
+		t.Fatalf("normalized LLM fields = name:%q version:%q adapter:%q max_tokens:%d", spec.GetLlmModelName(), spec.GetLlmModelVersion(), spec.GetLlmAdapter(), spec.GetLlmMaxTokens())
+	}
+}
+
 func taskSpecFromSubmittedRecord(t *testing.T, rec *logservepb.LogRecord) *logservepb.TaskSpec {
 	t.Helper()
 	spec, err := unmarshalTaskSubmittedSpec(rec.GetPayload())

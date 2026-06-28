@@ -37,7 +37,9 @@ export function renderRoute(path: string, routeKey = path) {
 export function pathTitle(path: string) {
   if (path === "/") return "Overview";
   if (path.startsWith("/tasks/")) return "Task Detail";
+  if (path === "/workflows/new") return "Workflow Builder";
   if (path.startsWith("/workflows/") && path !== "/workflows/new") return "Workflow Detail";
+  if (path === "/llm") return "LLM";
   if (path.startsWith("/actors/")) return "Actor Detail";
   if (path === "/submit/task") return "Submit Task";
   return path.slice(1).split("/").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");

@@ -139,6 +139,20 @@ export interface Dashboard {
   metadata_materializer?: MetadataMaterializerStats | null;
 }
 
+export interface PaginatedPayload {
+  limit: number;
+  total_count?: number;
+  next_page_token?: string;
+}
+
+export interface TaskListResponse extends PaginatedPayload {
+  tasks: Task[];
+}
+
+export interface WorkflowListResponse extends PaginatedPayload {
+  workflows: Workflow[];
+}
+
 export interface LLMTrace {
   task_id?: string;
   status?: TaskStatus;
@@ -190,4 +204,6 @@ export interface LogStreamDetail {
   limit: number;
   records: LogRecord[];
   stats?: StreamStats | null;
+  next_seq?: number;
+  has_more?: boolean;
 }

@@ -55,7 +55,10 @@ func (s *Service) normalizeWorkflowDefinition(ctx context.Context, def *workflow
 	}
 	for i := range def.Steps {
 		step := &def.Steps[i]
-		if step.LLMModelName != "" || step.FunctionName == "__logserve_llm__" {
+		if isWorkflowLLMStep(*step) {
+			if err := s.normalizeWorkflowLLMStep(step); err != nil {
+				return fmt.Errorf("workflow step %q: %w", step.StepID, err)
+			}
 			continue
 		}
 		ref, hash, err := s.ensureFunctionRegistered(ctx, step.FunctionName, step.FunctionSource, step.FunctionRef, step.FunctionHash)
@@ -65,6 +68,42 @@ func (s *Service) normalizeWorkflowDefinition(ctx context.Context, def *workflow
 		step.FunctionRef = ref
 		step.FunctionHash = hash
 		step.FunctionSource = ""
+	}
+	return nil
+}
+
+func isWorkflowLLMStep(step workflow.StepDefinition) bool {
+	return strings.TrimSpace(step.LLMModelName) != "" || strings.TrimSpace(step.FunctionName) == "__logserve_llm__"
+}
+
+func (s *Service) normalizeWorkflowLLMStep(step *workflow.StepDefinition) error {
+	step.LLMModelName = strings.TrimSpace(step.LLMModelName)
+	if step.LLMModelName == "" {
+		return errors.New("llm_model_name is required")
+	}
+	version := strings.TrimSpace(step.LLMModelVersion)
+	if version == "" {
+		version = "v1"
+	}
+	model, ok := s.meta.GetModel(step.LLMModelName, version)
+	if !ok {
+		return fmt.Errorf("model %s:%s is not registered", step.LLMModelName, version)
+	}
+	adapter := strings.TrimSpace(step.LLMAdapter)
+	if adapter == "" {
+		adapter = model.GetAdapter()
+	}
+	if adapter == "" {
+		adapter = "mock"
+	}
+	step.FunctionName = "__logserve_llm__"
+	step.FunctionSource = ""
+	step.FunctionRef = ""
+	step.FunctionHash = ""
+	step.LLMModelVersion = version
+	step.LLMAdapter = adapter
+	if step.LLMMaxTokens == 0 {
+		step.LLMMaxTokens = 64
 	}
 	return nil
 }

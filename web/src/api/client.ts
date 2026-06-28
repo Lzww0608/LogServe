@@ -1,4 +1,4 @@
-import type { Actor, AdminConfig, BackpressureConfig, Dashboard, FunctionRegistryEntry, LLMTrace, LogStreamDetail, LogStreamsResponse, ModelInfo, Task, Worker, Workflow } from "../types/logserve";
+import type { Actor, AdminConfig, BackpressureConfig, Dashboard, FunctionRegistryEntry, LLMTrace, LogStreamDetail, LogStreamsResponse, ModelInfo, Task, TaskListResponse, Worker, Workflow, WorkflowListResponse } from "../types/logserve";
 
 export class APIError extends Error {
   code: string;
@@ -12,6 +12,23 @@ export class APIError extends Error {
 }
 
 type FetchInit = RequestInit & { json?: unknown };
+
+type QueryValue = string | number | undefined;
+
+export type TaskListQuery = {
+  q?: string;
+  status?: string;
+  workerID?: string;
+  workflowID?: string;
+  limit?: number;
+  pageToken?: string;
+};
+
+export type WorkflowListQuery = {
+  status?: string;
+  limit?: number;
+  pageToken?: string;
+};
 
 const tokenKey = "logserve.console.token";
 
@@ -59,6 +76,43 @@ export type TaskOperation = "retry" | "cancel" | "resubmit";
 export function taskActionURL(taskID: string, action: TaskOperation): string {
   return `/api/tasks/${encodeURIComponent(taskID)}/${action}`;
 }
+
+export function tasksURL(query: TaskListQuery | string = ""): string {
+  if (typeof query === "string") return `/api/tasks${query}`;
+  return `/api/tasks${queryString({
+    q: query.q,
+    status: query.status,
+    worker_id: query.workerID,
+    workflow_id: query.workflowID,
+    limit: query.limit,
+    page_token: query.pageToken
+  })}`;
+}
+
+export function workflowsURL(query: WorkflowListQuery | string = ""): string {
+  if (typeof query === "string") return `/api/workflows${query}`;
+  return `/api/workflows${queryString({
+    status: query.status,
+    limit: query.limit,
+    page_token: query.pageToken
+  })}`;
+}
+
+export function logStreamURL(streamID: string, fromSeq = 1, limit = 100): string {
+  return `/api/logs/streams/${encodeURIComponent(streamID)}${queryString({ from_seq: fromSeq, limit })}`;
+}
+
+function queryString(values: Record<string, QueryValue>): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) continue;
+    const text = String(value).trim();
+    if (!text) continue;
+    params.set(key, text);
+  }
+  const encoded = params.toString();
+  return encoded ? `?${encoded}` : "";
+}
 function isAPIErrorPayload(value: unknown): value is { error: { code?: string; message?: string } } {
   return typeof value === "object" && value !== null && "error" in value;
 }
@@ -66,13 +120,13 @@ function isAPIErrorPayload(value: unknown): value is { error: { code?: string; m
 export const api = {
   health: () => apiFetch<{ status: string }>("/api/healthz"),
   dashboard: () => apiFetch<Dashboard>("/api/dashboard"),
-  tasks: (query = "") => apiFetch<{ tasks: Task[] }>(`/api/tasks${query}`),
+  tasks: (query: TaskListQuery | string = "") => apiFetch<TaskListResponse>(tasksURL(query)),
   task: (taskID: string) => apiFetch<Task>(`/api/tasks/${encodeURIComponent(taskID)}`),
   retryTask: (taskID: string) => apiFetch<Task>(taskActionURL(taskID, "retry"), { method: "POST" }),
   cancelTask: (taskID: string) => apiFetch<Task>(taskActionURL(taskID, "cancel"), { method: "POST" }),
   resubmitTask: (taskID: string) => apiFetch<Task>(taskActionURL(taskID, "resubmit"), { method: "POST" }),
   submitTask: (payload: unknown) => apiFetch<Task>("/api/tasks", { method: "POST", json: payload }),
-  workflows: () => apiFetch<{ workflows: Workflow[] }>("/api/workflows"),
+  workflows: (query: WorkflowListQuery | string = "") => apiFetch<WorkflowListResponse>(workflowsURL(query)),
   workflow: (workflowID: string) => apiFetch<Workflow>(`/api/workflows/${encodeURIComponent(workflowID)}`),
   submitWorkflow: (payload: unknown) => apiFetch<Workflow>("/api/workflows", { method: "POST", json: payload }),
   validateWorkflow: (payload: unknown) =>
@@ -97,8 +151,7 @@ export const api = {
     const query = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
     return apiFetch<LogStreamsResponse>(`/api/logs/streams${query}`);
   },
-  logStream: (streamID: string, fromSeq = 1, limit = 100) =>
-    apiFetch<LogStreamDetail>(`/api/logs/streams/${encodeURIComponent(streamID)}?from_seq=${fromSeq}&limit=${limit}`),
+  logStream: (streamID: string, fromSeq = 1, limit = 100) => apiFetch<LogStreamDetail>(logStreamURL(streamID, fromSeq, limit)),
   adminConfig: () => apiFetch<AdminConfig>("/api/admin/config"),
   setSchedulingPolicy: (policy: string) => apiFetch<{ policy: string }>("/api/admin/scheduling-policy", { method: "POST", json: { policy } }),
   setBackpressure: (payload: BackpressureConfig) => apiFetch<BackpressureConfig>("/api/admin/backpressure", { method: "POST", json: payload })

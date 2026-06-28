@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  analyzeWorkflowDefinition,
   parseJSONField,
   validateActorCallForm,
   validateLLMForm,
@@ -49,6 +50,16 @@ test("validateTaskForm requires the selected function identity", () => {
     argsText: "[]",
     kwargsText: "{}"
   });
+  const refWithoutHash = validateTaskForm({
+    mode: "ref",
+    taskName: "add",
+    functionName: "add",
+    functionSource: "",
+    functionRef: "local://functions/add.py",
+    functionHash: " ",
+    argsText: "[]",
+    kwargsText: "{}"
+  });
   const hashResult = validateTaskForm({
     mode: "hash",
     taskName: "add",
@@ -62,8 +73,27 @@ test("validateTaskForm requires the selected function identity", () => {
 
   assert.equal(refResult.valid, false);
   assert.equal(refResult.errors.functionRef, "Function ref is required.");
+  assert.equal(refResult.errors.functionHash, "Function hash is required with function ref.");
+  assert.equal(refWithoutHash.valid, false);
+  assert.equal(refWithoutHash.errors.functionHash, "Function hash is required with function ref.");
   assert.equal(hashResult.valid, false);
   assert.equal(hashResult.errors.functionHash, "Function hash is required.");
+});
+
+test("validateTaskForm accepts registered function ref with hash", () => {
+  const result = validateTaskForm({
+    mode: "ref",
+    taskName: "add",
+    functionName: "add",
+    functionSource: "",
+    functionRef: "local://functions/add.py",
+    functionHash: "sha256:abc123",
+    argsText: "[1, 2]",
+    kwargsText: "{}"
+  });
+
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.parsedArgs, [1, 2]);
 });
 test("validateTaskForm accepts hash mode with parsed args and kwargs", () => {
   const result = validateTaskForm({
@@ -110,4 +140,33 @@ test("validateLLMForm requires model name and prompt", () => {
       prompt: "Prompt is required."
     }
   });
+});
+
+test("analyzeWorkflowDefinition validates DAG shape and topological order", () => {
+  const valid = analyzeWorkflowDefinition({
+    result_step_id: "finish",
+    steps: [
+      { step_id: "start", task_name: "start", function_name: "start", function_source: "def start():\n    return 1\n", depends_on: [] },
+      { step_id: "finish", task_name: "finish", function_name: "finish", function_source: "def finish():\n    return 2\n", depends_on: ["start"] }
+    ]
+  });
+
+  assert.equal(valid.valid, true);
+  assert.deepEqual(valid.order, ["start", "finish"]);
+
+  const invalid = analyzeWorkflowDefinition({
+    result_step_id: "missing",
+    steps: [
+      { step_id: "a", task_name: "a", function_name: "a", function_source: "def a():\n    return 1\n", depends_on: ["b"] },
+      { step_id: "a", task_name: "dup", function_name: "dup", function_source: "def dup():\n    return 2\n", depends_on: [] },
+      { step_id: "cycle", task_name: "cycle", function_name: "cycle", function_source: "def cycle():\n    return 3\n", depends_on: ["cycle"] }
+    ]
+  });
+
+  assert.equal(invalid.valid, false);
+  assert.match(invalid.errors.join("\n"), /Duplicate workflow step_id "a"/);
+  assert.match(invalid.errors.join("\n"), /result_step_id "missing"/);
+  assert.match(invalid.errors.join("\n"), /unknown step "b"/);
+  assert.match(invalid.errors.join("\n"), /cannot depend on itself/);
+  assert.match(invalid.errors.join("\n"), /cycle/i);
 });

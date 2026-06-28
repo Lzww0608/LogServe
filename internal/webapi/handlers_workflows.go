@@ -3,6 +3,7 @@ package webapi
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
@@ -22,7 +23,26 @@ func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, map[string]any{"workflows": dashboard.Workflows})
+	status := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("status")))
+	out := make([]WorkflowDTO, 0, len(dashboard.Workflows))
+	for _, workflow := range dashboard.Workflows {
+		if status != "" && workflow.Status != status {
+			continue
+		}
+		out = append(out, workflow)
+	}
+	params, err := parsePaginationParams(r, len(out))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	page := paginate(len(out), params)
+	writeJSON(w, map[string]any{
+		"workflows":       out[page.Start:page.End],
+		"limit":           page.Limit,
+		"total_count":     page.TotalCount,
+		"next_page_token": page.NextPageToken,
+	})
 }
 
 func (s *Server) handleSubmitWorkflow(w http.ResponseWriter, r *http.Request) {

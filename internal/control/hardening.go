@@ -65,7 +65,12 @@ func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetD
 	}
 
 	tasks := s.meta.ListTasks()
-	sort.Slice(tasks, func(i, j int) bool { return tasks[i].CreatedAtMs < tasks[j].CreatedAtMs })
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].CreatedAtMs == tasks[j].CreatedAtMs {
+			return tasks[i].TaskID < tasks[j].TaskID
+		}
+		return tasks[i].CreatedAtMs < tasks[j].CreatedAtMs
+	})
 	dashboardTasks := make([]*logservepb.DashboardTask, 0, len(tasks))
 	for _, task := range tasks {
 		dashboardTasks = append(dashboardTasks, &logservepb.DashboardTask{
@@ -84,7 +89,12 @@ func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetD
 	}
 
 	workflows := s.meta.ListWorkflows()
-	sort.Slice(workflows, func(i, j int) bool { return workflows[i].CreatedAtMs < workflows[j].CreatedAtMs })
+	sort.Slice(workflows, func(i, j int) bool {
+		if workflows[i].CreatedAtMs == workflows[j].CreatedAtMs {
+			return workflows[i].WorkflowID < workflows[j].WorkflowID
+		}
+		return workflows[i].CreatedAtMs < workflows[j].CreatedAtMs
+	})
 	dashboardWorkflows := make([]*logservepb.DashboardWorkflow, 0, len(workflows))
 	for _, workflowState := range workflows {
 		status := workflowStatusResponse(workflowState)

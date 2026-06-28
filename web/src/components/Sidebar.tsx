@@ -29,7 +29,9 @@ export function Sidebar({ path }: { path: string }) {
 }
 
 function NavLink({ path, current, children }: { path: string; current: string; children: ReactNode }) {
-  const active = path === "/" ? current === "/" : current === path || current.startsWith(path + "/");
+  const exact = path === "/" || path === "/workflows/new";
+  const excludedChild = path === "/workflows" && current === "/workflows/new";
+  const active = exact ? current === path : current === path || (!excludedChild && current.startsWith(path + "/"));
   return (
     <a data-nav href={path} className={active ? "active" : ""}>
       {children}

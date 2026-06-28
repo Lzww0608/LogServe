@@ -6,9 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test:unit": "npm run test:forms && npm run test:events && npm run test:task-actions",
     "test:forms": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --outDir .tmp-form-tests --rootDir . src/utils/formValidation.ts && node --test tests/formValidation.test.mjs",
     "test:events": "tsc --target ES2022 --module ES2022 --moduleResolution Bundler --strict --skipLibCheck --outDir .tmp-event-tests --rootDir . src/api/events.ts src/utils/eventState.ts && node --test tests/events.test.mjs",
     "test:task-actions": "tsc --target ES2022 --module ES2022 --moduleResolution Bundler --strict --skipLibCheck --outDir .tmp-task-action-tests --rootDir . src/api/client.ts src/utils/taskActions.ts && node --test tests/taskActions.test.mjs",
+    "test:browser": "node tests/run-playwright.mjs --grep-invert @lighthouse",
+    "test:lighthouse": "node tests/run-playwright.mjs --grep @lighthouse",
+    "test:frontend": "npm run test:unit && npm run test:browser && npm run test:lighthouse",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -19,7 +23,9 @@
     "vite": "^7.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3"
+    "@types/react-dom": "^19.2.3",
+    "lighthouse": "^13.4.0"
   }
 }

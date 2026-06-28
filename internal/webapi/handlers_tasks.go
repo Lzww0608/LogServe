@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -36,9 +37,17 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	status := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("status")))
 	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+	workerID := strings.TrimSpace(r.URL.Query().Get("worker_id"))
+	workflowID := strings.TrimSpace(r.URL.Query().Get("workflow_id"))
 	out := make([]TaskDTO, 0, len(dashboard.Tasks))
 	for _, task := range dashboard.Tasks {
 		if status != "" && task.Status != status {
+			continue
+		}
+		if workerID != "" && task.WorkerID != workerID {
+			continue
+		}
+		if workflowID != "" && task.WorkflowID != workflowID {
 			continue
 		}
 		haystack := strings.ToLower(task.TaskID + " " + task.TaskName + " " + task.WorkerID + " " + task.WorkflowID + " " + task.ActorID + " " + task.LLMModelName)
@@ -47,7 +56,24 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, task)
 	}
-	writeJSON(w, map[string]any{"tasks": out})
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].CreatedAtMs == out[j].CreatedAtMs {
+			return out[i].TaskID < out[j].TaskID
+		}
+		return out[i].CreatedAtMs < out[j].CreatedAtMs
+	})
+	params, err := parsePaginationParams(r, len(out))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	page := paginate(len(out), params)
+	writeJSON(w, map[string]any{
+		"tasks":           out[page.Start:page.End],
+		"limit":           page.Limit,
+		"total_count":     page.TotalCount,
+		"next_page_token": page.NextPageToken,
+	})
 }
 
 func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
