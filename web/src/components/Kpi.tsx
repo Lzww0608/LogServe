@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-type KpiTone = "neutral" | "good" | "bad" | "info";
+type KpiTone = "neutral" | "good" | "bad" | "info" | "warn";
 
 export function Kpi({ label, value, tone = "neutral" }: { label: string; value: ReactNode; tone?: KpiTone }) {
   return (

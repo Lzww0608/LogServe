@@ -2,7 +2,7 @@ import type { Actor, FunctionRegistryEntry, LogRecord, ModelInfo, StreamStats, T
 import { formatTime, modelLabel, payloadPreview, submitTaskURLForFunction } from "../utils/format";
 import { DetailGrid } from "./DetailGrid";
 import { StatusBadge } from "./StatusBadge";
-import { Table, type TablePagination } from "./Table";
+import { Table, type Column, type TablePagination } from "./Table";
 
 export function FunctionTable({ rows, onCopy }: { rows: FunctionRegistryEntry[]; onCopy: (functionHash: string) => void }) {
   return <Table rows={rows} empty="No functions" columns={[
@@ -92,15 +92,26 @@ export function LogStreamTable({ streamIDs, stats, selected, onSelect }: { strea
   ]} />;
 }
 
-export function LogRecordTable({ rows, pagination }: { rows: LogRecord[]; pagination?: TablePagination }) {
-  return <Table rows={rows} empty="No records" pagination={pagination} columns={[
+export function LogRecordTable({ rows, pagination, onInspect, onCopyPayload }: { rows: LogRecord[]; pagination?: TablePagination; onInspect?: (row: LogRecord) => void; onCopyPayload?: (row: LogRecord) => void }) {
+  const columns: Column<LogRecord>[] = [
     { label: "Seq", render: (row) => row.seq },
     { label: "Event", render: (row) => row.event_type || "-" },
     { label: "Idempotency", render: (row) => row.idempotency_key || "-" },
     { label: "Timestamp", render: (row) => formatTime(row.timestamp_ms) },
     { label: "CRC32", render: (row) => row.crc32 ?? "-" },
     { label: "Payload", render: (row) => <code className="payload-cell">{payloadPreview(row)}</code> }
-  ]} />;
+  ];
+  if (onInspect || onCopyPayload) {
+    columns.push({
+      label: "Actions",
+      className: "actions-cell",
+      render: (row) => <div className="button-row table-actions">
+        {onInspect && <button type="button" className="ghost compact-button" onClick={() => onInspect(row)}>Inspect</button>}
+        {onCopyPayload && <button type="button" className="ghost compact-button" onClick={() => onCopyPayload(row)}>Copy payload</button>}
+      </div>
+    });
+  }
+  return <Table rows={rows} empty="No records" pagination={pagination} columns={columns} />;
 }
 
 export function StreamStatsPanel({ stats }: { stats?: StreamStats | null }) {

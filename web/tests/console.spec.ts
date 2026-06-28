@@ -31,10 +31,15 @@ test("task and workflow lists render paginated API data", async ({ page }) => {
   await page.goto("/tasks");
   await expect(page.getByRole("link", { name: "task-queued-1" })).toBeVisible();
   await expect(page.getByRole("link", { name: "task-success-1" })).toBeVisible();
-  await expect(page.getByText("1-2 of 2 tasks")).toBeVisible();
+  await expect(page.getByText("1-3 of 3 tasks")).toBeVisible();
 
   await page.getByPlaceholder("Worker ID").fill("worker-a");
   await expect(page.getByText("1-2 of 2 tasks")).toBeVisible();
+
+  await page.goto("/tasks?status=FAILED");
+  await expect(page.getByRole("link", { name: "task-failed-1" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "task-queued-1" })).toHaveCount(0);
+  await expect(page.getByText("1-1 of 1 tasks")).toBeVisible();
 
   await page.goto("/workflows");
   await expect(page.getByRole("link", { name: "simple_add" })).toBeVisible();
@@ -47,6 +52,15 @@ test("task and workflow lists render paginated API data", async ({ page }) => {
 test("submit task navigates to task detail", async ({ page }) => {
   await page.goto("/submit/task");
   await expect(page.getByRole("heading", { name: "Submit Task" })).toBeVisible();
+
+  await page.getByLabel("Template").selectOption("sleep");
+  await expect(page.getByLabel("Task name")).toHaveValue("sleep_ms");
+  await page.getByRole("button", { name: "Format JSON" }).first().click();
+  await expect(page.getByLabel("Args JSON", { exact: true })).toHaveValue("[\n  250\n]");
+
+  await page.getByRole("textbox", { name: "Python source" }).focus();
+  const editorFocus = await page.locator(".code-editor-frame").evaluate((element) => getComputedStyle(element).boxShadow);
+  expect(editorFocus).not.toBe("none");
 
   await page.getByLabel("Task name").fill("browser add");
   await page.getByRole("button", { name: "Submit" }).click();
@@ -87,6 +101,26 @@ test("viewer role hides operator-only console actions", async ({ page }) => {
   await page.goto("/workflows");
   await expect(page.getByRole("link", { name: "New" })).toHaveCount(0);
 });
+test("workflow detail renders graphical DAG and step drawer", async ({ page }) => {
+  await page.goto("/workflows/wf-1");
+  await expect(page.getByRole("heading", { name: "Workflow Detail" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "simple_add" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Step Flow" })).toBeVisible();
+  await expect(page.locator("[data-step-id=\"load\"]")).toBeVisible();
+  await expect(page.locator("[data-step-id=\"add\"]")).toBeVisible();
+  await page.locator("[data-step-id=\"add\"]").click();
+  await expect(page.getByLabel("Step detail")).toContainText("add");
+
+  const replayResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/workflows/wf-1/replay") && response.request().method() === "POST"
+  );
+  await page.getByRole("button", { name: "Replay" }).click();
+  await replayResponse;
+  await expect(page.locator("[data-step-id=\"verify\"]")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Replay" })).toBeVisible();
+  await expect(page.getByText("Consistent", { exact: true })).toBeVisible();
+  await expectNoDocumentOverflow(page);
+});
 test("workflow builder validates structured DAG definition", async ({ page }) => {
   await page.goto("/workflows/new");
   await expect(page.getByRole("heading", { name: "Workflow Builder" })).toBeVisible();
@@ -125,14 +159,40 @@ test("LLM page form accepts model and prompt interactions", async ({ page }) => 
 
   await page.getByRole("button", { name: "Submit" }).click();
   await expect(page.getByLabel("Trace task")).toHaveValue("llm-task-1");
-  await expect(page.getByText("LogServe records workflow events")).toBeVisible();
+  await expect(page.getByText("Submit confirms the task.")).toBeVisible();
+
+  const replayResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/llm/llm-task-1/replay") && response.request().method() === "POST"
+  );
+  await page.getByRole("button", { name: "Replay" }).click();
+  await replayResponse;
+  await expect(page.getByText("Replay matched the recorded trace.")).toBeVisible();
+  await expect(page.getByText("MODEL_LOADED")).toBeVisible();
+  await expect(page.getByText("Total latency")).toBeVisible();
 });
 
 test("logs page switches stream groups and stream details", async ({ page }) => {
   await page.goto("/logs");
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
   await expect(page.getByRole("button", { name: "system:functions" })).toBeVisible();
-  await expect(page.getByText("Seq 1-2 before 3")).toBeVisible();
+  await expect(page.getByText("Seq 1-2 before 5")).toBeVisible();
+
+  await page.getByLabel("Limit").fill("5000");
+  await expect(page.getByLabel("Limit")).toHaveValue("1000");
+  await expect(page.getByText("INVALID_ARGUMENT")).toHaveCount(0);
+
+  await page.getByLabel("Filter current page").selectOption("COMMIT");
+  await expect(page.getByText("system:functions-commit")).toBeVisible();
+  await expect(page.getByText("system:functions-append")).toHaveCount(0);
+  await page.getByRole("button", { name: "Inspect" }).click();
+  await expect(page.getByRole("heading", { name: "Payload #2" })).toBeVisible();
+  await expect(page.getByText('"ok": true')).toBeVisible();
+
+  await page.getByLabel("Filter current page").selectOption("");
+  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByLabel("From seq")).toHaveValue("3");
+  await page.getByRole("button", { name: "Previous" }).click();
+  await expect(page.getByLabel("From seq")).toHaveValue("1");
 
   await page.getByRole("button", { name: "Workflows" }).click();
   await expect(page.getByRole("button", { name: "wf:workflow-1" })).toBeVisible();

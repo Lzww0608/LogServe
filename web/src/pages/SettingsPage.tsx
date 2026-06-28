@@ -31,8 +31,8 @@ export function SettingsPage({ session, onSessionChange }: { session?: ConsoleSe
       </div>
       <label>API token<input type="password" value={token} onChange={(event) => setToken(event.target.value)} /></label>
       <div className="button-row">
-        <button className="primary" onClick={save}>Save</button>
-        <button className="ghost" onClick={clear}>Clear</button>
+        <button type="button" className="primary" onClick={save}>Save</button>
+        <button type="button" className="ghost" onClick={clear}>Clear</button>
       </div>
       {message && <span className="subtle">{message}</span>}
     </section>

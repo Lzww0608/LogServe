@@ -9,7 +9,8 @@ const dashboard = {
   scheduling_policy: "LOCALITY_AWARE",
   tasks: [
     { task_id: "task-queued-1", task_name: "queued add", status: "QUEUED", worker_id: "worker-a", created_at_ms: 1782630000000 },
-    { task_id: "task-success-1", task_name: "finished add", status: "SUCCEEDED", worker_id: "worker-a", result_json: { value: 3 }, created_at_ms: 1782630001000 }
+    { task_id: "task-success-1", task_name: "finished add", status: "SUCCEEDED", worker_id: "worker-a", result_json: { value: 3 }, created_at_ms: 1782630001000 },
+    { task_id: "task-failed-1", task_name: "failed add", status: "FAILED", worker_id: "worker-b", error: "boom", created_at_ms: 1782630002000 }
   ],
   workflows: [
     { workflow_id: "wf-1", workflow_name: "simple_add", status: "COMPLETED", step_count: 2, succeeded_steps: 2, failed_steps: 0, running_steps: 0 }
@@ -33,7 +34,7 @@ const templates = [
   { id: "mock_llm_request", label: "Mock LLM request", kind: "llm", description: "Runs a mock LLM request.", expected_result: "LLM task succeeds with mock text.", required_role: "admin" }
 ];
 const logStats = {
-  "system:functions": { stream_id: "system:functions", first_seq: 1, next_seq: 3, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 },
+  "system:functions": { stream_id: "system:functions", first_seq: 1, next_seq: 5, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 },
   "system:tasks": { stream_id: "system:tasks", first_seq: 1, next_seq: 2, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 },
   "wf:workflow-1": { stream_id: "wf:workflow-1", first_seq: 1, next_seq: 3, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 },
   "actor:actor-1": { stream_id: "actor:actor-1", first_seq: 1, next_seq: 2, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 }
@@ -73,8 +74,13 @@ const server = http.createServer(async (request, response) => {
   }
   if (url.pathname === "/api/events") {
     const taskID = url.searchParams.get("task_id");
+    const streamID = url.searchParams.get("stream") ?? "";
     if (taskID) {
       writeSSE(response, "task", { task: taskDetail(taskID) });
+      return;
+    }
+    if (streamID.startsWith("wf:")) {
+      writeSSE(response, "workflow", { workflow: workflowDetail(streamID.slice("wf:".length)) });
       return;
     }
     writeSSE(response, "dashboard", { dashboard });
@@ -108,6 +114,18 @@ const server = http.createServer(async (request, response) => {
     writeJSON(response, 200, paginated(url, rows, "workflows"));
     return;
   }
+  if (url.pathname.startsWith("/api/workflows/") && url.pathname.endsWith("/replay") && request.method === "POST") {
+    const workflowID = decodeURIComponent(url.pathname.split("/")[3] ?? "wf-1");
+    const workflow = workflowDetail(workflowID);
+    workflow.steps = [...workflow.steps, { step_id: "verify", task_name: "verify_result", status: "SUCCEEDED", attempts: 1, task_id: "task-verify-1", latency_ms: 7, depends_on: ["add"], started_at_ms: 1782630003000, completed_at_ms: 1782630004000, result_json: { consistent: true } }];
+    workflow.step_count = workflow.steps.length;
+    workflow.completed_at_ms = 1782630004000;
+    workflow.updated_at_ms = 1782630004000;
+    workflow.latency_ms = 40;
+    writeJSON(response, 200, { workflow, consistent_with_metadata: true });
+    return;
+  }
+
   if (url.pathname === "/api/workflows/validate" && request.method === "POST") {
     const payload = await readJSON(request);
     writeJSON(response, 200, {
@@ -147,9 +165,7 @@ const server = http.createServer(async (request, response) => {
       status: "SUCCEEDED",
       result_json: { text: "LogServe records workflow events in an auditable log." },
       model_name: "model-A",
-      model_version: "v1",
-      cache_hit: false,
-      total_latency_ms: 42
+      model_version: "v1"
     });
     return;
   }
@@ -159,7 +175,15 @@ const server = http.createServer(async (request, response) => {
       task_id: decodeURIComponent(url.pathname.split("/")[3] ?? "llm-task-1"),
       status: "SUCCEEDED",
       result_json: { text: "Replay matched the recorded trace." },
-      cache_hit: true
+      worker_id: "worker-a",
+      model_name: "model-A",
+      model_version: "v1",
+      cache_hit: true,
+      model_load_ms: 12,
+      checkpoint_fetch_ms: 3,
+      first_token_ms: 18,
+      total_latency_ms: 42,
+      events: [{ event_type: "MODEL_LOADED", worker_id: "worker-a", latency_ms: 12 }, { event_type: "TOKEN_STREAM", model_name: "model-A", latency_ms: 42 }]
     });
     return;
   }
@@ -175,6 +199,10 @@ const server = http.createServer(async (request, response) => {
     const streamID = decodeURIComponent(url.pathname.slice("/api/logs/streams/".length));
     const fromSeq = Number(url.searchParams.get("from_seq") ?? 1);
     const limit = Number(url.searchParams.get("limit") ?? 50);
+    if (limit < 1 || limit > 1000) {
+      writeJSON(response, 400, { error: { code: "INVALID_ARGUMENT", message: "limit must be between 1 and 1000" } });
+      return;
+    }
     const stats = logStats[streamID] ?? { stream_id: streamID, first_seq: 1, next_seq: 1, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 };
     const records = [
       { stream_id: streamID, seq: fromSeq, event_type: "APPEND", idempotency_key: `${streamID}-append`, payload_json: { stream_id: streamID }, timestamp_ms: 1782630000000, crc32: 123 },
@@ -211,6 +239,27 @@ function taskDetail(taskID, status = "SUCCEEDED") {
     created_at_ms: 1782630000000,
     updated_at_ms: 1782630002000,
     result_json: { value: 3 }
+  };
+}
+
+function workflowDetail(workflowID) {
+  return {
+    workflow_id: workflowID || "wf-1",
+    workflow_name: "simple_add",
+    status: "COMPLETED",
+    created_at_ms: 1782630000000,
+    updated_at_ms: 1782630003000,
+    completed_at_ms: 1782630003000,
+    latency_ms: 33,
+    step_count: 2,
+    succeeded_steps: 2,
+    failed_steps: 0,
+    running_steps: 0,
+    result_json: { value: 3 },
+    steps: [
+      { step_id: "load", task_name: "load_input", status: "SUCCEEDED", attempts: 1, task_id: "task-load-1", latency_ms: 11, depends_on: [], started_at_ms: 1782630000000, completed_at_ms: 1782630001000, result_json: { value: 1 } },
+      { step_id: "add", task_name: "add", status: "SUCCEEDED", attempts: 1, task_id: "task-add-1", latency_ms: 22, depends_on: ["load"], started_at_ms: 1782630001000, completed_at_ms: 1782630003000, result_json: { value: 3 } }
+    ]
   };
 }
 

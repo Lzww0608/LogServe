@@ -9,11 +9,12 @@ import { roleAtLeast } from "../utils/roles";
 const defaultPageSize = 50;
 
 export function TasksPage({ session }: { session?: ConsoleSession | null }) {
-  const [query, setQuery] = useState("");
-  const [status, setStatus] = useState("");
-  const [workerID, setWorkerID] = useState("");
-  const [workflowID, setWorkflowID] = useState("");
-  const [pageSize, setPageSize] = useState(defaultPageSize);
+  const initialFilters = taskFiltersFromSearch();
+  const [query, setQuery] = useState(initialFilters.query);
+  const [status, setStatus] = useState(initialFilters.status);
+  const [workerID, setWorkerID] = useState(initialFilters.workerID);
+  const [workflowID, setWorkflowID] = useState(initialFilters.workflowID);
+  const [pageSize, setPageSize] = useState(initialFilters.pageSize);
   const [pageIndex, setPageIndex] = useState(0);
   const [pageTokens, setPageTokens] = useState<string[]>([""]);
 
@@ -80,4 +81,15 @@ function pageLabel(itemName: string, pageIndex: number, pageSize: number, rowCou
   const start = pageIndex * pageSize + 1;
   const end = start + rowCount - 1;
   return totalCount === undefined ? `${start}-${end} ${itemName}` : `${start}-${end} of ${totalCount} ${itemName}`;
+}
+function taskFiltersFromSearch() {
+  const params = new URLSearchParams(window.location.search);
+  const limit = Number(params.get("limit") ?? defaultPageSize);
+  return {
+    query: params.get("q") ?? "",
+    status: params.get("status") ?? "",
+    workerID: params.get("worker_id") ?? "",
+    workflowID: params.get("workflow_id") ?? "",
+    pageSize: Number.isInteger(limit) && limit > 0 ? limit : defaultPageSize
+  };
 }

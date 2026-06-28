@@ -8,8 +8,10 @@ export function AppShell({ path, title, session, sessionError, children }: { pat
     <div className="shell">
       <Sidebar path={path} session={session} />
       <main className="content">
-        <Header title={title} session={session} sessionError={sessionError} />
-        {children}
+        <div className="content-inner">
+          <Header title={title} session={session} sessionError={sessionError} />
+          {children}
+        </div>
       </main>
     </div>
   );

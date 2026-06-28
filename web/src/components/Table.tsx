@@ -17,7 +17,7 @@ export type TablePagination = {
   onPageSizeChange: (pageSize: number) => void;
 };
 
-export function Table<T>({ rows, columns, empty, pagination }: { rows: T[]; columns: Column<T>[]; empty: string; pagination?: TablePagination }) {
+export function Table<T>({ rows, columns, empty, pagination }: { rows: T[]; columns: Column<T>[]; empty: ReactNode; pagination?: TablePagination }) {
   return (
     <div className="table-shell">
       {rows.length ? (
@@ -34,7 +34,7 @@ export function Table<T>({ rows, columns, empty, pagination }: { rows: T[]; colu
           </table>
         </div>
       ) : (
-        <div className="empty">{empty}</div>
+        <div className="empty empty-state">{empty}</div>
       )}
       {pagination && <PaginationFooter pagination={pagination} />}
     </div>

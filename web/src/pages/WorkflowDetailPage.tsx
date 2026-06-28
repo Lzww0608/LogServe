@@ -42,7 +42,9 @@ export function WorkflowDetailPage({ workflowID, session }: { workflowID: string
       return;
     }
     try {
-      setReplay(await api.replayWorkflow(workflowID));
+      const replayResult = await api.replayWorkflow(workflowID);
+      setReplay(replayResult);
+      if (replayResult.workflow) setWorkflow(replayResult.workflow);
       setMessage("");
     } catch (error) {
       setMessage(errorMessage(error));
@@ -64,10 +66,10 @@ export function WorkflowDetailPage({ workflowID, session }: { workflowID: string
         ]} />
       </section>
       <section className="panel">
-        <PanelTitle title="Step Flow" action={<button className="ghost" disabled={!canReplay} onClick={() => void runReplay()}>Replay</button>} />
+        <PanelTitle title="Step Flow" action={<button type="button" className="ghost" disabled={!canReplay} onClick={() => void runReplay()}>Replay</button>} />
         <Dag steps={workflow.steps ?? []} />
         {message && <InlineError message={message} />}
-        {replay !== null && <JsonViewer value={replay} />}
+        {replay !== null && <ReplaySummary replay={replay} />}
       </section>
       <section className="panel">
         <h2>Steps</h2>
@@ -75,8 +77,27 @@ export function WorkflowDetailPage({ workflowID, session }: { workflowID: string
       </section>
       <section className="panel">
         <h2>Result</h2>
-        <JsonViewer value={workflow.result_json ?? workflow.error ?? null} />
+        <JsonViewer title="Workflow Result" value={workflow.result_json ?? workflow.error ?? null} />
       </section>
     </div>
   );
+}
+
+function ReplaySummary({ replay }: { replay: unknown }) {
+  const consistent = replayConsistency(replay);
+  return (
+    <div className="trace-result">
+      <div className="panel-title">
+        <h2>Replay</h2>
+        <span className={`badge ${consistent === false ? "bad" : "good"}`}>{consistent === false ? "Diverged" : "Consistent"}</span>
+      </div>
+      <JsonViewer title="Replay JSON" value={replay} collapsible />
+    </div>
+  );
+}
+
+function replayConsistency(value: unknown): boolean | undefined {
+  if (typeof value !== "object" || value === null || !("consistent_with_metadata" in value)) return undefined;
+  const consistent = (value as { consistent_with_metadata?: unknown }).consistent_with_metadata;
+  return typeof consistent === "boolean" ? consistent : undefined;
 }
