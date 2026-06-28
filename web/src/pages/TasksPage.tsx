@@ -3,10 +3,12 @@ import { api, type TaskListQuery } from "../api/client";
 import { ErrorPanel } from "../components/ErrorPanel";
 import { TaskTable } from "../components/domainTables";
 import { usePolling } from "../hooks/usePolling";
+import type { ConsoleSession } from "../types/logserve";
+import { roleAtLeast } from "../utils/roles";
 
 const defaultPageSize = 50;
 
-export function TasksPage() {
+export function TasksPage({ session }: { session?: ConsoleSession | null }) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   const [workerID, setWorkerID] = useState("");
@@ -54,7 +56,7 @@ export function TasksPage() {
         </select>
         <input value={workerID} onChange={(event) => setWorkerID(event.target.value)} placeholder="Worker ID" />
         <input value={workflowID} onChange={(event) => setWorkflowID(event.target.value)} placeholder="Workflow ID" />
-        <a data-nav className="button primary" href="/submit/task">Submit</a>
+        {roleAtLeast(session, "operator") && <a data-nav className="button primary" href="/submit/task">Submit</a>}
       </div>
       <TaskTable rows={rows} pagination={{
         label: pageLabel("tasks", pageIndex, pageSize, rows.length, totalCount),

@@ -14,7 +14,7 @@ test("settings saves token and sends it on console requests", async ({ page }) =
   await expect(page.evaluate(() => sessionStorage.getItem("logserve.console.token"))).resolves.toBe("browser-token");
 
   const authorizedRequest = page.waitForRequest((request) =>
-    request.url().includes("/api/events") && request.headers().authorization === "Bearer browser-token"
+    request.url().includes("/api/events") && request.headers().authorization === "Bearer browser-token" && Boolean(request.headers()["x-request-id"])
   );
   await page.getByRole("link", { name: "Overview" }).click();
   await authorizedRequest;
@@ -57,6 +57,36 @@ test("submit task navigates to task detail", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Result" })).toBeVisible();
 });
 
+test("template library lists and runs a built-in template", async ({ page }) => {
+  await page.goto("/templates");
+  await expect(page.getByRole("heading", { name: "Templates" })).toBeVisible();
+  await expect(page.getByText("Add task")).toBeVisible();
+  await expect(page.getByText("Task succeeds with result_json 3.")).toBeVisible();
+
+  const runResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/templates/add_task/run") && response.request().method() === "POST"
+  );
+  await page.locator(".template-card", { hasText: "Add task" }).getByRole("button", { name: "Run" }).click();
+  await runResponse;
+  await expect(page.getByText("Last run: Add task")).toBeVisible();
+  await expect(page.getByText("task-template-1")).toBeVisible();
+});
+test("viewer role hides operator-only console actions", async ({ page }) => {
+  await page.goto("/settings");
+  await page.getByLabel("API token").fill("viewer-token");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByTitle("viewer:browser-token")).toBeVisible();
+
+  await page.goto("/templates");
+  await expect(page.locator(".template-card", { hasText: "Add task" }).getByRole("button", { name: "Run" })).toBeDisabled();
+  await expect(page.locator(".template-card", { hasText: "Mock LLM request" }).getByRole("button", { name: "Run" })).toBeDisabled();
+
+  await page.goto("/tasks");
+  await expect(page.getByRole("link", { name: "Submit" })).toHaveCount(0);
+
+  await page.goto("/workflows");
+  await expect(page.getByRole("link", { name: "New" })).toHaveCount(0);
+});
 test("workflow builder validates structured DAG definition", async ({ page }) => {
   await page.goto("/workflows/new");
   await expect(page.getByRole("heading", { name: "Workflow Builder" })).toBeVisible();

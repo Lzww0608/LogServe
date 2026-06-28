@@ -1,4 +1,4 @@
-import { APIError, getStoredToken } from "./client.js";
+import { APIError, getStoredToken, requestID } from "./client.js";
 
 export type EventStreamOptions = {
   taskID?: string;
@@ -97,6 +97,7 @@ export async function consumeEventStream(
   const headers = new Headers();
   const token = getStoredToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
+  headers.set("X-Request-ID", requestID());
   const response = await fetch(createEventStreamURL(options), { headers, signal });
   if (!response.ok) {
     throw new APIError(response.status, "HTTP_ERROR", response.statusText || "event stream request failed");

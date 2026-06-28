@@ -6,24 +6,31 @@ import { JsonViewer } from "../components/JsonViewer";
 import { PanelTitle } from "../components/PanelTitle";
 import { StatusBadge } from "../components/StatusBadge";
 import { usePolling } from "../hooks/usePolling";
+import type { ConsoleSession } from "../types/logserve";
 import { defaultID } from "../utils/format";
 import { copyToClipboard } from "../utils/clipboard";
 import { firstValidationError, validateActorCallForm } from "../utils/formValidation";
+import { roleAtLeast } from "../utils/roles";
 import { errorMessage } from "../utils/status";
 
-export function ActorDetailPage({ actorID }: { actorID: string }) {
+export function ActorDetailPage({ actorID, session }: { actorID: string; session?: ConsoleSession | null }) {
   const state = usePolling(() => api.actor(actorID), 1000, [actorID]);
   const [method, setMethod] = useState("inc");
   const [args, setArgs] = useState("[1]");
   const [idempotencyKey, setIdempotencyKey] = useState(defaultID("ui-actor-call"));
   const [callResult, setCallResult] = useState<unknown>(null);
   const [message, setMessage] = useState("");
+  const canOperate = roleAtLeast(session, "operator");
 
   const validation = useMemo(() => validateActorCallForm(method, args), [method, args]);
 
   const call = async (event: FormEvent) => {
     event.preventDefault();
     setMessage("");
+    if (!canOperate) {
+      setMessage("Operator role is required to call actors.");
+      return;
+    }
     if (!validation.valid) {
       setMessage(firstValidationError(validation.errors));
       return;
@@ -36,6 +43,19 @@ export function ActorDetailPage({ actorID }: { actorID: string }) {
         idempotency_key: idempotencyKey,
         timeout_ms: 30000
       }));
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
+  };
+
+  const replay = async () => {
+    setMessage("");
+    if (!canOperate) {
+      setMessage("Operator role is required to replay actors.");
+      return;
+    }
+    try {
+      setCallResult(await api.replayActor(actorID));
     } catch (error) {
       setMessage(errorMessage(error));
     }
@@ -61,10 +81,10 @@ export function ActorDetailPage({ actorID }: { actorID: string }) {
         <label>Args<textarea className={`short${validation.errors.args ? " input-invalid" : ""}`} value={args} onChange={(event) => setArgs(event.target.value)} aria-invalid={Boolean(validation.errors.args)} /><FieldError message={validation.errors.args} /></label>
         <label>Idempotency key<input value={idempotencyKey} onChange={(event) => setIdempotencyKey(event.target.value)} /></label>
         <div className="button-row">
-          <button type="submit" className="primary" disabled={!validation.valid}>Call</button>
+          <button type="submit" className="primary" disabled={!canOperate || !validation.valid}>Call</button>
           <button type="button" className="ghost" onClick={() => setIdempotencyKey(defaultID("ui-actor-call"))}>New key</button>
           <button type="button" className="ghost" onClick={() => void copyToClipboard(idempotencyKey)}>Copy key</button>
-          <button type="button" className="ghost" onClick={async () => setCallResult(await api.replayActor(actorID))}>Replay</button>
+          <button type="button" className="ghost" disabled={!canOperate} onClick={() => void replay()}>Replay</button>
         </div>
         {message && <InlineError message={message} />}
       </form>

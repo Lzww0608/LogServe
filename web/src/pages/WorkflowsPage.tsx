@@ -4,10 +4,12 @@ import { ErrorPanel } from "../components/ErrorPanel";
 import { PanelTitle } from "../components/PanelTitle";
 import { WorkflowTable } from "../components/domainTables";
 import { usePolling } from "../hooks/usePolling";
+import type { ConsoleSession } from "../types/logserve";
+import { roleAtLeast } from "../utils/roles";
 
 const defaultPageSize = 50;
 
-export function WorkflowsPage() {
+export function WorkflowsPage({ session }: { session?: ConsoleSession | null }) {
   const [status, setStatus] = useState("");
   const [pageSize, setPageSize] = useState(defaultPageSize);
   const [pageIndex, setPageIndex] = useState(0);
@@ -34,7 +36,7 @@ export function WorkflowsPage() {
 
   return (
     <section className="panel">
-      <PanelTitle title="Workflows" action={<a data-nav className="button primary" href="/workflows/new">New</a>} />
+      <PanelTitle title="Workflows" action={roleAtLeast(session, "operator") ? <a data-nav className="button primary" href="/workflows/new">New</a> : undefined} />
       <div className="toolbar">
         <select value={status} onChange={(event) => setStatus(event.target.value)}>
           <option value="">All status</option>

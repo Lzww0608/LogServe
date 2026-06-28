@@ -9,6 +9,8 @@ import { copyToClipboard } from "../utils/clipboard";
 import { analyzeWorkflowDefinition, firstValidationError, parseJSONField, validateWorkflowForm, type TaskMode } from "../utils/formValidation";
 import { navigate } from "../utils/navigation";
 import { errorMessage } from "../utils/status";
+import type { ConsoleSession } from "../types/logserve";
+import { roleAtLeast } from "../utils/roles";
 
 type StepPosition = { x: number; y: number };
 
@@ -59,7 +61,7 @@ type BuiltWorkflowDefinition = {
 
 let nextStepUID = 0;
 
-export function WorkflowBuilderPage() {
+export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | null }) {
   const initialSteps = useMemo(() => stepsFromDefinition(workflowTemplate), []);
   const [workflowName, setWorkflowName] = useState(stringValue(workflowTemplate.workflow_name) || "simple_add");
   const [maxAttempts, setMaxAttempts] = useState(numberText(workflowTemplate.max_attempts) || "3");
@@ -74,6 +76,7 @@ export function WorkflowBuilderPage() {
   const [connectFrom, setConnectFrom] = useState(initialSteps[0]?.stepId ?? "");
   const [connectTo, setConnectTo] = useState(initialSteps[1]?.stepId ?? initialSteps[0]?.stepId ?? "");
   const [dragging, setDragging] = useState<{ uid: string; offsetX: number; offsetY: number } | null>(null);
+  const canSubmit = roleAtLeast(session, "operator");
   const dagCanvasRef = useRef<HTMLDivElement>(null);
 
   const built = useMemo(() => buildWorkflowDefinition(workflowName, steps, resultStepId, maxAttempts, timeoutMs), [workflowName, steps, resultStepId, maxAttempts, timeoutMs]);
@@ -96,6 +99,10 @@ export function WorkflowBuilderPage() {
 
   const validate = async () => {
     setMessage("");
+    if (!canSubmit) {
+      setValidationResult({ valid: false, message: "Operator role is required to validate workflows.", order: topology.order });
+      return;
+    }
     if (!formValid) {
       setValidationResult({ valid: false, message: firstError, order: topology.order });
       return;
@@ -110,6 +117,10 @@ export function WorkflowBuilderPage() {
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setMessage("");
+    if (!canSubmit) {
+      setMessage("Operator role is required to submit workflows.");
+      return;
+    }
     if (!formValid) {
       setMessage(firstError);
       return;
@@ -234,11 +245,11 @@ export function WorkflowBuilderPage() {
           </select></label>
           <label>Idempotency key<input value={idempotencyKey} onChange={(event) => setIdempotencyKey(event.target.value)} /></label>
           <div className="button-row">
-            <button type="button" className="ghost" onClick={validate} disabled={!formValid}>Validate</button>
+            <button type="button" className="ghost" onClick={validate} disabled={!canSubmit || !formValid}>Validate</button>
             <button type="button" className="ghost" onClick={() => setIdempotencyKey(defaultID("ui-wf"))}>New key</button>
             <button type="button" className="ghost" onClick={() => void copyToClipboard(idempotencyKey)}>Copy key</button>
             <button type="button" className="ghost" onClick={() => void copyToClipboard(definitionJSON)}>Copy JSON</button>
-            <button type="submit" className="primary" disabled={submitting || !formValid}>Submit</button>
+            <button type="submit" className="primary" disabled={!canSubmit || submitting || !formValid}>Submit</button>
           </div>
           {message && <InlineError message={message} />}
           <div>

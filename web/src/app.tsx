@@ -1,7 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { api } from "./api/client";
 import { AppShell } from "./components/AppShell";
 import { pathTitle, renderRoute } from "./routes";
+import type { ConsoleSession } from "./types/logserve";
 import { navigate } from "./utils/navigation";
+import { errorMessage } from "./utils/status";
 
 type BrowserLocation = {
   path: string;
@@ -17,6 +20,19 @@ function currentBrowserLocation(): BrowserLocation {
 
 export function App() {
   const [location, setLocation] = useState(currentBrowserLocation);
+  const [session, setSession] = useState<ConsoleSession | null>(null);
+  const [sessionError, setSessionError] = useState("");
+
+  const refreshSession = useCallback(async () => {
+    try {
+      const next = await api.session();
+      setSession(next);
+      setSessionError("");
+    } catch (error) {
+      setSession(null);
+      setSessionError(errorMessage(error));
+    }
+  }, []);
 
   useEffect(() => {
     const onPop = () => setLocation(currentBrowserLocation());
@@ -37,9 +53,15 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    void refreshSession();
+    window.addEventListener("logserve:token-change", refreshSession);
+    return () => window.removeEventListener("logserve:token-change", refreshSession);
+  }, [refreshSession]);
+
   return (
-    <AppShell path={location.path} title={pathTitle(location.path)}>
-      {renderRoute(location.path, location.fullPath)}
+    <AppShell path={location.path} title={pathTitle(location.path)} session={session} sessionError={sessionError}>
+      {renderRoute(location.path, location.fullPath, session, refreshSession)}
     </AppShell>
   );
 }

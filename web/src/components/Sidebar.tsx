@@ -1,27 +1,30 @@
 import type { ReactNode } from "react";
+import type { ConsoleRole, ConsoleSession } from "../types/logserve";
+import { roleAtLeast } from "../utils/roles";
 
-const navItems = [
-  ["/", "Overview"],
-  ["/submit/task", "Submit Task"],
-  ["/tasks", "Tasks"],
-  ["/functions", "Functions"],
-  ["/workflows", "Workflows"],
-  ["/workflows/new", "Workflow Builder"],
-  ["/actors", "Actors"],
-  ["/llm", "LLM Serving"],
-  ["/workers", "Workers"],
-  ["/logs", "Logs"],
-  ["/admin", "Admin"],
-  ["/settings", "Settings"]
-] as const;
+const navItems: Array<{ href: string; label: string; minRole?: ConsoleRole }> = [
+  { href: "/", label: "Overview", minRole: "viewer" },
+  { href: "/submit/task", label: "Submit Task", minRole: "operator" },
+  { href: "/templates", label: "Templates", minRole: "viewer" },
+  { href: "/tasks", label: "Tasks", minRole: "viewer" },
+  { href: "/functions", label: "Functions", minRole: "operator" },
+  { href: "/workflows", label: "Workflows", minRole: "viewer" },
+  { href: "/workflows/new", label: "Workflow Builder", minRole: "operator" },
+  { href: "/actors", label: "Actors", minRole: "operator" },
+  { href: "/llm", label: "LLM Serving", minRole: "operator" },
+  { href: "/workers", label: "Workers", minRole: "operator" },
+  { href: "/logs", label: "Logs", minRole: "viewer" },
+  { href: "/admin", label: "Admin", minRole: "admin" },
+  { href: "/settings", label: "Settings" }
+];
 
-export function Sidebar({ path }: { path: string }) {
+export function Sidebar({ path, session }: { path: string; session?: ConsoleSession | null }) {
   return (
     <aside className="sidebar">
       <div className="brand">LogServe</div>
       <nav>
-        {navItems.map(([href, label]) => (
-          <NavLink key={href} path={href} current={path}>{label}</NavLink>
+        {navItems.filter((item) => !item.minRole || roleAtLeast(session, item.minRole)).map((item) => (
+          <NavLink key={item.href} path={item.href} current={path}>{item.label}</NavLink>
         ))}
       </nav>
     </aside>

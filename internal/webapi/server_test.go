@@ -33,10 +33,21 @@ type fakeClientConn struct {
 	readLogReqs        []*logservepb.ReadLogRequest
 	statsReqs          []*logservepb.GetStreamStatsRequest
 	setBackpressureReq *logservepb.SetBackpressureRequest
+	appendLogReqs      []*logservepb.AppendLogRequest
 	calls              []string
 }
 
 func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply any, _ ...grpc.CallOption) error {
+	if method == logservepb.LogService_AppendLog_FullMethodName {
+		if in, ok := req.(*logservepb.AppendLogRequest); ok {
+			f.appendLogReqs = append(f.appendLogReqs, proto.Clone(in).(*logservepb.AppendLogRequest))
+		}
+		if out, ok := reply.(*logservepb.AppendLogResponse); ok {
+			out.Seq = uint64(len(f.appendLogReqs))
+			out.TimestampMs = int64(len(f.appendLogReqs))
+		}
+		return nil
+	}
 	f.calls = append(f.calls, method)
 	switch method {
 	case logservepb.ControlService_GetDashboardSnapshot_FullMethodName:
@@ -1398,5 +1409,200 @@ func TestStaticFallbackServesIndexForDeepLinks(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), "LogServe Console") {
 		t.Fatalf("static fallback body did not contain index: %s", resp.Body.String())
+	}
+}
+
+func newRoleTestServer(conn *fakeClientConn, tokens map[role]string) *Server {
+	if conn == nil {
+		conn = &fakeClientConn{}
+	}
+	s := &Server{
+		cfg: Config{
+			RoleTokens:           tokens,
+			AllowUnauthenticated: false,
+			RequestTimeout:       time.Second,
+		},
+		clients: &Clients{
+			Control: logservepb.NewControlServiceClient(conn),
+			Log:     logservepb.NewLogServiceClient(conn),
+		},
+		mux:                   http.NewServeMux(),
+		functionRegistryCache: newFunctionRegistryCache(),
+	}
+	s.registerRoutes()
+	return s
+}
+
+func decodeAuditRecord(t *testing.T, req *logservepb.AppendLogRequest) auditEvent {
+	t.Helper()
+	if req.GetStreamId() != auditStreamID {
+		t.Fatalf("audit stream = %q", req.GetStreamId())
+	}
+	var event auditEvent
+	if err := json.Unmarshal(req.GetPayload(), &event); err != nil {
+		t.Fatalf("decode audit: %v", err)
+	}
+	return event
+}
+
+func TestRoleTokenConfigRequiresBackendToken(t *testing.T) {
+	viewerOnly := Config{RoleTokens: map[role]string{roleViewer: "viewer-token"}}
+	normalizeAuthConfig(&viewerOnly)
+	if hasConfiguredToken(viewerOnly) {
+		t.Fatalf("viewer-only role token must not satisfy backend RPC token config")
+	}
+
+	adminToken := Config{RoleTokens: map[role]string{roleAdmin: "admin-token"}}
+	normalizeAuthConfig(&adminToken)
+	if !hasConfiguredToken(adminToken) || adminToken.APIToken != "admin-token" {
+		t.Fatalf("admin role token should backfill backend RPC token: %+v", adminToken)
+	}
+}
+
+func TestRoleTokenConfigRejectsDuplicateRoleTokens(t *testing.T) {
+	cfg := Config{APIToken: "admin-token", RoleTokens: map[role]string{roleViewer: "same-token", roleOperator: "same-token"}}
+	normalizeAuthConfig(&cfg)
+	if err := validateAuthConfig(cfg); err == nil || !strings.Contains(err.Error(), "duplicate token") {
+		t.Fatalf("duplicate role tokens error = %v", err)
+	}
+}
+func TestRoleTokensGateOperatorAndAdminOperations(t *testing.T) {
+	tokens := map[role]string{roleViewer: "viewer-token", roleOperator: "operator-token", roleAdmin: "admin-token"}
+	viewerConn := &fakeClientConn{}
+	viewerSrv := newRoleTestServer(viewerConn, tokens)
+
+	viewerResp := httptest.NewRecorder()
+	viewerReq := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"task_name":"add","function_name":"add","function_source":"def add(): return 3","args":[],"kwargs":{}}`))
+	viewerReq.Header.Set("Authorization", "Bearer viewer-token")
+	viewerReq.Header.Set("X-Request-ID", "req-viewer-denied")
+	viewerSrv.Handler().ServeHTTP(viewerResp, viewerReq)
+	if viewerResp.Code != http.StatusForbidden {
+		t.Fatalf("viewer submit status = %d, body %s", viewerResp.Code, viewerResp.Body.String())
+	}
+	if len(viewerConn.submitTaskReqs) != 0 {
+		t.Fatalf("viewer reached submit task: %+v", viewerConn.submitTaskReqs)
+	}
+	if len(viewerConn.appendLogReqs) != 1 || viewerConn.appendLogReqs[0].GetStreamId() != auditStreamID {
+		t.Fatalf("viewer audit records = %+v", viewerConn.appendLogReqs)
+	}
+	denied := decodeAuditRecord(t, viewerConn.appendLogReqs[0])
+	if denied.Subject == "" || denied.Role != string(roleViewer) || denied.Action != "submit_task" || denied.Result != "denied" || denied.RequestID != "req-viewer-denied" {
+		t.Fatalf("denied audit = %+v", denied)
+	}
+
+	operatorConn := &fakeClientConn{submitTask: &logservepb.SubmitTaskResponse{TaskId: "task-template", Status: logservepb.TaskStatus_TASK_STATUS_QUEUED}}
+	operatorSrv := newRoleTestServer(operatorConn, tokens)
+	operatorResp := httptest.NewRecorder()
+	operatorReq := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"task_name":"add","function_name":"add","function_source":"def add(): return 3","args":[],"kwargs":{}}`))
+	operatorReq.Header.Set("Authorization", "Bearer operator-token")
+	operatorReq.Header.Set("X-Request-ID", "req-operator-submit")
+	operatorSrv.Handler().ServeHTTP(operatorResp, operatorReq)
+	if operatorResp.Code != http.StatusOK {
+		t.Fatalf("operator submit status = %d, body %s", operatorResp.Code, operatorResp.Body.String())
+	}
+	if len(operatorConn.submitTaskReqs) != 1 {
+		t.Fatalf("operator submit requests = %d", len(operatorConn.submitTaskReqs))
+	}
+	accepted := decodeAuditRecord(t, operatorConn.appendLogReqs[0])
+	if accepted.Role != string(roleOperator) || accepted.Result != "ok" || accepted.RequestID != "req-operator-submit" {
+		t.Fatalf("accepted audit = %+v", accepted)
+	}
+
+	adminResp := httptest.NewRecorder()
+	adminReq := httptest.NewRequest(http.MethodPost, "/api/admin/backpressure", strings.NewReader(`{"queue_high_watermark":1024,"redelivery_timeout_ms":30000,"log_append_slow_ms":100}`))
+	adminReq.Header.Set("Authorization", "Bearer operator-token")
+	operatorSrv.Handler().ServeHTTP(adminResp, adminReq)
+	if adminResp.Code != http.StatusForbidden {
+		t.Fatalf("operator backpressure status = %d, body %s", adminResp.Code, adminResp.Body.String())
+	}
+}
+
+func TestSessionReportsRoleAndPermissions(t *testing.T) {
+	conn := &fakeClientConn{}
+	srv := newRoleTestServer(conn, map[role]string{roleViewer: "viewer-token"})
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/session", nil)
+	req.Header.Set("Authorization", "Bearer viewer-token")
+	srv.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	if !strings.Contains(body, `"role":"viewer"`) || !strings.Contains(body, `"read:templates"`) {
+		t.Fatalf("session payload = %s", body)
+	}
+	if len(conn.appendLogReqs) != 1 {
+		t.Fatalf("session audit records = %+v", conn.appendLogReqs)
+	}
+	audit := decodeAuditRecord(t, conn.appendLogReqs[0])
+	if audit.Action != "read_session" || audit.Result != "ok" || audit.Role != string(roleViewer) {
+		t.Fatalf("session audit = %+v", audit)
+	}
+}
+
+func TestOperatorCannotRunAdminOnlyTemplate(t *testing.T) {
+	conn := &fakeClientConn{}
+	srv := newRoleTestServer(conn, map[role]string{roleOperator: "operator-token", roleAdmin: "admin-token"})
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/templates/mock_llm_request/run", strings.NewReader(`{"idempotency_key":"mock-key"}`))
+	req.Header.Set("Authorization", "Bearer operator-token")
+	req.Header.Set("X-Request-ID", "req-operator-mock-template")
+	srv.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("operator mock template status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	if len(conn.calls) != 0 {
+		t.Fatalf("operator reached backend for admin-only template: %v", conn.calls)
+	}
+	if len(conn.appendLogReqs) != 1 {
+		t.Fatalf("audit records = %+v", conn.appendLogReqs)
+	}
+	audit := decodeAuditRecord(t, conn.appendLogReqs[0])
+	if audit.Action != "run_template" || audit.Result != "denied" || audit.Role != string(roleOperator) || audit.RequestID != "req-operator-mock-template" {
+		t.Fatalf("admin-only template audit = %+v", audit)
+	}
+}
+func TestTemplatesListAndRunAddTask(t *testing.T) {
+	conn := &fakeClientConn{submitTask: &logservepb.SubmitTaskResponse{TaskId: "task-add", Status: logservepb.TaskStatus_TASK_STATUS_QUEUED}}
+	srv := newRoleTestServer(conn, map[role]string{roleOperator: "operator-token"})
+
+	listResp := httptest.NewRecorder()
+	listReq := httptest.NewRequest(http.MethodGet, "/api/templates", nil)
+	listReq.Header.Set("Authorization", "Bearer operator-token")
+	srv.Handler().ServeHTTP(listResp, listReq)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body %s", listResp.Code, listResp.Body.String())
+	}
+	if body := listResp.Body.String(); !strings.Contains(body, `"id":"add_task"`) || !strings.Contains(body, `"id":"mock_llm_request"`) || !strings.Contains(body, `"expected_result"`) {
+		t.Fatalf("template list missing built-ins: %s", body)
+	}
+	if len(conn.appendLogReqs) != 1 {
+		t.Fatalf("list audit records = %+v", conn.appendLogReqs)
+	}
+	listAudit := decodeAuditRecord(t, conn.appendLogReqs[0])
+	if listAudit.Action != "list_templates" || listAudit.Result != "ok" {
+		t.Fatalf("template list audit = %+v", listAudit)
+	}
+
+	runResp := httptest.NewRecorder()
+	runReq := httptest.NewRequest(http.MethodPost, "/api/templates/add_task/run", strings.NewReader(`{"idempotency_key":"template-key"}`))
+	runReq.Header.Set("Authorization", "Bearer operator-token")
+	srv.Handler().ServeHTTP(runResp, runReq)
+	if runResp.Code != http.StatusOK {
+		t.Fatalf("run status = %d, body %s", runResp.Code, runResp.Body.String())
+	}
+	if len(conn.submitTaskReqs) != 1 {
+		t.Fatalf("submit task requests = %d", len(conn.submitTaskReqs))
+	}
+	submitted := conn.submitTaskReqs[0]
+	if submitted.GetTaskName() != "add" || submitted.GetFunctionName() != "add" || string(submitted.GetArgsJson()) != `{"args":[1,2],"kwargs":{}}` || submitted.GetIdempotencyKey() != "template-key" {
+		t.Fatalf("template submit = %+v", submitted)
+	}
+	if len(conn.appendLogReqs) != 2 {
+		t.Fatalf("audit records = %+v", conn.appendLogReqs)
+	}
+	runAudit := decodeAuditRecord(t, conn.appendLogReqs[1])
+	if runAudit.Action != "run_template" || runAudit.Result != "ok" {
+		t.Fatalf("template run audit = %+v", runAudit)
 	}
 }

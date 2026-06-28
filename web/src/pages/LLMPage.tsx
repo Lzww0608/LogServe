@@ -5,13 +5,14 @@ import { JsonViewer } from "../components/JsonViewer";
 import { PanelTitle } from "../components/PanelTitle";
 import { ModelTable } from "../components/domainTables";
 import { usePolling } from "../hooks/usePolling";
-import type { LLMTrace } from "../types/logserve";
+import type { ConsoleSession, LLMTrace } from "../types/logserve";
 import { defaultID } from "../utils/format";
 import { copyToClipboard } from "../utils/clipboard";
 import { firstValidationError, validateLLMForm } from "../utils/formValidation";
+import { roleAtLeast } from "../utils/roles";
 import { errorMessage } from "../utils/status";
 
-export function LLMPage() {
+export function LLMPage({ session }: { session?: ConsoleSession | null }) {
   const modelsState = usePolling(() => api.models(), 1000);
   const [modelName, setModelName] = useState("model-A");
   const [modelVersion, setModelVersion] = useState("v1");
@@ -22,11 +23,17 @@ export function LLMPage() {
   const [trace, setTrace] = useState<LLMTrace | null>(null);
   const [policy, setPolicy] = useState("LOCALITY_AWARE");
   const [message, setMessage] = useState("");
+  const canOperate = roleAtLeast(session, "operator");
+  const canAdmin = roleAtLeast(session, "admin");
 
   const validation = useMemo(() => validateLLMForm(modelName, prompt), [modelName, prompt]);
 
   const register = async () => {
     setMessage("");
+    if (!canAdmin) {
+      setMessage("Admin role is required to register models.");
+      return;
+    }
     if (validation.errors.modelName) {
       setMessage(validation.errors.modelName);
       return;
@@ -40,6 +47,10 @@ export function LLMPage() {
 
   const submit = async () => {
     setMessage("");
+    if (!canOperate) {
+      setMessage("Operator role is required to submit LLM requests.");
+      return;
+    }
     if (!validation.valid) {
       setMessage(firstValidationError(validation.errors));
       return;
@@ -63,8 +74,25 @@ export function LLMPage() {
   const replay = async () => {
     if (!taskID.trim()) return;
     setMessage("");
+    if (!canOperate) {
+      setMessage("Operator role is required to replay LLM traces.");
+      return;
+    }
     try {
       setTrace(await api.replayLLM(taskID.trim()));
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
+  };
+
+  const setSchedulingPolicy = async () => {
+    setMessage("");
+    if (!canOperate) {
+      setMessage("Operator role is required to set scheduling policy.");
+      return;
+    }
+    try {
+      setMessage((await api.setSchedulingPolicy(policy)).policy);
     } catch (error) {
       setMessage(errorMessage(error));
     }
@@ -87,8 +115,8 @@ export function LLMPage() {
             <option>PREDICTED_LATENCY</option>
           </select></label>
           <div className="button-row">
-            <button type="button" className="ghost" onClick={register} disabled={Boolean(validation.errors.modelName)}>Register</button>
-            <button type="button" className="ghost" onClick={async () => setMessage((await api.setSchedulingPolicy(policy)).policy)}>Set Policy</button>
+            <button type="button" className="ghost" onClick={register} disabled={!canAdmin || Boolean(validation.errors.modelName)}>Register</button>
+            <button type="button" className="ghost" onClick={() => void setSchedulingPolicy()} disabled={!canOperate}>Set Policy</button>
           </div>
         </div>
       </section>
@@ -98,10 +126,10 @@ export function LLMPage() {
           <label>Idempotency key<input value={idempotencyKey} onChange={(event) => setIdempotencyKey(event.target.value)} /></label>
           <label>Trace task<input value={taskID} onChange={(event) => setTaskID(event.target.value)} /></label>
           <div className="button-row">
-            <button type="button" className="primary" onClick={submit} disabled={!validation.valid}>Submit</button>
+            <button type="button" className="primary" onClick={submit} disabled={!canOperate || !validation.valid}>Submit</button>
             <button type="button" className="ghost" onClick={() => setIdempotencyKey(defaultID("ui-llm"))}>New key</button>
             <button type="button" className="ghost" onClick={() => void copyToClipboard(idempotencyKey)}>Copy key</button>
-            <button type="button" className="ghost" onClick={replay}>Replay</button>
+            <button type="button" className="ghost" onClick={replay} disabled={!canOperate || !taskID.trim()}>Replay</button>
           </div>
           {message && <InlineError message={message} />}
         </div>

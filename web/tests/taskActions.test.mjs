@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { taskActionState } from "../.tmp-task-action-tests/src/utils/taskActions.js";
-import { logStreamURL, taskActionURL, tasksURL, workflowsURL } from "../.tmp-task-action-tests/src/api/client.js";
+import { logStreamURL, taskActionURL, tasksURL, workflowsURL, templateRunURL } from "../.tmp-task-action-tests/src/api/client.js";
 
 const standaloneFailed = { task_id: "task-1", status: "FAILED", task_name: "add" };
 
@@ -34,4 +34,9 @@ test("list URL builders encode pagination and filters", () => {
   assert.equal(tasksURL({ q: "add fn", status: "RUNNING", workerID: "worker/1", workflowID: "wf:1", limit: 25, pageToken: "25" }), "/api/tasks?q=add+fn&status=RUNNING&worker_id=worker%2F1&workflow_id=wf%3A1&limit=25&page_token=25");
   assert.equal(workflowsURL({ status: "FAILED", limit: 100, pageToken: "next page" }), "/api/workflows?status=FAILED&limit=100&page_token=next+page");
   assert.equal(logStreamURL("wf:wf-1", 51, 25), "/api/logs/streams/wf%3Awf-1?from_seq=51&limit=25");
+});
+
+test("templateRunURL encodes template ids and wait flag", () => {
+  assert.equal(templateRunURL("mock_llm_request"), "/api/templates/mock_llm_request/run");
+  assert.equal(templateRunURL("custom template", true), "/api/templates/custom%20template/run?wait=1");
 });

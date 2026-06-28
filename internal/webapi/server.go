@@ -18,9 +18,12 @@ type Server struct {
 }
 
 func NewServer(cfg Config) (*Server, error) {
-	cfg.APIToken = strings.TrimSpace(cfg.APIToken)
-	if cfg.APIToken == "" && !cfg.AllowUnauthenticated {
-		return nil, fmt.Errorf("%w: LOGSERVE_API_TOKEN is required unless --allow-unauthenticated is set", errInvalidInput)
+	normalizeAuthConfig(&cfg)
+	if !hasConfiguredToken(cfg) && !cfg.AllowUnauthenticated {
+		return nil, fmt.Errorf("%w: LOGSERVE_API_TOKEN or LOGSERVE_ADMIN_TOKEN is required unless --allow-unauthenticated is set", errInvalidInput)
+	}
+	if err := validateAuthConfig(cfg); err != nil {
+		return nil, err
 	}
 	clients, err := DialClients(cfg)
 	if err != nil {
@@ -46,40 +49,43 @@ func (s *Server) Close() error {
 
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
-	s.mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
-	s.mux.HandleFunc("GET /api/events", s.handleEvents)
-	s.mux.HandleFunc("GET /api/tasks", s.handleListTasks)
-	s.mux.HandleFunc("POST /api/tasks", s.handleSubmitTask)
-	s.mux.HandleFunc("GET /api/tasks/{task_id}", s.handleGetTask)
-	s.mux.HandleFunc("POST /api/tasks/{task_id}/retry", s.handleRetryTask)
-	s.mux.HandleFunc("POST /api/tasks/{task_id}/cancel", s.handleCancelTask)
-	s.mux.HandleFunc("POST /api/tasks/{task_id}/resubmit", s.handleResubmitTask)
-	s.mux.HandleFunc("GET /api/workflows", s.handleListWorkflows)
-	s.mux.HandleFunc("POST /api/workflows", s.handleSubmitWorkflow)
-	s.mux.HandleFunc("POST /api/workflows/validate", s.handleValidateWorkflow)
-	s.mux.HandleFunc("GET /api/workflows/{workflow_id}", s.handleGetWorkflow)
-	s.mux.HandleFunc("POST /api/workflows/{workflow_id}/replay", s.handleReplayWorkflow)
-	s.mux.HandleFunc("GET /api/actors", s.handleListActors)
-	s.mux.HandleFunc("POST /api/actors", s.handleCreateActor)
-	s.mux.HandleFunc("GET /api/actors/{actor_id}", s.handleGetActor)
-	s.mux.HandleFunc("POST /api/actors/{actor_id}/calls", s.handleCallActor)
-	s.mux.HandleFunc("POST /api/actors/{actor_id}/replay", s.handleReplayActor)
-	s.mux.HandleFunc("GET /api/models", s.handleListModels)
-	s.mux.HandleFunc("POST /api/models", s.handleRegisterModel)
-	s.mux.HandleFunc("POST /api/llm", s.handleSubmitLLM)
-	s.mux.HandleFunc("POST /api/llm/{task_id}/replay", s.handleReplayLLM)
-	s.mux.HandleFunc("GET /api/workers", s.handleListWorkers)
-	s.mux.HandleFunc("GET /api/functions", s.handleListFunctions)
-	s.mux.HandleFunc("GET /api/functions/{function_hash}", s.handleGetFunction)
-	s.mux.HandleFunc("GET /api/logs/streams", s.handleListLogStreams)
-	s.mux.HandleFunc("GET /api/logs/streams/{stream_id}", s.handleReadLogStream)
-	s.mux.HandleFunc("GET /api/logs/stats", s.handleLogStats)
-	s.mux.HandleFunc("POST /api/admin/scheduling-policy", s.handleSetSchedulingPolicy)
-	s.mux.HandleFunc("POST /api/admin/backpressure", s.handleSetBackpressure)
-	s.mux.HandleFunc("GET /api/admin/config", s.handleAdminConfig)
+	s.handleRoute("GET /api/session", roleViewer, "read_session", s.handleSession)
+	s.handleRoute("GET /api/dashboard", roleViewer, "read_dashboard", s.handleDashboard)
+	s.handleRoute("GET /api/events", roleViewer, "stream_events", s.handleEvents)
+	s.handleRoute("GET /api/tasks", roleViewer, "list_tasks", s.handleListTasks)
+	s.handleRoute("POST /api/tasks", roleOperator, "submit_task", s.handleSubmitTask)
+	s.handleRoute("GET /api/tasks/{task_id}", roleViewer, "read_task", s.handleGetTask)
+	s.handleRoute("POST /api/tasks/{task_id}/retry", roleOperator, "retry_task", s.handleRetryTask)
+	s.handleRoute("POST /api/tasks/{task_id}/cancel", roleAdmin, "cancel_task", s.handleCancelTask)
+	s.handleRoute("POST /api/tasks/{task_id}/resubmit", roleOperator, "resubmit_task", s.handleResubmitTask)
+	s.handleRoute("GET /api/workflows", roleViewer, "list_workflows", s.handleListWorkflows)
+	s.handleRoute("POST /api/workflows", roleOperator, "submit_workflow", s.handleSubmitWorkflow)
+	s.handleRoute("POST /api/workflows/validate", roleOperator, "validate_workflow", s.handleValidateWorkflow)
+	s.handleRoute("GET /api/workflows/{workflow_id}", roleViewer, "read_workflow", s.handleGetWorkflow)
+	s.handleRoute("POST /api/workflows/{workflow_id}/replay", roleOperator, "replay_workflow", s.handleReplayWorkflow)
+	s.handleRoute("GET /api/actors", roleOperator, "list_actors", s.handleListActors)
+	s.handleRoute("POST /api/actors", roleOperator, "create_actor", s.handleCreateActor)
+	s.handleRoute("GET /api/actors/{actor_id}", roleOperator, "read_actor", s.handleGetActor)
+	s.handleRoute("POST /api/actors/{actor_id}/calls", roleOperator, "call_actor", s.handleCallActor)
+	s.handleRoute("POST /api/actors/{actor_id}/replay", roleOperator, "replay_actor", s.handleReplayActor)
+	s.handleRoute("GET /api/models", roleOperator, "list_models", s.handleListModels)
+	s.handleRoute("POST /api/models", roleAdmin, "register_model", s.handleRegisterModel)
+	s.handleRoute("POST /api/llm", roleOperator, "submit_llm", s.handleSubmitLLM)
+	s.handleRoute("POST /api/llm/{task_id}/replay", roleOperator, "replay_llm", s.handleReplayLLM)
+	s.handleRoute("GET /api/workers", roleOperator, "list_workers", s.handleListWorkers)
+	s.handleRoute("GET /api/functions", roleOperator, "list_functions", s.handleListFunctions)
+	s.handleRoute("GET /api/functions/{function_hash}", roleOperator, "read_function", s.handleGetFunction)
+	s.handleRoute("GET /api/logs/streams", roleViewer, "list_log_streams", s.handleListLogStreams)
+	s.handleRoute("GET /api/logs/streams/{stream_id}", roleViewer, "read_log_stream", s.handleReadLogStream)
+	s.handleRoute("GET /api/logs/stats", roleViewer, "read_log_stats", s.handleLogStats)
+	s.handleRoute("GET /api/templates", roleViewer, "list_templates", s.handleListTemplates)
+	s.handleRoute("GET /api/templates/{template_id}", roleViewer, "read_template", s.handleGetTemplate)
+	s.handleRoute("POST /api/templates/{template_id}/run", roleOperator, "run_template", s.handleRunTemplate)
+	s.handleRoute("POST /api/admin/scheduling-policy", roleOperator, "set_scheduling_policy", s.handleSetSchedulingPolicy)
+	s.handleRoute("POST /api/admin/backpressure", roleAdmin, "set_backpressure", s.handleSetBackpressure)
+	s.handleRoute("GET /api/admin/config", roleAdmin, "read_admin_config", s.handleAdminConfig)
 	s.mux.HandleFunc("/", s.handleStatic)
 }
-
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"status":       "ok",

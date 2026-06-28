@@ -16,6 +16,14 @@ export type EventStreamHandlers = {
 
 export function useEventStream(options: EventStreamOptions, handlers: EventStreamHandlers, deps: DependencyList = []): EventStreamState {
   const [state, setState] = useState<EventStreamState>({ connected: false });
+  const [authRevision, setAuthRevision] = useState(0);
+
+  useEffect(() => {
+    const onTokenChange = () => setAuthRevision((current) => current + 1);
+    window.addEventListener("logserve:token-change", onTokenChange);
+    return () => window.removeEventListener("logserve:token-change", onTokenChange);
+  }, []);
+
   useEffect(() => {
     if (options.enabled === false) {
       setState({ connected: false });
@@ -44,7 +52,7 @@ export function useEventStream(options: EventStreamOptions, handlers: EventStrea
       active = false;
       controller.abort();
     };
-  }, deps);
+  }, [authRevision, ...deps]);
   return state;
 }
 

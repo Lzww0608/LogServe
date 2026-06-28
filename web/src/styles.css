@@ -690,3 +690,51 @@ th {
     grid-template-columns: 1fr;
   }
 }
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.template-library-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.template-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+  align-content: space-between;
+  min-height: 210px;
+  background: #fff;
+}
+
+.template-card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.template-card p,
+.template-card dl {
+  margin: 8px 0 0;
+}
+
+.template-card dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.template-card dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}

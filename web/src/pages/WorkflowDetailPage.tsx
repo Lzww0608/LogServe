@@ -9,16 +9,19 @@ import { PanelTitle } from "../components/PanelTitle";
 import { StatusBadge } from "../components/StatusBadge";
 import { StepTable } from "../components/domainTables";
 import { useEventStream } from "../hooks/useEventStream";
-import type { Workflow } from "../types/logserve";
+import type { ConsoleSession, Workflow } from "../types/logserve";
 import { applyWorkflowEvent } from "../utils/eventState";
 import { formatTime } from "../utils/format";
+import { roleAtLeast } from "../utils/roles";
 import { errorMessage } from "../utils/status";
 
-export function WorkflowDetailPage({ workflowID }: { workflowID: string }) {
+export function WorkflowDetailPage({ workflowID, session }: { workflowID: string; session?: ConsoleSession | null }) {
   const [workflow, setWorkflow] = useState<Workflow>();
   const [error, setError] = useState("");
   const [replay, setReplay] = useState<unknown>(null);
   const [message, setMessage] = useState("");
+  const canReplay = roleAtLeast(session, "operator");
+
   useEffect(() => {
     setWorkflow(undefined);
     setError("");
@@ -32,6 +35,20 @@ export function WorkflowDetailPage({ workflowID }: { workflowID: string }) {
     setError("");
   }, []);
   useEventStream({ stream: `wf:${workflowID}`, intervalMs: 1000 }, { onMessage: handleMessage, onError: setError }, [workflowID]);
+
+  const runReplay = async () => {
+    if (!canReplay) {
+      setMessage("Operator role is required to replay workflows.");
+      return;
+    }
+    try {
+      setReplay(await api.replayWorkflow(workflowID));
+      setMessage("");
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
+  };
+
   if (error && !workflow) return <ErrorPanel message={error} />;
   if (!workflow) return <Loading />;
   return (
@@ -47,14 +64,7 @@ export function WorkflowDetailPage({ workflowID }: { workflowID: string }) {
         ]} />
       </section>
       <section className="panel">
-        <PanelTitle title="Step Flow" action={<button className="ghost" onClick={async () => {
-          try {
-            setReplay(await api.replayWorkflow(workflowID));
-            setMessage("");
-          } catch (error) {
-            setMessage(errorMessage(error));
-          }
-        }}>Replay</button>} />
+        <PanelTitle title="Step Flow" action={<button className="ghost" disabled={!canReplay} onClick={() => void runReplay()}>Replay</button>} />
         <Dag steps={workflow.steps ?? []} />
         {message && <InlineError message={message} />}
         {replay !== null && <JsonViewer value={replay} />}

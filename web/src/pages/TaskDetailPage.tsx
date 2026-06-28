@@ -7,14 +7,15 @@ import { JsonViewer } from "../components/JsonViewer";
 import { PanelTitle } from "../components/PanelTitle";
 import { StatusBadge } from "../components/StatusBadge";
 import { useEventStream } from "../hooks/useEventStream";
-import type { Task } from "../types/logserve";
+import type { ConsoleSession, Task } from "../types/logserve";
 import { applyTaskEvent } from "../utils/eventState";
 import { formatTime, modelLabel } from "../utils/format";
 import { navigate } from "../utils/navigation";
 import { errorMessage } from "../utils/status";
 import { taskActionState } from "../utils/taskActions";
+import { roleAtLeast } from "../utils/roles";
 
-export function TaskDetailPage({ taskID }: { taskID: string }) {
+export function TaskDetailPage({ taskID, session }: { taskID: string; session?: ConsoleSession | null }) {
   const [task, setTask] = useState<Task>();
   const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
@@ -35,6 +36,11 @@ export function TaskDetailPage({ taskID }: { taskID: string }) {
 
   const runAction = async (action: TaskOperation) => {
     if (!task) return;
+    const requiredRole = action === "cancel" ? "admin" : "operator";
+    if (!roleAtLeast(session, requiredRole)) {
+      setActionError(`${requiredRole.charAt(0).toUpperCase()}${requiredRole.slice(1)} role is required for ${action}.`);
+      return;
+    }
     const state = taskActionState(task, action);
     if (!state.enabled) {
       setActionError(state.reason ?? "Task action is unavailable.");
@@ -65,7 +71,7 @@ export function TaskDetailPage({ taskID }: { taskID: string }) {
     <div className="stack">
       {error && <ErrorPanel message={error} />}
       <section className="panel">
-        <PanelTitle title={task.task_id} action={<TaskActions task={task} busyAction={busyAction} onRun={runAction} />} />
+        <PanelTitle title={task.task_id} action={<TaskActions task={task} busyAction={busyAction} session={session} onRun={runAction} />} />
         <DetailGrid items={[
           ["Worker", task.worker_id],
           ["Created", formatTime(task.created_at_ms)],
@@ -85,30 +91,32 @@ export function TaskDetailPage({ taskID }: { taskID: string }) {
   );
 }
 
-function TaskActions({ task, busyAction, onRun }: { task: Task; busyAction: TaskOperation | ""; onRun: (action: TaskOperation) => void }) {
+function TaskActions({ task, busyAction, session, onRun }: { task: Task; busyAction: TaskOperation | ""; session?: ConsoleSession | null; onRun: (action: TaskOperation) => void }) {
   return (
     <div className="task-header-actions">
       <StatusBadge value={task.status} />
       <div className="button-row task-action-row">
         {(["retry", "resubmit", "cancel"] as TaskOperation[]).map((action) => (
-          <TaskActionButton key={action} task={task} action={action} busyAction={busyAction} onRun={onRun} />
+          <TaskActionButton key={action} task={task} action={action} busyAction={busyAction} session={session} onRun={onRun} />
         ))}
       </div>
     </div>
   );
 }
 
-function TaskActionButton({ task, action, busyAction, onRun }: { task: Task; action: TaskOperation; busyAction: TaskOperation | ""; onRun: (action: TaskOperation) => void }) {
+function TaskActionButton({ task, action, busyAction, session, onRun }: { task: Task; action: TaskOperation; busyAction: TaskOperation | ""; session?: ConsoleSession | null; onRun: (action: TaskOperation) => void }) {
   const state = taskActionState(task, action);
   const busy = busyAction === action;
-  const disabled = !state.enabled || busyAction !== "";
+  const requiredRole = action === "cancel" ? "admin" : "operator";
+  const roleBlocked = !roleAtLeast(session, requiredRole);
+  const disabled = roleBlocked || !state.enabled || busyAction !== "";
   return (
     <span className="task-action-control" title={state.reason ?? undefined}>
       <button
         type="button"
         className={action === "retry" ? "primary" : "ghost"}
         disabled={disabled}
-        aria-label={state.reason ? `${taskActionLabel(action)}: ${state.reason}` : taskActionLabel(action)}
+        aria-label={roleBlocked ? `${taskActionLabel(action)}: ${requiredRole} role required` : state.reason ? `${taskActionLabel(action)}: ${state.reason}` : taskActionLabel(action)}
         onClick={() => onRun(action)}
       >
         {busy ? "Working" : taskActionLabel(action)}

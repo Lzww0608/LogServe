@@ -11,20 +11,27 @@ import { copyToClipboard } from "../utils/clipboard";
 import { firstValidationError, validateActorCreateForm } from "../utils/formValidation";
 import { navigate } from "../utils/navigation";
 import { errorMessage } from "../utils/status";
+import type { ConsoleSession } from "../types/logserve";
+import { roleAtLeast } from "../utils/roles";
 
-export function ActorsPage() {
+export function ActorsPage({ session }: { session?: ConsoleSession | null }) {
   const state = usePolling(() => api.actors(), 1000);
   const [className, setClassName] = useState("Counter");
   const [classSource, setClassSource] = useState(counterSource);
   const [initArgs, setInitArgs] = useState("[0]");
   const [idempotencyKey, setIdempotencyKey] = useState(defaultID("ui-actor"));
   const [message, setMessage] = useState("");
+  const canCreate = roleAtLeast(session, "operator");
 
   const validation = useMemo(() => validateActorCreateForm(className, classSource, initArgs), [className, classSource, initArgs]);
 
   const create = async (event: FormEvent) => {
     event.preventDefault();
     setMessage("");
+    if (!canCreate) {
+      setMessage("Operator role is required to create actors.");
+      return;
+    }
     if (!validation.valid) {
       setMessage(firstValidationError(validation.errors));
       return;
@@ -58,7 +65,7 @@ export function ActorsPage() {
           <div className="button-row">
             <button type="button" className="ghost" onClick={() => setIdempotencyKey(defaultID("ui-actor"))}>New key</button>
             <button type="button" className="ghost" onClick={() => void copyToClipboard(idempotencyKey)}>Copy key</button>
-            <button type="submit" className="primary" disabled={!validation.valid}>Create</button>
+            <button type="submit" className="primary" disabled={!canCreate || !validation.valid}>Create</button>
           </div>
           {message && <InlineError message={message} />}
         </div>

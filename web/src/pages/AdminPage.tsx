@@ -3,9 +3,10 @@ import { api } from "../api/client";
 import { DetailGrid } from "../components/DetailGrid";
 import { ErrorPanel, InlineError, Loading } from "../components/ErrorPanel";
 import { PanelTitle } from "../components/PanelTitle";
-import type { AdminConfig } from "../types/logserve";
+import type { AdminConfig, ConsoleSession } from "../types/logserve";
 import { formatTime } from "../utils/format";
 import { errorMessage } from "../utils/status";
+import { roleAtLeast } from "../utils/roles";
 
 type BackpressureForm = {
   queueHighWatermark: string;
@@ -13,13 +14,14 @@ type BackpressureForm = {
   logAppendSlowMs: string;
 };
 
-export function AdminPage() {
+export function AdminPage({ session }: { session?: ConsoleSession | null }) {
   const [config, setConfig] = useState<AdminConfig | null>(null);
   const [form, setForm] = useState<BackpressureForm>(emptyBackpressureForm());
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const canSave = roleAtLeast(session, "admin");
 
   useEffect(() => {
     let cancelled = false;
@@ -97,7 +99,7 @@ export function AdminPage() {
         <label>Queue high watermark<input type="number" min="1" step="1" value={form.queueHighWatermark} onChange={(event) => updateForm("queueHighWatermark", event.target.value)} /></label>
         <label>Redelivery timeout<input type="number" min="1" step="1" value={form.redeliveryTimeoutMs} onChange={(event) => updateForm("redeliveryTimeoutMs", event.target.value)} /></label>
         <label>Log append slow threshold<input type="number" min="1" step="1" value={form.logAppendSlowMs} onChange={(event) => updateForm("logAppendSlowMs", event.target.value)} /></label>
-        <button className="primary" type="submit" disabled={saving}>Save backpressure config</button>
+        <button className="primary" type="submit" disabled={!canSave || saving}>Save backpressure config</button>
         {message && (message === "Saved" ? <span className="subtle">{message}</span> : <InlineError message={message} />)}
       </form>
       <section className="panel split">

@@ -1,3 +1,29 @@
+export type ConsoleRole = "viewer" | "operator" | "admin";
+
+export interface ConsoleSession {
+  subject: string;
+  role: ConsoleRole;
+  permissions: string[];
+}
+
+export interface TemplateInfo {
+  id: string;
+  label: string;
+  kind: "task" | "workflow" | "actor" | "llm" | string;
+  description: string;
+  expected_result: string;
+  required_role: ConsoleRole;
+  payload?: unknown;
+}
+
+export interface TemplateListResponse {
+  templates: TemplateInfo[];
+}
+
+export interface TemplateRunResponse {
+  template: TemplateInfo;
+  result: unknown;
+}
 export type TaskStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNSPECIFIED";
 export type WorkflowStatus = "RUNNING" | "COMPLETED" | "FAILED" | "UNSPECIFIED";
 export type ActorStatus = "ACTIVE" | "UNAVAILABLE" | "UNSPECIFIED";

@@ -1,4 +1,4 @@
-import type { Actor, AdminConfig, BackpressureConfig, Dashboard, FunctionRegistryEntry, LLMTrace, LogStreamDetail, LogStreamsResponse, ModelInfo, Task, TaskListResponse, Worker, Workflow, WorkflowListResponse } from "../types/logserve";
+import type { Actor, AdminConfig, BackpressureConfig, ConsoleSession, Dashboard, FunctionRegistryEntry, LLMTrace, LogStreamDetail, LogStreamsResponse, ModelInfo, Task, TaskListResponse, TemplateInfo, TemplateListResponse, TemplateRunResponse, Worker, Workflow, WorkflowListResponse } from "../types/logserve";
 
 export class APIError extends Error {
   code: string;
@@ -43,6 +43,9 @@ export function setStoredToken(token: string): void {
   } else {
     sessionStorage.removeItem(tokenKey);
   }
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event("logserve:token-change"));
+  }
 }
 
 async function apiFetch<T>(path: string, init: FetchInit = {}): Promise<T> {
@@ -55,6 +58,9 @@ async function apiFetch<T>(path: string, init: FetchInit = {}): Promise<T> {
   if (init.json !== undefined) {
     headers.set("Content-Type", "application/json");
     body = JSON.stringify(init.json);
+  }
+  if (!headers.has("X-Request-ID")) {
+    headers.set("X-Request-ID", requestID());
   }
   const response = await fetch(path, { ...init, headers, body });
   const text = await response.text();
@@ -102,6 +108,16 @@ export function logStreamURL(streamID: string, fromSeq = 1, limit = 100): string
   return `/api/logs/streams/${encodeURIComponent(streamID)}${queryString({ from_seq: fromSeq, limit })}`;
 }
 
+export function templateRunURL(templateID: string, wait = false): string {
+  return `/api/templates/${encodeURIComponent(templateID)}/run${wait ? "?wait=1" : ""}`;
+}
+
+export function requestID(): string {
+  const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto);
+  if (randomUUID) return randomUUID();
+  return `ui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 function queryString(values: Record<string, QueryValue>): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(values)) {
@@ -119,6 +135,7 @@ function isAPIErrorPayload(value: unknown): value is { error: { code?: string; m
 
 export const api = {
   health: () => apiFetch<{ status: string }>("/api/healthz"),
+  session: () => apiFetch<ConsoleSession>("/api/session"),
   dashboard: () => apiFetch<Dashboard>("/api/dashboard"),
   tasks: (query: TaskListQuery | string = "") => apiFetch<TaskListResponse>(tasksURL(query)),
   task: (taskID: string) => apiFetch<Task>(`/api/tasks/${encodeURIComponent(taskID)}`),
@@ -152,6 +169,9 @@ export const api = {
     return apiFetch<LogStreamsResponse>(`/api/logs/streams${query}`);
   },
   logStream: (streamID: string, fromSeq = 1, limit = 100) => apiFetch<LogStreamDetail>(logStreamURL(streamID, fromSeq, limit)),
+  templates: () => apiFetch<TemplateListResponse>("/api/templates"),
+  template: (templateID: string) => apiFetch<TemplateInfo>(`/api/templates/${encodeURIComponent(templateID)}`),
+  runTemplate: (templateID: string, payload: unknown = {}, wait = false) => apiFetch<TemplateRunResponse>(templateRunURL(templateID, wait), { method: "POST", json: payload }),
   adminConfig: () => apiFetch<AdminConfig>("/api/admin/config"),
   setSchedulingPolicy: (policy: string) => apiFetch<{ policy: string }>("/api/admin/scheduling-policy", { method: "POST", json: { policy } }),
   setBackpressure: (payload: BackpressureConfig) => apiFetch<BackpressureConfig>("/api/admin/backpressure", { method: "POST", json: payload })

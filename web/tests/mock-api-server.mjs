@@ -28,6 +28,10 @@ const dashboard = {
   metadata_materializer: { mode: "async", eventual_lag_estimate_ms: 12 }
 };
 
+const templates = [
+  { id: "add_task", label: "Add task", kind: "task", description: "Runs add(a, b).", expected_result: "Task succeeds with result_json 3.", required_role: "operator" },
+  { id: "mock_llm_request", label: "Mock LLM request", kind: "llm", description: "Runs a mock LLM request.", expected_result: "LLM task succeeds with mock text.", required_role: "admin" }
+];
 const logStats = {
   "system:functions": { stream_id: "system:functions", first_seq: 1, next_seq: 3, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 },
   "system:tasks": { stream_id: "system:tasks", first_seq: 1, next_seq: 2, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 },
@@ -42,6 +46,31 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
+  if (url.pathname === "/api/session" && request.method === "GET") {
+    const role = roleFromRequest(request);
+    writeJSON(response, 200, {
+      subject: `${role}:browser-token`,
+      role,
+      permissions: permissionsForRole(role)
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/templates" && request.method === "GET") {
+    writeJSON(response, 200, { templates });
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/templates/") && url.pathname.endsWith("/run") && request.method === "POST") {
+    const templateID = decodeURIComponent(url.pathname.split("/")[3] ?? "add_task");
+    const template = templates.find((item) => item.id === templateID) ?? templates[0];
+    if (!roleAtLeast(roleFromRequest(request), template.required_role)) {
+      writeJSON(response, 403, { error: { code: "PERMISSION_DENIED", message: "insufficient role for this template" } });
+      return;
+    }
+    writeJSON(response, 200, { template, result: templateID === "mock_llm_request" ? { task_id: "llm-task-1", status: "QUEUED" } : taskDetail("task-template-1", "QUEUED") });
+    return;
+  }
   if (url.pathname === "/api/events") {
     const taskID = url.searchParams.get("task_id");
     if (taskID) {
@@ -234,4 +263,22 @@ function readJSON(request) {
       }
     });
   });
+}
+function roleFromRequest(request) {
+  const value = String(request.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
+  if (value === "viewer-token") return "viewer";
+  if (value === "operator-token") return "operator";
+  return "admin";
+}
+
+function permissionsForRole(role) {
+  const permissions = ["read:dashboard", "read:tasks", "read:workflows", "read:logs", "read:templates"];
+  if (roleAtLeast(role, "operator")) permissions.push("submit:tasks", "submit:workflows", "call:actors", "replay", "set:scheduling", "run:templates");
+  if (roleAtLeast(role, "admin")) permissions.push("set:backpressure", "register:models", "dangerous:actions");
+  return permissions;
+}
+
+function roleAtLeast(role, minimum) {
+  const ranks = { viewer: 1, operator: 2, admin: 3 };
+  return (ranks[role] ?? 0) >= (ranks[minimum] ?? 0);
 }

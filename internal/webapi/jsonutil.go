@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"google.golang.org/grpc/metadata"
 )
 
 var errInvalidInput = errors.New("invalid input")
@@ -44,7 +46,11 @@ func requestContext(r *http.Request, timeout time.Duration) (context.Context, co
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return context.WithTimeout(r.Context(), timeout)
+	ctx := r.Context()
+	if id := requestID(r); id != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", id)
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func defaultRaw(value json.RawMessage, fallback []byte) json.RawMessage {

@@ -9,8 +9,10 @@ import { defaultID, safePreview } from "../utils/format";
 import { copyToClipboard } from "../utils/clipboard";
 import { firstValidationError, validateTaskForm } from "../utils/formValidation";
 import { errorMessage } from "../utils/status";
+import type { ConsoleSession } from "../types/logserve";
+import { roleAtLeast } from "../utils/roles";
 
-export function SubmitTaskPage() {
+export function SubmitTaskPage({ session }: { session?: ConsoleSession | null }) {
   const taskParams = new URLSearchParams(window.location.search);
   const initialFunctionHash = taskParams.get("function_hash") ?? "";
   const initialFunctionName = taskParams.get("function_name") ?? "";
@@ -25,6 +27,7 @@ export function SubmitTaskPage() {
   const [idempotencyKey, setIdempotencyKey] = useState(defaultID("ui-task"));
   const [message, setMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const canSubmit = roleAtLeast(session, "operator");
 
   const validation = useMemo(() => validateTaskForm({
     mode,
@@ -51,6 +54,10 @@ export function SubmitTaskPage() {
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setMessage("");
+    if (!canSubmit) {
+      setMessage("Operator role is required to submit tasks.");
+      return;
+    }
     if (!validation.valid) {
       setMessage(firstValidationError(validation.errors));
       return;
@@ -95,7 +102,7 @@ export function SubmitTaskPage() {
             <button type="button" className="ghost" onClick={() => setSource(failSource)}>Fail</button>
             <button type="button" className="ghost" onClick={() => setIdempotencyKey(defaultID("ui-task"))}>New key</button>
             <button type="button" className="ghost" onClick={() => void copyToClipboard(idempotencyKey)}>Copy key</button>
-            <button type="submit" className="primary" disabled={submitting || !validation.valid}>Submit</button>
+            <button type="submit" className="primary" disabled={!canSubmit || submitting || !validation.valid}>Submit</button>
           </div>
           {message && <InlineError message={message} />}
         </div>

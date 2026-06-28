@@ -29,6 +29,7 @@ func main() {
 		ControlAddr:          *controlAddr,
 		LogAddr:              *logAddr,
 		APIToken:             os.Getenv(*apiTokenEnv),
+		RoleTokens:           defaults.RoleTokens,
 		StaticDir:            *staticDir,
 		DevCORS:              *devCORS,
 		AllowUnauthenticated: *allowUnauthenticated,

@@ -5,9 +5,10 @@ import { ErrorPanel, Loading } from "../components/ErrorPanel";
 import { PanelTitle } from "../components/PanelTitle";
 import { TaskTable, WorkerTable, WorkflowTable } from "../components/domainTables";
 import { useEventStream } from "../hooks/useEventStream";
-import type { Dashboard } from "../types/logserve";
+import type { ConsoleSession, Dashboard } from "../types/logserve";
+import { roleAtLeast } from "../utils/roles";
 
-export function OverviewPage() {
+export function OverviewPage({ session }: { session?: ConsoleSession | null }) {
   const [dashboard, setDashboard] = useState<Dashboard>();
   const [error, setError] = useState("");
   const handleMessage = useCallback((message: SSEMessage) => {
@@ -51,7 +52,7 @@ export function OverviewPage() {
           <WorkflowTable rows={dashboard.workflows.slice(0, 6)} />
         </div>
         <div>
-          <PanelTitle title="Workers" action={<a data-nav className="button ghost" href="/workers">Open</a>} />
+          <PanelTitle title="Workers" action={roleAtLeast(session, "operator") ? <a data-nav className="button ghost" href="/workers">Open</a> : undefined} />
           <WorkerTable rows={dashboard.workers.slice(0, 6)} />
         </div>
       </section>
