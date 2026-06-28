@@ -86,6 +86,21 @@ FEATURE_GROUPS_6_10 = {
     },
 }
 
+FRONTEND_ADMIN_FUNCTION_CHECKS = (
+    "static_admin_route",
+    "static_functions_route",
+    "static_submit_function_hash_route",
+    "functions_requires_auth",
+    "functions_list_with_auth",
+    "function_detail_with_auth",
+    "admin_config_requires_auth",
+    "admin_backpressure_requires_auth",
+    "admin_config_with_auth",
+    "admin_config_has_materializer_stats",
+    "admin_backpressure_rejects_invalid_values",
+    "admin_backpressure_update_with_auth",
+    "admin_config_reflects_backpressure_update",
+)
 
 def build_feature_groups_6_10(run_docker, probe_checks):
     features = {}
@@ -117,6 +132,25 @@ def build_feature_groups_6_10(run_docker, probe_checks):
         verdict = "FAIL"
     return {"verdict": verdict, "features": features}
 
+
+def build_frontend_admin_functions(run_docker, probe_checks):
+    probe_checks = probe_checks or {}
+    check_results = {name: probe_checks.get(name) is True for name in FRONTEND_ADMIN_FUNCTION_CHECKS}
+    missing_checks = [name for name in FRONTEND_ADMIN_FUNCTION_CHECKS if name not in probe_checks]
+    failed_checks = [name for name, passed in check_results.items() if not passed]
+    if not run_docker:
+        verdict = "INCOMPLETE"
+    elif failed_checks:
+        verdict = "FAIL"
+    else:
+        verdict = "PASS"
+    return {
+        "title": "Frontend Admin and Function Registry",
+        "verdict": verdict,
+        "checks": check_results,
+        "missing_checks": missing_checks,
+        "failed_checks": failed_checks,
+    }
 
 def build_checks(statuses, config, probe):
     checks = {
@@ -159,9 +193,17 @@ def write_summary(root):
     statuses = read_statuses(root / "command_status.jsonl")
     probe = read_json(root / "console_http_probe.json")
     checks = build_checks(statuses, config, probe)
-    features_6_10 = build_feature_groups_6_10(bool_config(config, "run_docker", True), probe.get("checks") or {})
+    run_docker = bool_config(config, "run_docker", True)
+    probe_checks = probe.get("checks") or {}
+    features_6_10 = build_feature_groups_6_10(run_docker, probe_checks)
+    frontend_admin_functions = build_frontend_admin_functions(run_docker, probe_checks)
     failed_commands = [item.get("name") for item in statuses if status_failed(item)]
-    failed_checks = sorted(name for name, passed in checks.items() if not passed)
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    if run_docker and features_6_10.get("verdict") == "FAIL":
+        failed_checks.append("features_6_10")
+    if run_docker and frontend_admin_functions.get("verdict") == "FAIL":
+        failed_checks.append("frontend_admin_functions")
+    failed_checks = sorted(set(failed_checks))
     package_path = root / "console-acceptance-package.tar.gz"
     summary = {
         "verdict": "PASS" if not failed_commands and not failed_checks else "FAIL",
@@ -172,6 +214,7 @@ def write_summary(root):
         "commands": statuses,
         "checks": checks,
         "features_6_10": features_6_10,
+        "frontend_admin_functions": frontend_admin_functions,
         "probe": probe,
         "run_config": config,
         "send_back": send_back_paths(root),
@@ -204,6 +247,18 @@ def write_markdown(root, summary):
             failed = feature.get("failed_checks") or []
             checks_text = "all pass" if not failed else ", ".join(failed)
             lines.append(f"| `{feature_id}` {feature.get('title', '')} | {feature.get('state')} | {checks_text} |")
+    frontend = summary.get("frontend_admin_functions") or {}
+    if frontend:
+        lines.append("")
+        lines.append("## Frontend Admin / Functions")
+        lines.append("")
+        lines.append(f"- Verdict: **{frontend.get('verdict', 'UNKNOWN')}**")
+        failed = frontend.get("failed_checks") or []
+        missing = frontend.get("missing_checks") or []
+        if failed:
+            lines.append(f"- Failed checks: {', '.join(failed)}")
+        if missing:
+            lines.append(f"- Missing checks: {', '.join(missing)}")
     lines.append("")
     lines.append("## Commands")
     lines.append("")

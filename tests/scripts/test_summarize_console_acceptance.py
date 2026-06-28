@@ -56,6 +56,9 @@ def write_probe(root, verdict="PASS", checks=None):
             "dashboard_with_auth": True,
             "static_root": True,
             "static_deep_link": True,
+            "static_admin_route": True,
+            "static_functions_route": True,
+            "static_submit_function_hash_route": True,
             "submit_task_via_console_api": True,
             "get_task_detail": True,
             "task_visible_in_dashboard_view": True,
@@ -73,7 +76,16 @@ def write_probe(root, verdict="PASS", checks=None):
             "log_stream_read_system_functions": True,
             "log_stream_read_workflow": True,
             "log_stream_read_actor": True,
+            "functions_requires_auth": True,
+            "functions_list_with_auth": True,
+            "function_detail_with_auth": True,
+            "admin_config_requires_auth": True,
+            "admin_backpressure_requires_auth": True,
             "admin_config_with_auth": True,
+            "admin_config_has_materializer_stats": True,
+            "admin_backpressure_rejects_invalid_values": True,
+            "admin_backpressure_update_with_auth": True,
+            "admin_config_reflects_backpressure_update": True,
         }
     (root / "console_http_probe.json").write_text(json.dumps({"verdict": verdict, "checks": checks}), encoding="utf-8")
 
@@ -93,10 +105,12 @@ class ConsoleAcceptanceSummaryTest(unittest.TestCase):
             self.assertEqual("PASS", summary["verdict"])
             self.assertTrue(summary["checks"]["probe_submit_task_via_console_api"])
             self.assertEqual("PASS", summary["features_6_10"]["verdict"])
+            self.assertEqual("PASS", summary["frontend_admin_functions"]["verdict"])
             self.assertEqual("PASS", summary["features_6_10"]["features"]["feature_10_log_stream_explorer"]["state"])
             markdown = (root / "acceptance_summary.md").read_text(encoding="utf-8")
             self.assertIn("Ubuntu Console Acceptance Summary", markdown)
             self.assertIn("Features 6-10", markdown)
+            self.assertIn("Frontend Admin / Functions", markdown)
             self.assertIn("feature_6_workflow_dag", markdown)
             self.assertIn("HTTP Probe", markdown)
 
@@ -111,6 +125,7 @@ class ConsoleAcceptanceSummaryTest(unittest.TestCase):
 
             self.assertEqual("PASS", summary["verdict"])
             self.assertEqual("INCOMPLETE", summary["features_6_10"]["verdict"])
+            self.assertEqual("INCOMPLETE", summary["frontend_admin_functions"]["verdict"])
             self.assertNotIn("console_http_probe", summary["checks"])
             self.assertNotIn("probe_dashboard_with_auth", summary["checks"])
 

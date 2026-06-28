@@ -27,6 +27,9 @@ def write_summary(root, run_docker=True, verdict="PASS", probe_verdict="PASS", p
             "dashboard_with_auth": True,
             "static_root": True,
             "static_deep_link": True,
+            "static_admin_route": True,
+            "static_functions_route": True,
+            "static_submit_function_hash_route": True,
             "submit_task_via_console_api": True,
             "get_task_detail": True,
             "task_visible_in_dashboard_view": True,
@@ -44,7 +47,16 @@ def write_summary(root, run_docker=True, verdict="PASS", probe_verdict="PASS", p
             "log_stream_read_system_functions": True,
             "log_stream_read_workflow": True,
             "log_stream_read_actor": True,
+            "functions_requires_auth": True,
+            "functions_list_with_auth": True,
+            "function_detail_with_auth": True,
+            "admin_config_requires_auth": True,
+            "admin_backpressure_requires_auth": True,
             "admin_config_with_auth": True,
+            "admin_config_has_materializer_stats": True,
+            "admin_backpressure_rejects_invalid_values": True,
+            "admin_backpressure_update_with_auth": True,
+            "admin_config_reflects_backpressure_update": True,
         }
     checks = {
         "go_web_tests": True,
@@ -101,6 +113,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("PASS", result["verdict"])
             self.assertFalse(result["failures"])
             self.assertEqual("PASS", result["features_6_10"]["verdict"])
+            self.assertEqual("PASS", result["frontend_admin_functions"]["verdict"])
 
     def test_lightweight_result_is_incomplete(self):
         module = load_module()
@@ -113,6 +126,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("INCOMPLETE", result["verdict"])
             self.assertEqual("Docker console runtime was not exercised", result["reason"])
             self.assertEqual("INCOMPLETE", result["features_6_10"]["verdict"])
+            self.assertEqual("INCOMPLETE", result["frontend_admin_functions"]["verdict"])
 
     def test_lightweight_failed_local_check_is_fail(self):
         module = load_module()
@@ -173,6 +187,22 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("FAIL", result["features_6_10"]["features"]["feature_8_worker_cache_matrix"]["state"])
             self.assertTrue(any("feature_8_worker_cache_matrix" in item for item in result["failures"]))
 
+    def test_failed_frontend_admin_group_fails_expectations(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            root = Path(tmp)
+            write_summary(root)
+            summary_path = root / "acceptance_summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["probe"]["checks"]["admin_config_reflects_backpressure_update"] = False
+            summary["checks"]["probe_admin_config_reflects_backpressure_update"] = False
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+            result = module.evaluate_result(root)
+
+            self.assertEqual("FAIL", result["verdict"])
+            self.assertEqual("FAIL", result["frontend_admin_functions"]["verdict"])
+            self.assertTrue(any("frontend admin/functions" in item for item in result["failures"]))
     def test_main_accepts_package(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:

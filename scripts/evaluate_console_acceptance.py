@@ -29,6 +29,9 @@ REQUIRED_PROBE_CHECKS = (
     "dashboard_with_auth",
     "static_root",
     "static_deep_link",
+    "static_admin_route",
+    "static_functions_route",
+    "static_submit_function_hash_route",
     "submit_task_via_console_api",
     "get_task_detail",
     "task_visible_in_dashboard_view",
@@ -46,7 +49,16 @@ REQUIRED_PROBE_CHECKS = (
     "log_stream_read_system_functions",
     "log_stream_read_workflow",
     "log_stream_read_actor",
+    "functions_requires_auth",
+    "functions_list_with_auth",
+    "function_detail_with_auth",
+    "admin_config_requires_auth",
+    "admin_backpressure_requires_auth",
     "admin_config_with_auth",
+    "admin_config_has_materializer_stats",
+    "admin_backpressure_rejects_invalid_values",
+    "admin_backpressure_update_with_auth",
+    "admin_config_reflects_backpressure_update",
 )
 
 
@@ -130,6 +142,21 @@ FEATURE_GROUPS_6_10 = {
     },
 }
 
+FRONTEND_ADMIN_FUNCTION_CHECKS = (
+    "static_admin_route",
+    "static_functions_route",
+    "static_submit_function_hash_route",
+    "functions_requires_auth",
+    "functions_list_with_auth",
+    "function_detail_with_auth",
+    "admin_config_requires_auth",
+    "admin_backpressure_requires_auth",
+    "admin_config_with_auth",
+    "admin_config_has_materializer_stats",
+    "admin_backpressure_rejects_invalid_values",
+    "admin_backpressure_update_with_auth",
+    "admin_config_reflects_backpressure_update",
+)
 
 def build_feature_groups_6_10(run_docker, probe_checks):
     features = {}
@@ -162,6 +189,25 @@ def build_feature_groups_6_10(run_docker, probe_checks):
     return {"verdict": verdict, "features": features}
 
 
+def build_frontend_admin_functions(run_docker, probe_checks):
+    probe_checks = probe_checks or {}
+    check_results = {name: probe_checks.get(name) is True for name in FRONTEND_ADMIN_FUNCTION_CHECKS}
+    missing_checks = [name for name in FRONTEND_ADMIN_FUNCTION_CHECKS if name not in probe_checks]
+    failed_checks = [name for name, passed in check_results.items() if not passed]
+    if not run_docker:
+        verdict = "INCOMPLETE"
+    elif failed_checks:
+        verdict = "FAIL"
+    else:
+        verdict = "PASS"
+    return {
+        "title": "Frontend Admin and Function Registry",
+        "verdict": verdict,
+        "checks": check_results,
+        "missing_checks": missing_checks,
+        "failed_checks": failed_checks,
+    }
+
 def missing_or_failed(checks, names):
     return [name for name in names if checks.get(name) is not True]
 
@@ -184,6 +230,7 @@ def evaluate_result(root):
             "result_dir": str(root),
             "failures": ["missing acceptance_summary.json"],
             "features_6_10": build_feature_groups_6_10(False, {}),
+            "frontend_admin_functions": build_frontend_admin_functions(False, {}),
             "summary": {},
         }
 
@@ -209,6 +256,7 @@ def evaluate_result(root):
 
     run_docker = bool_config(run_config, "run_docker", False)
     features_6_10 = build_feature_groups_6_10(run_docker, probe_checks)
+    frontend_admin_functions = build_frontend_admin_functions(run_docker, probe_checks)
     if not run_docker:
         if failures:
             return {
@@ -218,6 +266,7 @@ def evaluate_result(root):
                 "failures": failures,
                 "warnings": warnings,
                 "features_6_10": features_6_10,
+                "frontend_admin_functions": frontend_admin_functions,
                 "summary": summary,
             }
         return {
@@ -227,6 +276,7 @@ def evaluate_result(root):
             "failures": failures,
             "warnings": warnings,
             "features_6_10": features_6_10,
+            "frontend_admin_functions": frontend_admin_functions,
             "summary": summary,
         }
 
@@ -242,6 +292,9 @@ def evaluate_result(root):
             failed = ", ".join(feature.get("failed_checks") or feature.get("missing_checks") or [])
             failures.append(f"feature 6-10 group failed: {feature_id} ({feature.get('state')}) {failed}".strip())
 
+    if frontend_admin_functions.get("verdict") != "PASS":
+        failed = ", ".join(frontend_admin_functions.get("failed_checks") or frontend_admin_functions.get("missing_checks") or [])
+        failures.append(f"frontend admin/functions group failed: {frontend_admin_functions.get('verdict')} {failed}".strip())
     return {
         "verdict": "FAIL" if failures else "PASS",
         "reason": "console acceptance matches expectations" if not failures else "console acceptance did not match expectations",
@@ -249,6 +302,7 @@ def evaluate_result(root):
         "failures": failures,
         "warnings": warnings,
         "features_6_10": features_6_10,
+        "frontend_admin_functions": frontend_admin_functions,
         "summary": summary,
     }
 
@@ -285,6 +339,15 @@ def write_markdown(result, path):
             failed = feature.get("failed_checks") or []
             failed_text = "-" if not failed else ", ".join(failed)
             lines.append(f"| `{feature_id}` {feature.get('title', '')} | {feature.get('state')} | {failed_text} |")
+    frontend = result.get("frontend_admin_functions") or {}
+    if frontend:
+        lines.append("")
+        lines.append("## Frontend Admin / Functions")
+        lines.append("")
+        lines.append(f"- Verdict: **{frontend.get('verdict', 'UNKNOWN')}**")
+        failed = frontend.get("failed_checks") or []
+        failed_text = "-" if not failed else ", ".join(failed)
+        lines.append(f"- Failed checks: {failed_text}")
     summary = result.get("summary") or {}
     if summary.get("checks"):
         lines.append("")

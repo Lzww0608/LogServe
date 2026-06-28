@@ -107,7 +107,13 @@ def run_probe(base_url, token, timeout_sec):
         },
     )
 
-    for name, path in (("static_root", "/"), ("static_deep_link", "/tasks/console-acceptance")):
+    for name, path in (
+        ("static_root", "/"),
+        ("static_deep_link", "/tasks/console-acceptance"),
+        ("static_admin_route", "/admin"),
+        ("static_functions_route", "/functions"),
+        ("static_submit_function_hash_route", "/submit/task?function_hash=sha256%3Aconsole-acceptance&function_name=console_acceptance_add"),
+    ):
         resp = http_request("GET", f"{base_url}{path}", timeout=10)
         ok = resp["status"] == 200 and "LogServe Console" in resp.get("body", "")
         record(name, ok, {"status": resp["status"], "content_type": resp.get("content_type"), "error": resp.get("error")})
@@ -468,15 +474,138 @@ def run_probe(base_url, token, timeout_sec):
                 "body": actor_read_json or actor_streams_json if not actor_stream_ok else None,
             },
         )
+    functions_no_auth = http_request("GET", f"{base_url}/api/functions", timeout=10)
+    record(
+        "functions_requires_auth",
+        functions_no_auth["status"] == 401,
+        {"status": functions_no_auth["status"], "body": parse_json(functions_no_auth) or functions_no_auth.get("body")},
+    )
+
+    functions = http_request("GET", f"{base_url}/api/functions", token=token, timeout=10)
+    functions_json = parse_json(functions)
+    function_rows = functions_json.get("functions") if isinstance(functions_json, dict) else []
+    if not isinstance(function_rows, list):
+        function_rows = []
+    matching_function = next(
+        (
+            item
+            for item in function_rows
+            if isinstance(item, dict)
+            and item.get("function_hash")
+            and (item.get("entrypoint") or "").endswith("add")
+        ),
+        None,
+    )
+    function_hash = matching_function.get("function_hash") if isinstance(matching_function, dict) else ""
+    functions_ok = functions["status"] == 200 and bool(function_rows) and bool(function_hash)
+    record(
+        "functions_list_with_auth",
+        functions_ok,
+        {"status": functions["status"], "function_count": len(function_rows), "body": functions_json if not functions_ok else None},
+    )
+
+    if function_hash:
+        encoded_hash = urllib.parse.quote(function_hash, safe="")
+        function_detail = http_request("GET", f"{base_url}/api/functions/{encoded_hash}", token=token, timeout=10)
+        function_detail_json = parse_json(function_detail)
+        detail_ok = (
+            function_detail["status"] == 200
+            and isinstance(function_detail_json, dict)
+            and function_detail_json.get("function_hash") == function_hash
+            and bool(function_detail_json.get("source_ref"))
+            and bool(function_detail_json.get("entrypoint"))
+            and bool(function_detail_json.get("language"))
+        )
+        record(
+            "function_detail_with_auth",
+            detail_ok,
+            {"status": function_detail["status"], "body": function_detail_json if not detail_ok else None, "error": function_detail.get("error")},
+        )
+
+    admin_no_auth = http_request("GET", f"{base_url}/api/admin/config", timeout=10)
+    record(
+        "admin_config_requires_auth",
+        admin_no_auth["status"] == 401,
+        {"status": admin_no_auth["status"], "body": parse_json(admin_no_auth) or admin_no_auth.get("body")},
+    )
+
+    admin_backpressure_no_auth = http_request(
+        "POST",
+        f"{base_url}/api/admin/backpressure",
+        body={"queue_high_watermark": 1024, "redelivery_timeout_ms": 30000, "log_append_slow_ms": 100},
+        timeout=10,
+    )
+    record(
+        "admin_backpressure_requires_auth",
+        admin_backpressure_no_auth["status"] == 401,
+        {"status": admin_backpressure_no_auth["status"], "body": parse_json(admin_backpressure_no_auth) or admin_backpressure_no_auth.get("body")},
+    )
+
     admin = http_request("GET", f"{base_url}/api/admin/config", token=token, timeout=10)
     admin_json = parse_json(admin)
-    admin_ok = admin["status"] == 200 and isinstance(admin_json, dict) and "scheduling_policy" in admin_json
+    expected_admin_fields = (
+        "scheduling_policy",
+        "queue_high_watermark",
+        "redelivery_timeout_ms",
+        "log_append_slow_ms",
+        "compactable_log_records",
+        "compactable_log_bytes",
+    )
+    admin_ok = admin["status"] == 200 and isinstance(admin_json, dict) and all(field in admin_json for field in expected_admin_fields)
     record(
         "admin_config_with_auth",
         admin_ok,
         {"status": admin["status"], "body": admin_json if not admin_ok else None, "error": admin.get("error")},
     )
 
+    materializer_stats = admin_json.get("metadata_materializer") if isinstance(admin_json, dict) else None
+    materializer_ok = isinstance(materializer_stats, dict) and bool(materializer_stats.get("mode"))
+    record(
+        "admin_config_has_materializer_stats",
+        materializer_ok,
+        {"status": admin["status"], "metadata_materializer": materializer_stats},
+    )
+
+    invalid_backpressure_cases = (
+        {"queue_high_watermark": 0, "redelivery_timeout_ms": 30000, "log_append_slow_ms": 100},
+        {"queue_high_watermark": 1024, "redelivery_timeout_ms": 0, "log_append_slow_ms": 100},
+        {"queue_high_watermark": 1024, "redelivery_timeout_ms": 30000, "log_append_slow_ms": 0},
+    )
+    invalid_results = []
+    for payload in invalid_backpressure_cases:
+        resp = http_request("POST", f"{base_url}/api/admin/backpressure", token=token, body=payload, timeout=10)
+        invalid_results.append({"status": resp["status"], "body": parse_json(resp) or resp.get("body"), "payload": payload})
+    record(
+        "admin_backpressure_rejects_invalid_values",
+        all(item["status"] == 400 for item in invalid_results),
+        {"results": invalid_results},
+    )
+    backpressure_body = {
+        "queue_high_watermark": 1536,
+        "redelivery_timeout_ms": 31000,
+        "log_append_slow_ms": 110,
+    }
+    backpressure = http_request("POST", f"{base_url}/api/admin/backpressure", token=token, body=backpressure_body, timeout=10)
+    backpressure_json = parse_json(backpressure)
+    post_ok = backpressure["status"] == 200 and isinstance(backpressure_json, dict) and all(
+        backpressure_json.get(key) == value for key, value in backpressure_body.items()
+    )
+    record(
+        "admin_backpressure_update_with_auth",
+        post_ok,
+        {"status": backpressure["status"], "body": backpressure_json or backpressure.get("body"), "error": backpressure.get("error")},
+    )
+
+    admin_after = http_request("GET", f"{base_url}/api/admin/config", token=token, timeout=10)
+    admin_after_json = parse_json(admin_after)
+    reflected_ok = admin_after["status"] == 200 and isinstance(admin_after_json, dict) and all(
+        admin_after_json.get(key) == value for key, value in backpressure_body.items()
+    )
+    record(
+        "admin_config_reflects_backpressure_update",
+        reflected_ok,
+        {"status": admin_after["status"], "body": admin_after_json if not reflected_ok else None, "error": admin_after.get("error")},
+    )
     return {
         "verdict": "PASS" if not failures else "FAIL",
         "checks": checks,

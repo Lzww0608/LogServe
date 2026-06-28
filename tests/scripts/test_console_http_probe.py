@@ -31,7 +31,13 @@ class ConsoleHTTPProbeTest(unittest.TestCase):
                     "content_type": "application/json",
                     "body": '{"queue_depth":0,"tasks":[],"workers":[{"worker_id":"worker-1"}]}',
                 }
-            if url.endswith("/") or url.endswith("/tasks/console-acceptance"):
+            if "/api/" not in url and (
+                url.endswith("/")
+                or url.endswith("/tasks/console-acceptance")
+                or url.endswith("/admin")
+                or url.endswith("/functions")
+                or url.endswith("/submit/task?function_hash=sha256%3Aconsole-acceptance&function_name=console_acceptance_add")
+            ):
                 return {"status": 200, "content_type": "text/html", "body": "<title>LogServe Console</title>"}
             if method == "POST" and "/api/tasks?wait=true" in url:
                 self.assertEqual("console_acceptance_add", body["task_name"])
@@ -106,8 +112,41 @@ class ConsoleHTTPProbeTest(unittest.TestCase):
                 return {"status": 200, "content_type": "application/json", "body": '{"stream_id":"wf:wf-1","records":[{"stream_id":"wf:wf-1","seq":1,"event_type":"WorkflowStarted"}],"stats":{"stream_id":"wf:wf-1"}}'}
             if "/api/logs/streams/actor%3Aactor-1" in url:
                 return {"status": 200, "content_type": "application/json", "body": '{"stream_id":"actor:actor-1","records":[{"stream_id":"actor:actor-1","seq":1,"event_type":"ActorCreated"}],"stats":{"stream_id":"actor:actor-1"}}'}
+            if url.endswith("/api/functions") and token is None:
+                return {"status": 401, "content_type": "application/json", "body": '{"error":{"code":"UNAUTHENTICATED"}}'}
+            if url.endswith("/api/functions"):
+                return {
+                    "status": 200,
+                    "content_type": "application/json",
+                    "body": '{"functions":[{"function_hash":"sha256:abc","source_ref":"s3://functions/abc.py","entrypoint":"module:add","language":"python","timestamp_ms":1234}]}',
+                }
+            if url.endswith("/api/functions/sha256%3Aabc"):
+                return {
+                    "status": 200,
+                    "content_type": "application/json",
+                    "body": '{"function_hash":"sha256:abc","source_ref":"s3://functions/abc.py","entrypoint":"module:add","language":"python","timestamp_ms":1234}',
+                }
+            if url.endswith("/api/admin/config") and token is None:
+                return {"status": 401, "content_type": "application/json", "body": '{"error":{"code":"UNAUTHENTICATED"}}'}
+            if url.endswith("/api/admin/backpressure") and token is None:
+                return {"status": 401, "content_type": "application/json", "body": '{"error":{"code":"UNAUTHENTICATED"}}'}
+            if url.endswith("/api/admin/backpressure") and method == "POST":
+                if body["queue_high_watermark"] <= 0 or body["redelivery_timeout_ms"] <= 0 or body["log_append_slow_ms"] <= 0:
+                    return {"status": 400, "content_type": "application/json", "body": '{"error":{"code":"INVALID_ARGUMENT"}}'}
+                seen["backpressure"] = dict(body)
+                return {"status": 200, "content_type": "application/json", "body": json.dumps(body)}
             if url.endswith("/api/admin/config"):
-                return {"status": 200, "content_type": "application/json", "body": '{"scheduling_policy":"LOCALITY_AWARE"}'}
+                backpressure = seen.get("backpressure") or {"queue_high_watermark": 1024, "redelivery_timeout_ms": 30000, "log_append_slow_ms": 100}
+                payload = {
+                    "scheduling_policy": "LOCALITY_AWARE",
+                    "queue_high_watermark": backpressure["queue_high_watermark"],
+                    "redelivery_timeout_ms": backpressure["redelivery_timeout_ms"],
+                    "log_append_slow_ms": backpressure["log_append_slow_ms"],
+                    "compactable_log_records": 0,
+                    "compactable_log_bytes": 0,
+                    "metadata_materializer": {"mode": "async", "pending_deltas": 0},
+                }
+                return {"status": 200, "content_type": "application/json", "body": json.dumps(payload)}
             return {"status": 404, "content_type": "text/plain", "body": url}
 
         module.http_request = fake_http_request
@@ -132,6 +171,19 @@ class ConsoleHTTPProbeTest(unittest.TestCase):
             "log_stream_read_system_functions",
             "log_stream_read_workflow",
             "log_stream_read_actor",
+            "static_admin_route",
+            "static_functions_route",
+            "static_submit_function_hash_route",
+            "functions_requires_auth",
+            "functions_list_with_auth",
+            "function_detail_with_auth",
+            "admin_config_requires_auth",
+            "admin_backpressure_requires_auth",
+            "admin_config_with_auth",
+            "admin_config_has_materializer_stats",
+            "admin_backpressure_rejects_invalid_values",
+            "admin_backpressure_update_with_auth",
+            "admin_config_reflects_backpressure_update",
         ):
             self.assertTrue(summary["checks"][check], check)
 
