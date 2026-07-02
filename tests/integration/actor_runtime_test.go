@@ -23,6 +23,7 @@ func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 		runWorkerForTest(firstCtx, t, env, "actor-worker-1", 100)
 		close(done)
 	}()
+	waitForWorkerRegistered(t, env.controlClient, "actor-worker-1")
 
 	created := createCounterActor(t, env.controlClient, 20)
 	for i := 1; i <= 100; i++ {
@@ -47,6 +48,7 @@ func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 	secondCtx, secondCancel := context.WithCancel(context.Background())
 	defer secondCancel()
 	go runWorkerForTest(secondCtx, t, env, "actor-worker-2", 0)
+	waitForWorkerRegistered(t, env.controlClient, "actor-worker-2")
 	time.Sleep(900 * time.Millisecond)
 
 	getResp := callActor(t, env.controlClient, created.GetActorId(), "get", nil)
@@ -110,6 +112,7 @@ func TestActorConcurrentMailboxSerializes1000Increments(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go runWorkerForTest(ctx, t, env, "actor-concurrency-worker", 0)
+	waitForWorkerRegistered(t, env.controlClient, "actor-concurrency-worker")
 
 	created := createCounterActor(t, env.controlClient, 200)
 	var wg sync.WaitGroup

@@ -230,6 +230,32 @@ func runWorkerForTest(ctx context.Context, t *testing.T, env *workflowTestEnv, w
 	}
 }
 
+func waitForWorkerRegistered(t *testing.T, client logservepb.ControlServiceClient, workerID string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	lastWorkers := []string{}
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		snapshot, err := client.GetDashboardSnapshot(ctx, &logservepb.GetDashboardSnapshotRequest{})
+		cancel()
+		if err == nil {
+			lastErr = nil
+			lastWorkers = lastWorkers[:0]
+			for _, worker := range snapshot.GetWorkers() {
+				lastWorkers = append(lastWorkers, worker.GetWorkerId())
+				if worker.GetWorkerId() == workerID {
+					return
+				}
+			}
+		} else {
+			lastErr = err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("worker %s did not register; last workers=%v last error=%v", workerID, lastWorkers, lastErr)
+}
+
 func submitWorkflowForTest(t *testing.T, client logservepb.ControlServiceClient, def map[string]any) *logservepb.SubmitWorkflowResponse {
 	t.Helper()
 	data, err := json.Marshal(def)

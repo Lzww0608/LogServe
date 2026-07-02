@@ -10,7 +10,8 @@ type Table struct {
 }
 
 type entry struct {
-	mu sync.Mutex
+	mu   sync.Mutex
+	refs int
 }
 
 func NewTable() *Table {
@@ -29,25 +30,19 @@ func (t *Table) Lock(actorID string) func() {
 		e = &entry{}
 		t.locks[actorID] = e
 	}
+	e.refs++
 	t.mu.Unlock()
 
 	e.mu.Lock()
 	return func() {
 		e.mu.Unlock()
-		t.maybeEvict(actorID, e)
+		t.mu.Lock()
+		e.refs--
+		if e.refs == 0 && t.locks[actorID] == e {
+			delete(t.locks, actorID)
+		}
+		t.mu.Unlock()
 	}
-}
-
-func (t *Table) maybeEvict(actorID string, e *entry) {
-	if !e.mu.TryLock() {
-		return
-	}
-	t.mu.Lock()
-	if t.locks[actorID] == e {
-		delete(t.locks, actorID)
-	}
-	t.mu.Unlock()
-	e.mu.Unlock()
 }
 
 func (t *Table) Len() int {
