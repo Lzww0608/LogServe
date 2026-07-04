@@ -11,14 +11,18 @@ import (
 	"google.golang.org/grpc"
 )
 
+// functionRegistryLogClient is a small in-memory log used to inspect function
+// registry and TaskSubmitted records.
 type functionRegistryLogClient struct {
 	records map[string][]*logservepb.LogRecord
 }
 
+// newFunctionRegistryLogClient constructs an empty function-registry log client.
 func newFunctionRegistryLogClient() *functionRegistryLogClient {
 	return &functionRegistryLogClient{records: make(map[string][]*logservepb.LogRecord)}
 }
 
+// AppendLog stores one record per append so tests can inspect payloads by stream.
 func (c *functionRegistryLogClient) AppendLog(_ context.Context, req *logservepb.AppendLogRequest, _ ...grpc.CallOption) (*logservepb.AppendLogResponse, error) {
 	seq := uint64(len(c.records[req.GetStreamId()]) + 1)
 	rec := &logservepb.LogRecord{
@@ -33,6 +37,7 @@ func (c *functionRegistryLogClient) AppendLog(_ context.Context, req *logservepb
 	return &logservepb.AppendLogResponse{Seq: seq, TimestampMs: int64(seq)}, nil
 }
 
+// ReadLog returns in-memory records from the requested sequence and limit.
 func (c *functionRegistryLogClient) ReadLog(_ context.Context, req *logservepb.ReadLogRequest, _ ...grpc.CallOption) (*logservepb.ReadLogResponse, error) {
 	from := req.GetFromSeq()
 	if from == 0 {
@@ -53,6 +58,7 @@ func (c *functionRegistryLogClient) ReadLog(_ context.Context, req *logservepb.R
 	return &logservepb.ReadLogResponse{Records: out}, nil
 }
 
+// ListStreams returns streams matching the requested prefix for bootstrap helpers.
 func (c *functionRegistryLogClient) ListStreams(_ context.Context, req *logservepb.ListStreamsRequest, _ ...grpc.CallOption) (*logservepb.ListStreamsResponse, error) {
 	streams := make([]string, 0, len(c.records))
 	for streamID := range c.records {
@@ -63,14 +69,18 @@ func (c *functionRegistryLogClient) ListStreams(_ context.Context, req *logserve
 	return &logservepb.ListStreamsResponse{StreamIds: streams}, nil
 }
 
+// TrimStream is a no-op because function registry tests do not cover compaction.
 func (c *functionRegistryLogClient) TrimStream(context.Context, *logservepb.TrimStreamRequest, ...grpc.CallOption) (*logservepb.TrimStreamResponse, error) {
 	return &logservepb.TrimStreamResponse{}, nil
 }
 
+// GetStreamStats is a no-op stub for function registry tests.
 func (c *functionRegistryLogClient) GetStreamStats(context.Context, *logservepb.GetStreamStatsRequest, ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error) {
 	return &logservepb.GetStreamStatsResponse{}, nil
 }
 
+// TestSubmitTaskRegistersFunctionAndStoresTaskRef verifies inline source is stored
+// once and TaskSubmitted contains only ref/hash identity.
 func TestSubmitTaskRegistersFunctionAndStoresTaskRef(t *testing.T) {
 	ctx := context.Background()
 	logClient := newFunctionRegistryLogClient()
@@ -125,6 +135,8 @@ func TestSubmitTaskRegistersFunctionAndStoresTaskRef(t *testing.T) {
 	}
 }
 
+// TestSubmitTaskIdempotencyTreatsInlineAndRegisteredRefAsSameFunction verifies a
+// retry using a registered ref matches the original inline source fingerprint.
 func TestSubmitTaskIdempotencyTreatsInlineAndRegisteredRefAsSameFunction(t *testing.T) {
 	ctx := context.Background()
 	logClient := newFunctionRegistryLogClient()
@@ -172,6 +184,8 @@ func TestSubmitTaskIdempotencyTreatsInlineAndRegisteredRefAsSameFunction(t *test
 	}
 }
 
+// TestSubmitTaskRejectsMismatchedFunctionHash ensures supplied hashes must match
+// inline function source.
 func TestSubmitTaskRejectsMismatchedFunctionHash(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), newFunctionRegistryLogClient(), nil, 0)
 	_, err := service.SubmitTask(context.Background(), &logservepb.SubmitTaskRequest{
@@ -186,6 +200,8 @@ func TestSubmitTaskRejectsMismatchedFunctionHash(t *testing.T) {
 	}
 }
 
+// TestSubmitWorkflowRejectsUnregisteredLLMModel keeps LLM workflow steps tied to
+// registered model metadata.
 func TestSubmitWorkflowRejectsUnregisteredLLMModel(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	service := NewServiceWithResultStore(meta, newFunctionRegistryLogClient(), nil, 0)
@@ -213,6 +229,8 @@ func TestSubmitWorkflowRejectsUnregisteredLLMModel(t *testing.T) {
 	}
 }
 
+// TestSubmitWorkflowNormalizesRegisteredLLMModelStep verifies LLM steps clear Python
+// function identity and inherit model defaults.
 func TestSubmitWorkflowNormalizesRegisteredLLMModelStep(t *testing.T) {
 	ctx := context.Background()
 	meta := metadata.NewMemoryStore()
@@ -258,6 +276,7 @@ func TestSubmitWorkflowNormalizesRegisteredLLMModelStep(t *testing.T) {
 	}
 }
 
+// taskSpecFromSubmittedRecord decodes a TaskSubmitted payload for assertions.
 func taskSpecFromSubmittedRecord(t *testing.T, rec *logservepb.LogRecord) *logservepb.TaskSpec {
 	t.Helper()
 	spec, err := unmarshalTaskSubmittedSpec(rec.GetPayload())

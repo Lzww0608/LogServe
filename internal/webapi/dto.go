@@ -1,11 +1,16 @@
 package webapi
 
+// This file defines the stable JSON DTO contract returned to the console and
+// the protobuf conversion helpers that populate those DTOs.
+
 import (
 	"encoding/json"
 
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// DashboardDTO is the aggregated console snapshot returned by dashboard and SSE
+// endpoints.
 type DashboardDTO struct {
 	QueueDepth                uint32                   `json:"queue_depth"`
 	QueueHighWatermark        uint32                   `json:"queue_high_watermark"`
@@ -23,6 +28,8 @@ type DashboardDTO struct {
 	MetadataMaterializerStats *MetadataMaterializerDTO `json:"metadata_materializer,omitempty"`
 }
 
+// TaskDTO is the frontend shape for task state from dashboard, status, and wait
+// responses.
 type TaskDTO struct {
 	TaskID          string          `json:"task_id"`
 	TaskName        string          `json:"task_name,omitempty"`
@@ -39,6 +46,8 @@ type TaskDTO struct {
 	Error           string          `json:"error,omitempty"`
 }
 
+// WorkflowDTO is the frontend shape for workflow status plus derived step counts
+// used by the DAG view.
 type WorkflowDTO struct {
 	WorkflowID     string          `json:"workflow_id"`
 	WorkflowName   string          `json:"workflow_name,omitempty"`
@@ -57,6 +66,8 @@ type WorkflowDTO struct {
 	RunningSteps   int             `json:"running_steps"`
 }
 
+// StepDTO is the frontend representation of one workflow step and its dependency
+// metadata.
 type StepDTO struct {
 	StepID        string          `json:"step_id"`
 	DependsOn     []string        `json:"depends_on,omitempty"`
@@ -72,6 +83,8 @@ type StepDTO struct {
 	LatencyMs     int64           `json:"latency_ms,omitempty"`
 }
 
+// ActorDTO represents actor state, actor call results, and replay consistency
+// metadata in one console-friendly shape.
 type ActorDTO struct {
 	ActorID                string          `json:"actor_id"`
 	CallID                 string          `json:"call_id,omitempty"`
@@ -92,6 +105,7 @@ type ActorDTO struct {
 	SnapshotReplayCommands uint64          `json:"snapshot_replay_commands,omitempty"`
 }
 
+// ModelDTO is the registered model metadata exposed to the console.
 type ModelDTO struct {
 	Name      string `json:"name"`
 	Version   string `json:"version"`
@@ -100,6 +114,7 @@ type ModelDTO struct {
 	Adapter   string `json:"adapter,omitempty"`
 }
 
+// WorkerDTO is the worker heartbeat/capacity view returned by dashboard.
 type WorkerDTO struct {
 	WorkerID        string          `json:"worker_id"`
 	Capacity        uint32          `json:"capacity"`
@@ -108,11 +123,14 @@ type WorkerDTO struct {
 	LastHeartbeatMs int64           `json:"last_heartbeat_ms,omitempty"`
 }
 
+// ModelCacheDTO identifies one model cached by a worker.
 type ModelCacheDTO struct {
 	Name    string `json:"name"`
 	Version string `json:"version,omitempty"`
 }
 
+// MetadataMaterializerDTO surfaces async materializer counters and lag estimates
+// from the control-plane dashboard snapshot.
 type MetadataMaterializerDTO struct {
 	Mode                  string `json:"mode,omitempty"`
 	PendingDeltas         uint64 `json:"pending_deltas,omitempty"`
@@ -130,6 +148,8 @@ type MetadataMaterializerDTO struct {
 	EventualLagEstimateMs int64  `json:"eventual_lag_estimate_ms,omitempty"`
 }
 
+// LLMDTO represents LLM task submission, replay, cache, and latency fields in a
+// single response shape.
 type LLMDTO struct {
 	TaskID             string          `json:"task_id,omitempty"`
 	Status             string          `json:"status,omitempty"`
@@ -149,6 +169,7 @@ type LLMDTO struct {
 	Events             []LLMEventDTO   `json:"events,omitempty"`
 }
 
+// LLMEventDTO is one replayed LLM lifecycle/cache event.
 type LLMEventDTO struct {
 	EventType          string `json:"event_type,omitempty"`
 	TimestampMs        int64  `json:"timestamp_ms,omitempty"`
@@ -166,6 +187,8 @@ type LLMEventDTO struct {
 	EvictionCount      int64  `json:"eviction_count,omitempty"`
 }
 
+// dashboardDTO converts a protobuf dashboard snapshot into non-nil JSON slices so
+// empty collections serialize as arrays rather than null.
 func dashboardDTO(snapshot *logservepb.DashboardSnapshot) DashboardDTO {
 	out := DashboardDTO{
 		Tasks:     []TaskDTO{},
@@ -221,6 +244,7 @@ func dashboardDTO(snapshot *logservepb.DashboardSnapshot) DashboardDTO {
 	return out
 }
 
+// dashboardTaskDTO converts lightweight dashboard task metadata into TaskDTO.
 func dashboardTaskDTO(task *logservepb.DashboardTask) TaskDTO {
 	return TaskDTO{
 		TaskID:          task.GetTaskId(),
@@ -237,6 +261,8 @@ func dashboardTaskDTO(task *logservepb.DashboardTask) TaskDTO {
 	}
 }
 
+// taskStatusDTO converts a task status RPC response into TaskDTO with owned JSON
+// result bytes.
 func taskStatusDTO(resp *logservepb.GetTaskStatusResponse) TaskDTO {
 	return TaskDTO{
 		TaskID:      resp.GetTaskId(),
@@ -249,6 +275,8 @@ func taskStatusDTO(resp *logservepb.GetTaskStatusResponse) TaskDTO {
 	}
 }
 
+// dashboardWorkflowDTO converts dashboard workflow metadata and derives step
+// status counters for summary cards.
 func dashboardWorkflowDTO(wf *logservepb.DashboardWorkflow) WorkflowDTO {
 	out := WorkflowDTO{
 		WorkflowID:   wf.GetWorkflowId(),
@@ -271,6 +299,8 @@ func dashboardWorkflowDTO(wf *logservepb.DashboardWorkflow) WorkflowDTO {
 	return out
 }
 
+// workflowStatusDTO converts the detailed workflow status response and derives
+// step counters for the console.
 func workflowStatusDTO(resp *logservepb.GetWorkflowStatusResponse) WorkflowDTO {
 	out := WorkflowDTO{
 		WorkflowID:    resp.GetWorkflowId(),
@@ -300,6 +330,8 @@ func workflowStatusDTO(resp *logservepb.GetWorkflowStatusResponse) WorkflowDTO {
 	return out
 }
 
+// stepDTO converts one protobuf workflow step and copies dependency slices for
+// caller ownership.
 func stepDTO(step *logservepb.WorkflowStepState) StepDTO {
 	return StepDTO{
 		StepID:        step.GetStepId(),
@@ -317,6 +349,7 @@ func stepDTO(step *logservepb.WorkflowStepState) StepDTO {
 	}
 }
 
+// actorStatusDTO converts actor status RPC fields into the shared ActorDTO shape.
 func actorStatusDTO(resp *logservepb.GetActorStatusResponse) ActorDTO {
 	return ActorDTO{
 		ActorID:              resp.GetActorId(),
@@ -333,6 +366,8 @@ func actorStatusDTO(resp *logservepb.GetActorStatusResponse) ActorDTO {
 	}
 }
 
+// actorCallDTO converts an actor call response into the same DTO used for actor
+// status rows.
 func actorCallDTO(resp *logservepb.CallActorResponse) ActorDTO {
 	return ActorDTO{
 		ActorID: resp.GetActorId(),
@@ -344,6 +379,7 @@ func actorCallDTO(resp *logservepb.CallActorResponse) ActorDTO {
 	}
 }
 
+// modelDTO converts model registry protobuf metadata into JSON fields.
 func modelDTO(model *logservepb.ModelInfo) ModelDTO {
 	return ModelDTO{
 		Name:      model.GetName(),
@@ -354,6 +390,7 @@ func modelDTO(model *logservepb.ModelInfo) ModelDTO {
 	}
 }
 
+// workerDTO converts worker dashboard metadata and cached model entries.
 func workerDTO(worker *logservepb.DashboardWorker) WorkerDTO {
 	out := WorkerDTO{
 		WorkerID:        worker.GetWorkerId(),
@@ -367,6 +404,8 @@ func workerDTO(worker *logservepb.DashboardWorker) WorkerDTO {
 	return out
 }
 
+// llmReplayDTO converts replay output into the LLMDTO shape used by the console
+// timeline and cache panels.
 func llmReplayDTO(resp *logservepb.ReplayLLMResponse) LLMDTO {
 	out := LLMDTO{
 		TaskID:             resp.GetTaskId(),

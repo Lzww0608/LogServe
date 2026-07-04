@@ -11,6 +11,8 @@ import (
 	"github.com/logserve/logserve/internal/workflow"
 )
 
+// taskSpecFingerprint returns the stable identity used to validate repeated task
+// submissions with the same idempotency key.
 func taskSpecFingerprint(spec *logservepb.TaskSpec) (string, error) {
 	args, err := jsonValueForFingerprint(spec.GetArgsJson())
 	if err != nil {
@@ -35,6 +37,7 @@ func taskSpecFingerprint(spec *logservepb.TaskSpec) (string, error) {
 	})
 }
 
+// workflowFingerprint returns the stable identity for a workflow submission.
 func workflowFingerprint(workflowName string, def workflow.Definition) (string, error) {
 	definition, err := json.Marshal(def)
 	if err != nil {
@@ -50,6 +53,7 @@ func workflowFingerprint(workflowName string, def workflow.Definition) (string, 
 	})
 }
 
+// actorCreateFingerprint returns the stable identity for actor creation requests.
 func actorCreateFingerprint(req *logservepb.CreateActorRequest, initArgs []byte, snapshotEvery uint32) (string, error) {
 	initArgsValue, err := jsonValueForFingerprint(initArgs)
 	if err != nil {
@@ -63,6 +67,8 @@ func actorCreateFingerprint(req *logservepb.CreateActorRequest, initArgs []byte,
 	})
 }
 
+// ensureIdempotencyFingerprint rejects reuse of an idempotency key with different
+// semantic request content.
 func ensureIdempotencyFingerprint(kind, key, existing, requested string) error {
 	if key == "" || existing == "" || existing == requested {
 		return nil
@@ -70,6 +76,7 @@ func ensureIdempotencyFingerprint(kind, key, existing, requested string) error {
 	return fmt.Errorf("idempotency conflict for %s key %q", kind, key)
 }
 
+// stableFingerprint hashes JSON-marshaled structured values for idempotency checks.
 func stableFingerprint(value any) (string, error) {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -79,6 +86,8 @@ func stableFingerprint(value any) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// jsonValueForFingerprint compacts and unmarshals JSON so whitespace and object
+// formatting do not change an idempotency fingerprint.
 func jsonValueForFingerprint(data []byte) (any, error) {
 	if len(data) == 0 {
 		return nil, nil

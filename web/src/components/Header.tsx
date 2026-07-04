@@ -1,7 +1,10 @@
+// Top-bar component that surfaces route title, token state, and current role.
+
 import { getStoredToken } from "../api/client";
 import type { ConsoleSession } from "../types/logserve";
 import { roleLabel } from "../utils/roles";
 
+// Render control-plane connection metadata and the signed-in role badge.
 export function Header({ title, session, sessionError }: { title: string; session?: ConsoleSession | null; sessionError?: string }) {
   const hasToken = Boolean(getStoredToken());
   const refreshedAt = new Date().toLocaleTimeString();

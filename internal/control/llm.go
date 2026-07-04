@@ -13,6 +13,8 @@ import (
 	"github.com/logserve/logserve/internal/metadata"
 )
 
+// llmEventPayload is the durable per-task LLM event payload used for replay, stats,
+// and operator-facing LLM timelines.
 type llmEventPayload struct {
 	TaskID             string `json:"task_id,omitempty"`
 	ModelName          string `json:"model_name,omitempty"`
@@ -29,12 +31,15 @@ type llmEventPayload struct {
 	TimestampMs        int64  `json:"timestamp_ms,omitempty"`
 }
 
+// llmStatsKey identifies one model-version-worker statistics bucket.
 type llmStatsKey struct {
 	modelName    string
 	modelVersion string
 	workerID     string
 }
 
+// llmWorkerStats keeps aggregate request and latency/cache signals used by
+// predicted-latency scheduling.
 type llmWorkerStats struct {
 	RequestCount          uint64
 	CacheHitCount         uint64
@@ -45,6 +50,7 @@ type llmWorkerStats struct {
 	LastUpdatedMs         int64
 }
 
+// RegisterModel persists and materializes a model definition used by LLM tasks.
 func (s *Service) RegisterModel(ctx context.Context, req *logservepb.RegisterModelRequest) (*logservepb.RegisterModelResponse, error) {
 	model := req.GetModel()
 	if model.GetName() == "" {
@@ -67,6 +73,7 @@ func (s *Service) RegisterModel(ctx context.Context, req *logservepb.RegisterMod
 	return &logservepb.RegisterModelResponse{Model: registeredModel}, nil
 }
 
+// SetSchedulingPolicy records and applies the active LLM worker-selection policy.
 func (s *Service) SetSchedulingPolicy(ctx context.Context, req *logservepb.SetSchedulingPolicyRequest) (*logservepb.SetSchedulingPolicyResponse, error) {
 	policy := req.GetPolicy()
 	if policy == logservepb.SchedulingPolicy_SCHEDULING_POLICY_UNSPECIFIED {
@@ -90,6 +97,8 @@ func (s *Service) SetSchedulingPolicy(ctx context.Context, req *logservepb.SetSc
 	return &logservepb.SetSchedulingPolicyResponse{Policy: policy}, nil
 }
 
+// SubmitLLM converts a prompt into a synthetic task that workers execute through
+// the __logserve_llm__ function path.
 func (s *Service) SubmitLLM(ctx context.Context, req *logservepb.SubmitLLMRequest) (*logservepb.SubmitLLMResponse, error) {
 	if req.GetModelName() == "" {
 		return nil, errors.New("model_name is required")
@@ -140,6 +149,8 @@ func (s *Service) SubmitLLM(ctx context.Context, req *logservepb.SubmitLLMReques
 	return &logservepb.SubmitLLMResponse{TaskId: task.TaskID, Status: task.Status}, nil
 }
 
+// ReplayLLM reads the LLM task stream and reconstructs event history plus summary
+// fields from ModelLoaded and LLMCompleted records.
 func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMRequest) (*logservepb.ReplayLLMResponse, error) {
 	if req.GetTaskId() == "" {
 		return nil, errors.New("task_id is required")
@@ -205,6 +216,8 @@ func (s *Service) ReplayLLM(ctx context.Context, req *logservepb.ReplayLLMReques
 	return out, nil
 }
 
+// canAssignTaskToWorker enforces target-worker, capacity, and LLM scheduling policy
+// checks for the legacy queue path.
 func (s *Service) canAssignTaskToWorker(taskID string, spec *logservepb.TaskSpec, workerID string) bool {
 	if s.useSchedulerV2() {
 		return s.canAssignTaskToWorkerIndexed(taskID, spec, workerID)
@@ -231,6 +244,8 @@ func (s *Service) canAssignTaskToWorker(taskID string, spec *logservepb.TaskSpec
 	}
 }
 
+// canAssignTaskToWorkerIndexed performs final worker eligibility checks after the
+// indexed scheduler has already selected a candidate.
 func (s *Service) canAssignTaskToWorkerIndexed(taskID string, spec *logservepb.TaskSpec, workerID string) bool {
 	if spec.GetActorId() == "" && spec.GetTargetWorkerId() != "" && spec.GetTargetWorkerId() != workerID {
 		return false
@@ -253,6 +268,7 @@ func (s *Service) canAssignTaskToWorkerIndexed(taskID string, spec *logservepb.T
 	}
 }
 
+// preferredLLMWorker chooses the best locality-aware worker for an LLM task.
 func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) string {
 	createdAtMs := int64(0)
 	if task, ok := s.meta.GetTask(taskID); ok {
@@ -297,6 +313,8 @@ func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) s
 		if cacheHit {
 			score += 1000
 		}
+		// Prefer waiting briefly for a warm worker before assigning cold work; after the
+		// locality wait, cold workers are allowed to prevent starvation.
 		if !cacheHit && hasCachedAvailable && queueDelay < localityQueueWait {
 			score -= 1000
 		}
@@ -308,6 +326,8 @@ func (s *Service) preferredLLMWorker(taskID string, spec *logservepb.TaskSpec) s
 	return bestWorker
 }
 
+// predictedLLMWorker chooses the worker with the lowest estimated latency for an
+// LLM task using materialized latency/cache statistics.
 func (s *Service) predictedLLMWorker(taskID string, spec *logservepb.TaskSpec) string {
 	modelName := spec.GetLlmModelName()
 	modelVersion := spec.GetLlmModelVersion()
@@ -352,6 +372,8 @@ func (s *Service) predictedLLMWorker(taskID string, spec *logservepb.TaskSpec) s
 	return bestWorker
 }
 
+// predictedLatencyMs estimates task latency from EWMA totals, cold-load costs, and
+// eviction pressure.
 func predictedLatencyMs(worker metadata.Worker, modelKey string, stats llmWorkerStats) int64 {
 	base := int64(25)
 	if stats.RequestCount > 0 && stats.EWMATotalLatencyMs > 0 {
@@ -375,6 +397,7 @@ func predictedLatencyMs(worker metadata.Worker, modelKey string, stats llmWorker
 	return base + coldStartPenalty + evictionPenalty
 }
 
+// materializedLLMStats returns a copy of stats for one model version keyed by worker.
 func (s *Service) materializedLLMStats(modelName, modelVersion string) map[string]llmWorkerStats {
 	if modelVersion == "" {
 		modelVersion = "v1"
@@ -390,6 +413,7 @@ func (s *Service) materializedLLMStats(modelName, modelVersion string) map[strin
 	return out
 }
 
+// llmStatsForWorker returns one worker stats bucket if it has been materialized.
 func (s *Service) llmStatsForWorker(modelName, modelVersion, workerID string) (llmWorkerStats, bool) {
 	if modelVersion == "" {
 		modelVersion = "v1"
@@ -404,6 +428,8 @@ func (s *Service) llmStatsForWorker(modelName, modelVersion, workerID string) (l
 	return stats, ok
 }
 
+// materializeLLMTaskCompletion updates scheduling stats from the first LLMCompleted
+// event in a task stream.
 func (s *Service) materializeLLMTaskCompletion(ctx context.Context, taskID string) error {
 	var done bool
 	return s.forEachRawLogRecord(ctx, llmStream(taskID), 1, func(rec logrecord.RawRecord) error {
@@ -423,6 +449,8 @@ func (s *Service) materializeLLMTaskCompletion(ctx context.Context, taskID strin
 	})
 }
 
+// materializeLLMCompleted folds one completion payload into the EWMA stats map and
+// scheduler placement index.
 func (s *Service) materializeLLMCompleted(payload llmEventPayload) {
 	if payload.ModelName == "" || payload.WorkerID == "" || payload.TotalLatencyMs <= 0 {
 		return
@@ -456,6 +484,7 @@ func (s *Service) materializeLLMCompleted(payload llmEventPayload) {
 	}
 }
 
+// updateEWMA applies a fixed 70/30 previous-sample weighting after the first sample.
 func updateEWMA(previous, sample int64, count uint64) int64 {
 	if count <= 1 {
 		return sample
@@ -463,6 +492,7 @@ func updateEWMA(previous, sample int64, count uint64) int64 {
 	return (previous*7 + sample*3) / 10
 }
 
+// bootstrapLLMStats fully replays LLM streams to rebuild worker latency/cache stats.
 func (s *Service) bootstrapLLMStats(ctx context.Context) error {
 	streams, err := s.listStreams(ctx, "llm:")
 	if err != nil {
@@ -493,6 +523,7 @@ func (s *Service) bootstrapLLMStats(ctx context.Context) error {
 	return nil
 }
 
+// workerHasCapacity treats zero capacity as one slot and checks available worker load.
 func workerHasCapacity(worker metadata.Worker) bool {
 	capacity := worker.Capacity
 	if capacity == 0 {
@@ -501,6 +532,7 @@ func workerHasCapacity(worker metadata.Worker) bool {
 	return worker.RunningTasks < capacity
 }
 
+// modelCacheFromProto converts worker-reported cached models into metadata keys.
 func modelCacheFromProto(entries []*logservepb.ModelCacheEntry) map[string]bool {
 	out := make(map[string]bool, len(entries))
 	for _, entry := range entries {
@@ -512,10 +544,12 @@ func modelCacheFromProto(entries []*logservepb.ModelCacheEntry) map[string]bool 
 	return out
 }
 
+// llmStream maps an LLM task ID to its auxiliary LLM event stream.
 func llmStream(taskID string) string {
 	return "llm:" + taskID
 }
 
+// normalizeModelInfo copies a model registration and fills default version/adapter.
 func normalizeModelInfo(model *logservepb.ModelInfo) *logservepb.ModelInfo {
 	clone := &logservepb.ModelInfo{
 		Name:      model.GetName(),
@@ -533,6 +567,7 @@ func normalizeModelInfo(model *logservepb.ModelInfo) *logservepb.ModelInfo {
 	return clone
 }
 
+// firstNonEmpty returns the first non-empty string in priority order.
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {

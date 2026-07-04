@@ -1,3 +1,5 @@
+// Task submission route with JSON validation and built-in Python templates.
+
 import { useMemo, useState, type FormEvent } from "react";
 import { api } from "../api/client";
 import { CodeEditor } from "../components/CodeEditor";
@@ -28,6 +30,7 @@ const taskTemplates = {
 type TemplateID = keyof typeof taskTemplates | "custom";
 type FormMessage = { tone: "error" | "info"; text: string };
 
+// Render task submission controls with client-side JSON validation.
 export function SubmitTaskPage({ session }: { session?: ConsoleSession | null }) {
   const taskParams = new URLSearchParams(window.location.search);
   const initialFunctionHash = taskParams.get("function_hash") ?? "";
@@ -69,6 +72,7 @@ export function SubmitTaskPage({ session }: { session?: ConsoleSession | null })
     idempotency_key: idempotencyKey
   };
 
+  // Submit the validated Python task payload, then navigate to its detail route.
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setMessage(null);
@@ -103,6 +107,7 @@ export function SubmitTaskPage({ session }: { session?: ConsoleSession | null })
     }
   };
 
+  // Load a sample task template and mark subsequent manual edits as custom.
   const applyTemplate = (nextTemplateID: TemplateID) => {
     setTemplateID(nextTemplateID);
     if (nextTemplateID === "custom") return;
@@ -116,6 +121,7 @@ export function SubmitTaskPage({ session }: { session?: ConsoleSession | null })
     setMessage(null);
   };
 
+  // Pretty-print args or kwargs JSON without submitting the form.
   const formatJSON = (kind: "args" | "kwargs") => {
     const value = kind === "args" ? args : kwargs;
     const setter = kind === "args" ? setArgs : setKwargs;
@@ -127,6 +133,7 @@ export function SubmitTaskPage({ session }: { session?: ConsoleSession | null })
     }
   };
 
+  // Report the current args or kwargs validation result in the form message area.
   const validateJSON = (kind: "args" | "kwargs") => {
     const fieldError = kind === "args" ? validation.errors.args : validation.errors.kwargs;
     setMessage(fieldError ? { tone: "error", text: fieldError } : { tone: "info", text: `${kind === "args" ? "Args" : "Kwargs"} JSON is valid.` });
@@ -175,6 +182,7 @@ export function SubmitTaskPage({ session }: { session?: ConsoleSession | null })
   );
 }
 
+// Render one JSON editor field with format and validate controls.
 function JSONField({ label, value, error, onChange, onFormat, onValidate }: { label: string; value: string; error?: string; onChange: (value: string) => void; onFormat: () => void; onValidate: () => void }) {
   return (
     <div className="form-grid compact-field">

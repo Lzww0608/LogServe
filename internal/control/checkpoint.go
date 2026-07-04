@@ -17,11 +17,16 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
+// This file implements metadata checkpoints: compact snapshots of materialized
+// task, workflow, actor, and LLM state plus per-stream tail positions.
 const (
 	metadataCheckpointStream = "system:checkpoints"
 	metadataCheckpointEvent  = "MetadataCheckpointCreated"
 )
 
+// MetadataCheckpoint is the durable snapshot payload stored in system:checkpoints.
+// Streams records the last included sequence for each stream so bootstrap can
+// replay only records written after the checkpoint.
 type MetadataCheckpoint struct {
 	ID          string                              `json:"checkpoint_id"`
 	CreatedAtMs int64                               `json:"created_at_ms"`
@@ -32,26 +37,32 @@ type MetadataCheckpoint struct {
 	LLMStats    []metadataCheckpointLLMStats        `json:"llm_stats,omitempty"`
 }
 
+// MetadataCheckpointStream records the kind and last included sequence of one log
+// stream at checkpoint time.
 type MetadataCheckpointStream struct {
 	Kind    string `json:"kind,omitempty"`
 	LastSeq uint64 `json:"last_seq"`
 }
 
+// metadataCheckpointTask stores task metadata together with its protobuf task spec.
 type metadataCheckpointTask struct {
 	Task metadata.Task   `json:"task"`
 	Spec json.RawMessage `json:"spec"`
 }
 
+// metadataCheckpointWorkflow stores a workflow materialization inside a checkpoint.
 type metadataCheckpointWorkflow struct {
 	WorkflowID string         `json:"workflow_id"`
 	State      workflow.State `json:"state"`
 }
 
+// metadataCheckpointActor stores an actor materialization inside a checkpoint.
 type metadataCheckpointActor struct {
 	ActorID string      `json:"actor_id"`
 	State   actor.State `json:"state"`
 }
 
+// metadataCheckpointLLMStats stores one model-worker statistics bucket.
 type metadataCheckpointLLMStats struct {
 	ModelName    string         `json:"model_name"`
 	ModelVersion string         `json:"model_version"`
@@ -59,6 +70,8 @@ type metadataCheckpointLLMStats struct {
 	Stats        llmWorkerStats `json:"stats"`
 }
 
+// MetadataCheckpointConsistency reports whether checkpoint-plus-tail replay matches
+// full log replay for materialized control-plane state.
 type MetadataCheckpointConsistency struct {
 	Consistent    bool     `json:"consistent"`
 	CheckedCount  int      `json:"checked_count"`
@@ -67,6 +80,8 @@ type MetadataCheckpointConsistency struct {
 	CheckpointAge int64    `json:"checkpoint_age_ms,omitempty"`
 }
 
+// CreateMetadataCheckpoint snapshots current metadata, writes it to the checkpoint
+// stream, and optionally trims older checkpoint records according to retention.
 func (s *Service) CreateMetadataCheckpoint(ctx context.Context, retention int) (MetadataCheckpoint, error) {
 	now := time.Now().UnixMilli()
 	cp := MetadataCheckpoint{
@@ -105,6 +120,8 @@ func (s *Service) CreateMetadataCheckpoint(ctx context.Context, retention int) (
 	return cp, nil
 }
 
+// StartMetadataCheckpointLoop periodically creates metadata checkpoints and returns
+// a stop function that cancels the loop and waits for it to exit.
 func (s *Service) StartMetadataCheckpointLoop(ctx context.Context, interval time.Duration, retention int) func() {
 	if interval <= 0 {
 		return func() {}
@@ -131,6 +148,9 @@ func (s *Service) StartMetadataCheckpointLoop(ctx context.Context, interval time
 		<-done
 	}
 }
+
+// CheckMetadataCheckpointConsistency compares full replay with checkpoint-plus-tail
+// replay and returns the stream keys that diverge.
 func (s *Service) CheckMetadataCheckpointConsistency(ctx context.Context) (MetadataCheckpointConsistency, error) {
 	cp, err := s.loadLatestMetadataCheckpoint(ctx)
 	if err != nil {
@@ -202,6 +222,8 @@ func (s *Service) CheckMetadataCheckpointConsistency(ctx context.Context) (Metad
 	return result, nil
 }
 
+// loadLatestMetadataCheckpoint scans checkpoint records and returns the newest
+// decodable checkpoint payload, ignoring corrupt records after logging them.
 func (s *Service) loadLatestMetadataCheckpoint(ctx context.Context) (*MetadataCheckpoint, error) {
 	var latest *MetadataCheckpoint
 	if err := s.forEachRawLogRecord(ctx, metadataCheckpointStream, 1, func(rec logrecord.RawRecord) error {
@@ -227,10 +249,14 @@ func (s *Service) loadLatestMetadataCheckpoint(ctx context.Context) (*MetadataCh
 	return latest, nil
 }
 
+// bootstrapMetadataFromCheckpoint restores metadata from a checkpoint and schedules
+// recovered runnable work.
 func (s *Service) bootstrapMetadataFromCheckpoint(ctx context.Context, cp MetadataCheckpoint) error {
 	return s.bootstrapMetadataFromCheckpointWithScheduling(ctx, cp, true)
 }
 
+// bootstrapMetadataFromCheckpointWithScheduling restores checkpointed state and can
+// suppress scheduling for consistency checks.
 func (s *Service) bootstrapMetadataFromCheckpointWithScheduling(ctx context.Context, cp MetadataCheckpoint, schedule bool) error {
 	if err := s.bootstrapCheckpointTasks(ctx, cp); err != nil {
 		return err
@@ -247,6 +273,8 @@ func (s *Service) bootstrapMetadataFromCheckpointWithScheduling(ctx context.Cont
 	return nil
 }
 
+// bootstrapCheckpointTasks restores checkpointed tasks, replays each task tail, and
+// fully replays task streams that were not present in the checkpoint.
 func (s *Service) bootstrapCheckpointTasks(ctx context.Context, cp MetadataCheckpoint) error {
 	seen := make(map[string]struct{}, len(cp.Tasks))
 	for _, item := range cp.Tasks {
@@ -293,6 +321,8 @@ func (s *Service) bootstrapCheckpointTasks(ctx context.Context, cp MetadataCheck
 	return nil
 }
 
+// bootstrapCheckpointWorkflows restores workflow snapshots, replays tail events, and
+// optionally recreates runnable step tasks.
 func (s *Service) bootstrapCheckpointWorkflows(ctx context.Context, cp MetadataCheckpoint, schedule bool) error {
 	seen := make(map[string]struct{}, len(cp.Workflows))
 	for _, item := range cp.Workflows {
@@ -355,6 +385,8 @@ func (s *Service) bootstrapCheckpointWorkflows(ctx context.Context, cp MetadataC
 	return nil
 }
 
+// bootstrapCheckpointActors restores actor snapshots, replays tail events, and fully
+// replays actor streams missing from the checkpoint.
 func (s *Service) bootstrapCheckpointActors(ctx context.Context, cp MetadataCheckpoint) error {
 	seen := make(map[string]struct{}, len(cp.Actors))
 	for _, item := range cp.Actors {
@@ -392,11 +424,15 @@ func (s *Service) bootstrapCheckpointActors(ctx context.Context, cp MetadataChec
 	return nil
 }
 
+// bootstrapCheckpointLLMStats restores LLM stats buckets and materializes LLM tail
+// events written after the checkpoint.
 func (s *Service) bootstrapCheckpointLLMStats(ctx context.Context, cp MetadataCheckpoint) error {
 	s.restoreCheckpointLLMStats(cp)
 	return s.materializeLLMTailsFromCheckpoint(ctx, cp)
 }
 
+// restoreCheckpointLLMStats replaces in-memory LLM stats from checkpoint payload and
+// mirrors them into scheduler placement indexes.
 func (s *Service) restoreCheckpointLLMStats(cp MetadataCheckpoint) {
 	s.llmStatsMu.Lock()
 	s.llmStats = llmStatsFromCheckpoint(cp)
@@ -404,6 +440,7 @@ func (s *Service) restoreCheckpointLLMStats(cp MetadataCheckpoint) {
 	s.syncSchedulerLLMStats()
 }
 
+// llmStatsFromCheckpoint converts checkpoint rows into the in-memory stats map.
 func llmStatsFromCheckpoint(cp MetadataCheckpoint) map[llmStatsKey]llmWorkerStats {
 	stats := make(map[llmStatsKey]llmWorkerStats, len(cp.LLMStats))
 	for _, item := range cp.LLMStats {
@@ -413,6 +450,8 @@ func llmStatsFromCheckpoint(cp MetadataCheckpoint) map[llmStatsKey]llmWorkerStat
 	return stats
 }
 
+// materializeLLMTailsFromCheckpoint replays LLMCompleted events after checkpoint
+// positions and also scans streams created after the checkpoint.
 func (s *Service) materializeLLMTailsFromCheckpoint(ctx context.Context, cp MetadataCheckpoint) error {
 	seen := make(map[string]struct{})
 	for _, streamID := range checkpointLLMStreams(cp) {
@@ -438,6 +477,7 @@ func (s *Service) materializeLLMTailsFromCheckpoint(ctx context.Context, cp Meta
 	return nil
 }
 
+// checkpointLLMStreams returns sorted LLM stream IDs that the checkpoint knows about.
 func checkpointLLMStreams(cp MetadataCheckpoint) []string {
 	streams := make([]string, 0, len(cp.Streams))
 	for streamID, entry := range cp.Streams {
@@ -453,6 +493,8 @@ func checkpointLLMStreams(cp MetadataCheckpoint) []string {
 	return streams
 }
 
+// llmStatsFromCheckpointTail computes the expected LLM stats after applying the
+// checkpoint tail in an isolated verifier service.
 func (s *Service) llmStatsFromCheckpointTail(ctx context.Context, cp MetadataCheckpoint) (map[llmStatsKey]llmWorkerStats, error) {
 	verifier := NewServiceWithResultStore(metadata.NewMemoryStore(), s.log, s.resultStore, s.resultInlineThreshold)
 	verifier.restoreCheckpointLLMStats(cp)
@@ -462,6 +504,8 @@ func (s *Service) llmStatsFromCheckpointTail(ctx context.Context, cp MetadataChe
 	return verifier.llmStatsSnapshot(), nil
 }
 
+// materializeLLMStreamFromSeq replays LLMCompleted records from a stream sequence
+// and updates in-memory latency/cache statistics.
 func (s *Service) materializeLLMStreamFromSeq(ctx context.Context, streamID string, fromSeq uint64) error {
 	return s.forEachRawLogRecord(ctx, streamID, fromSeq, func(rec logrecord.RawRecord) error {
 		if rec.EventType != "LLMCompleted" {
@@ -479,6 +523,8 @@ func (s *Service) materializeLLMStreamFromSeq(ctx context.Context, streamID stri
 	})
 }
 
+// forEachLogRecordFromSeq pages protobuf log records from an arbitrary starting
+// sequence until the stream tail is reached.
 func (s *Service) forEachLogRecordFromSeq(ctx context.Context, streamID string, fromSeq uint64, emit func(*logservepb.LogRecord) error) error {
 	if emit == nil {
 		return nil
@@ -511,6 +557,8 @@ func (s *Service) forEachLogRecordFromSeq(ctx context.Context, streamID string, 
 	}
 }
 
+// snapshotTasks copies task metadata and specs into the checkpoint in deterministic
+// task ID order.
 func snapshotTasks(cp *MetadataCheckpoint, s *Service, lastSeqs map[string]uint64) {
 	tasks := s.meta.ListTasks()
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].TaskID < tasks[j].TaskID })
@@ -528,6 +576,8 @@ func snapshotTasks(cp *MetadataCheckpoint, s *Service, lastSeqs map[string]uint6
 	}
 }
 
+// snapshotWorkflows copies workflow states into the checkpoint in deterministic
+// workflow ID order.
 func snapshotWorkflows(cp *MetadataCheckpoint, s *Service, lastSeqs map[string]uint64) {
 	states := s.meta.ListWorkflows()
 	sort.Slice(states, func(i, j int) bool { return states[i].WorkflowID < states[j].WorkflowID })
@@ -537,6 +587,7 @@ func snapshotWorkflows(cp *MetadataCheckpoint, s *Service, lastSeqs map[string]u
 	}
 }
 
+// snapshotActors copies actor states into the checkpoint in deterministic actor ID order.
 func snapshotActors(cp *MetadataCheckpoint, s *Service, lastSeqs map[string]uint64) {
 	states := s.meta.ListActors()
 	sort.Slice(states, func(i, j int) bool { return states[i].ActorID < states[j].ActorID })
@@ -546,6 +597,7 @@ func snapshotActors(cp *MetadataCheckpoint, s *Service, lastSeqs map[string]uint
 	}
 }
 
+// snapshotLLMStats copies model-worker stats and records LLM stream tail positions.
 func snapshotLLMStats(cp *MetadataCheckpoint, s *Service, lastSeqs map[string]uint64) {
 	s.llmStatsMu.RLock()
 	keys := make([]llmStatsKey, 0, len(s.llmStats))
@@ -577,6 +629,8 @@ func snapshotLLMStats(cp *MetadataCheckpoint, s *Service, lastSeqs map[string]ui
 	}
 }
 
+// streamLastSeqs collects the last sequence per stream, using stream stats when
+// available and falling back to reading the stream when stats are absent.
 func (s *Service) streamLastSeqs(ctx context.Context, prefixes []string) (map[string]uint64, error) {
 	out := make(map[string]uint64)
 	for _, prefix := range prefixes {
@@ -607,6 +661,7 @@ func (s *Service) streamLastSeqs(ctx context.Context, prefixes []string) (map[st
 	return out, nil
 }
 
+// streamLastSeqByRead finds a stream tail by scanning records when stats are unavailable.
 func (s *Service) streamLastSeqByRead(ctx context.Context, streamID string) (uint64, error) {
 	var last uint64
 	err := s.forEachRawLogRecord(ctx, streamID, 1, func(rec logrecord.RawRecord) error {
@@ -618,6 +673,8 @@ func (s *Service) streamLastSeqByRead(ctx context.Context, streamID string) (uin
 	return last, err
 }
 
+// restoreTaskReplayState writes replayed task state into metadata, caches its spec,
+// and restores queue/scheduler membership for non-terminal tasks.
 func (s *Service) restoreTaskReplayState(state *taskReplayState) error {
 	if state == nil || !state.ok || state.spec == nil {
 		return nil
@@ -641,6 +698,7 @@ func (s *Service) restoreTaskReplayState(state *taskReplayState) error {
 	return nil
 }
 
+// llmStatsSnapshot returns a copy of the current LLM stats map for comparison.
 func (s *Service) llmStatsSnapshot() map[llmStatsKey]llmWorkerStats {
 	s.llmStatsMu.RLock()
 	defer s.llmStatsMu.RUnlock()
@@ -651,6 +709,7 @@ func (s *Service) llmStatsSnapshot() map[llmStatsKey]llmWorkerStats {
 	return out
 }
 
+// llmStatsMapsConsistent compares two LLM stats maps exactly.
 func llmStatsMapsConsistent(a, b map[llmStatsKey]llmWorkerStats) bool {
 	if len(a) != len(b) {
 		return false
@@ -663,6 +722,7 @@ func llmStatsMapsConsistent(a, b map[llmStatsKey]llmWorkerStats) bool {
 	return true
 }
 
+// metadataTasksConsistent compares task fields relevant to replay consistency.
 func metadataTasksConsistent(a, b metadata.Task) bool {
 	return a.TaskID == b.TaskID &&
 		a.TaskName == b.TaskName &&
@@ -684,6 +744,7 @@ func metadataTasksConsistent(a, b metadata.Task) bool {
 		string(a.ResultJSON) == string(b.ResultJSON)
 }
 
+// checkpointStreamKind infers a checkpoint stream kind from its ID prefix.
 func checkpointStreamKind(streamID string) string {
 	switch {
 	case strings.HasPrefix(streamID, "task:"):
@@ -699,6 +760,7 @@ func checkpointStreamKind(streamID string) string {
 	}
 }
 
+// normalizeStreamKinds fills missing stream kinds for older checkpoint payloads.
 func (cp *MetadataCheckpoint) normalizeStreamKinds() {
 	for streamID, entry := range cp.Streams {
 		if entry.Kind == "" {
@@ -708,6 +770,7 @@ func (cp *MetadataCheckpoint) normalizeStreamKinds() {
 	}
 }
 
+// String returns a compact checkpoint summary for logs and reports.
 func (cp MetadataCheckpoint) String() string {
 	return fmt.Sprintf("%s streams=%d tasks=%d workflows=%d actors=%d llm_stats=%d", cp.ID, len(cp.Streams), len(cp.Tasks), len(cp.Workflows), len(cp.Actors), len(cp.LLMStats))
 }

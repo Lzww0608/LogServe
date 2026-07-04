@@ -1,8 +1,11 @@
+// Unit tests for SSE parsing and event-state merge helpers.
+
 import assert from "node:assert/strict";
 import test from "node:test";
 import { consumeEventStream, createEventStreamURL, parseSSEChunk } from "../.tmp-event-tests/src/api/events.js";
 import { applyLogRecordsEvent, applyTaskEvent, applyWorkflowEvent } from "../.tmp-event-tests/src/utils/eventState.js";
 
+// Verifies parseSSEChunk buffers partial messages and emits completed events.
 test("parseSSEChunk buffers partial messages and emits completed events", () => {
   let parsed = parseSSEChunk("", "event: task\ndata: {\"task\":{\"task_id\":\"task-");
   assert.deepEqual(parsed.messages, []);
@@ -13,11 +16,13 @@ test("parseSSEChunk buffers partial messages and emits completed events", () => 
   assert.deepEqual(parsed.messages, [{ event: "task", data: "{\"task\":{\"task_id\":\"task-1\",\"status\":\"RUNNING\"}}" }]);
 });
 
+// Verifies createEventStreamURL encodes supported filters.
 test("createEventStreamURL encodes supported filters", () => {
   assert.equal(createEventStreamURL({ taskID: "task 1", intervalMs: 1000 }), "/api/events?task_id=task+1&interval_ms=1000");
   assert.equal(createEventStreamURL({ stream: "wf:wf-1", fromSeq: 2, limit: 10 }), "/api/events?stream=wf%3Awf-1&from_seq=2&limit=10");
 });
 
+// Verifies applyTaskEvent updates status without dropping existing metadata.
 test("applyTaskEvent updates status without dropping existing metadata", () => {
   const current = { task_id: "task-1", task_name: "add", status: "RUNNING", worker_id: "worker-1" };
   const next = applyTaskEvent(current, { task_id: "task-1", status: "SUCCEEDED", result_json: { ok: true } });
@@ -25,6 +30,7 @@ test("applyTaskEvent updates status without dropping existing metadata", () => {
   assert.deepEqual(next, { task_id: "task-1", task_name: "add", status: "SUCCEEDED", worker_id: "worker-1", result_json: { ok: true } });
 });
 
+// Verifies applyWorkflowEvent merges step updates by step_id and keeps stable order.
 test("applyWorkflowEvent merges step updates by step_id and keeps stable order", () => {
   const current = {
     workflow_id: "wf-1",
@@ -50,6 +56,7 @@ test("applyWorkflowEvent merges step updates by step_id and keeps stable order",
   assert.deepEqual(next.steps?.[0].result_json, ["doc"]);
 });
 
+// Verifies applyLogRecordsEvent appends new records once by sequence.
 test("applyLogRecordsEvent appends new records once by sequence", () => {
   const current = {
     stream_id: "system:functions",
@@ -76,6 +83,7 @@ test("applyLogRecordsEvent appends new records once by sequence", () => {
   assert.equal(next.stats?.next_seq, 3);
 });
 
+// Verifies consumeEventStream rejects backend error events.
 test("consumeEventStream rejects backend error events", async () => {
   const previousFetch = globalThis.fetch;
   const previousSessionStorage = globalThis.sessionStorage;

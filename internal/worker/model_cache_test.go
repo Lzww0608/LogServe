@@ -1,5 +1,8 @@
 package worker
 
+// This file exercises the worker checkpoint cache, especially the LRU,
+// singleflight, manifest-replay, and concurrent cold-load edge cases.
+
 import (
 	"bytes"
 	"context"
@@ -14,6 +17,7 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// TestModelCheckpointCacheCopiesAndHits verifies a cold checkpoint fetch becomes a cache hit on the next load.
 func TestModelCheckpointCacheCopiesAndHits(t *testing.T) {
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
@@ -54,6 +58,7 @@ func TestModelCheckpointCacheCopiesAndHits(t *testing.T) {
 	}
 }
 
+// TestModelCheckpointCacheEvictsLRUWhenCapacityExceeded verifies capacity pressure removes the least-recently-used checkpoint.
 func TestModelCheckpointCacheEvictsLRUWhenCapacityExceeded(t *testing.T) {
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
@@ -86,6 +91,7 @@ func TestModelCheckpointCacheEvictsLRUWhenCapacityExceeded(t *testing.T) {
 	}
 }
 
+// TestModelCheckpointCacheAccessPromotesLRU verifies cache hits promote entries before later evictions.
 func TestModelCheckpointCacheAccessPromotesLRU(t *testing.T) {
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
@@ -134,6 +140,7 @@ func TestModelCheckpointCacheAccessPromotesLRU(t *testing.T) {
 	}
 }
 
+// TestModelCheckpointCacheUsesO1LRUIndex verifies the cache has both list and map structures needed for O(1) LRU operations.
 func TestModelCheckpointCacheUsesO1LRUIndex(t *testing.T) {
 	cache := newModelCache(Config{ModelCacheDir: t.TempDir(), ModelCacheCapacityBytes: 1024})
 	if cache.lru == nil {
@@ -147,6 +154,7 @@ func TestModelCheckpointCacheUsesO1LRUIndex(t *testing.T) {
 	}
 }
 
+// TestModelCheckpointCacheAllowsDifferentModelsToLoadConcurrently verifies per-model singleflight does not serialize unrelated models.
 func TestModelCheckpointCacheAllowsDifferentModelsToLoadConcurrently(t *testing.T) {
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
@@ -163,6 +171,8 @@ func TestModelCheckpointCacheAllowsDifferentModelsToLoadConcurrently(t *testing.
 	originalRead := readCheckpointFunc
 	copyStarted := make(chan string, 2)
 	releaseCopies := make(chan struct{})
+
+	// Patch checkpoint I/O so the test can hold copies open and prove both model loads start concurrently.
 	var activeCopies atomic.Int32
 	copyCheckpointFunc = func(ctx context.Context, sourcePath, targetPath string) (int64, error) {
 		activeCopies.Add(1)
@@ -228,6 +238,8 @@ func TestModelCheckpointCacheAllowsDifferentModelsToLoadConcurrently(t *testing.
 		t.Fatal(err)
 	}
 }
+
+// TestModelCheckpointCacheSnapshotDoesNotWaitForColdLoadIO verifies heartbeats can snapshot warm models while a cold load blocks on I/O.
 func TestModelCheckpointCacheSnapshotDoesNotWaitForColdLoadIO(t *testing.T) {
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
@@ -242,6 +254,8 @@ func TestModelCheckpointCacheSnapshotDoesNotWaitForColdLoadIO(t *testing.T) {
 
 	originalCopy := copyCheckpointFunc
 	originalRead := readCheckpointFunc
+
+	// The patched copy blocks after signaling so snapshotEntries can be checked during cold-load I/O.
 	copyStarted := make(chan struct{})
 	releaseCopy := make(chan struct{})
 	copyCheckpointFunc = func(ctx context.Context, sourcePath, targetPath string) (int64, error) {
@@ -300,6 +314,7 @@ func TestModelCheckpointCacheSnapshotDoesNotWaitForColdLoadIO(t *testing.T) {
 	}
 }
 
+// TestWriteCheckpointManifestRewritesThroughTempFile verifies manifest rewrites leave no temp file and publish the newest metadata.
 func TestWriteCheckpointManifestRewritesThroughTempFile(t *testing.T) {
 	dir := t.TempDir()
 	checkpointPath := filepath.Join(dir, "model.checkpoint")
@@ -331,6 +346,8 @@ func TestWriteCheckpointManifestRewritesThroughTempFile(t *testing.T) {
 		t.Fatalf("manifest = %+v, want rewritten size/access", manifest)
 	}
 }
+
+// TestModelCheckpointCacheReportsExistingCheckpointOnStartup verifies manifest replay advertises cached checkpoints after restart.
 func TestModelCheckpointCacheReportsExistingCheckpointOnStartup(t *testing.T) {
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
@@ -355,6 +372,7 @@ func TestModelCheckpointCacheReportsExistingCheckpointOnStartup(t *testing.T) {
 	}
 }
 
+// TestModelCheckpointCacheSerializesConcurrentColdLoads verifies same-model callers share one cold fetch and the rest observe hits.
 func TestModelCheckpointCacheSerializesConcurrentColdLoads(t *testing.T) {
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
@@ -414,6 +432,7 @@ func TestModelCheckpointCacheSerializesConcurrentColdLoads(t *testing.T) {
 	}
 }
 
+// writeCheckpoint creates a source checkpoint fixture in the directory layout sourcePath expects.
 func writeCheckpoint(t *testing.T, root, name, version string, data []byte) {
 	t.Helper()
 	dir := filepath.Join(root, name+"-"+version)
@@ -425,6 +444,7 @@ func writeCheckpoint(t *testing.T, root, name, version string, data []byte) {
 	}
 }
 
+// cacheEntriesContain reports whether a snapshot includes a model/version entry.
 func cacheEntriesContain(entries []*logservepb.ModelCacheEntry, name, version string) bool {
 	for _, entry := range entries {
 		if entry.GetName() == name && entry.GetVersion() == version {
@@ -434,14 +454,17 @@ func cacheEntriesContain(entries []*logservepb.ModelCacheEntry, name, version st
 	return false
 }
 
+// errUnexpectedCacheHit builds a typed test error for concurrent-load assertions.
 func errUnexpectedCacheHit(name string) error {
 	return &unexpectedCacheHitError{name: name}
 }
 
+// unexpectedCacheHitError preserves the model name in cache-hit assertion failures.
 type unexpectedCacheHitError struct {
 	name string
 }
 
+// Error returns the unexpected-cache-hit test failure text.
 func (e *unexpectedCacheHitError) Error() string {
 	return e.name + " unexpectedly reported a cache hit"
 }

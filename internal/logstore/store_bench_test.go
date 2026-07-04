@@ -8,6 +8,8 @@ import (
 	"github.com/logserve/logserve/internal/logrecord"
 )
 
+// BenchmarkReadLargeStream measures indexed unary reads from the head, middle,
+// and tail of large streams.
 func BenchmarkReadLargeStream(b *testing.B) {
 	for _, entries := range []int{100_000, 1_000_000} {
 		b.Run(fmt.Sprintf("entries=%d", entries), func(b *testing.B) {
@@ -40,6 +42,8 @@ func BenchmarkReadLargeStream(b *testing.B) {
 	}
 }
 
+// BenchmarkReadRawLargeStream compares raw iteration with ReadAt and mmap-backed
+// segment readers when the platform supports mmap.
 func BenchmarkReadRawLargeStream(b *testing.B) {
 	for _, mmapRead := range []bool{false, true} {
 		if mmapRead && !mmapSupported() {
@@ -74,6 +78,8 @@ func BenchmarkReadRawLargeStream(b *testing.B) {
 	}
 }
 
+// buildBenchmarkStoreWithMmap seeds and reopens a benchmark store so sealed
+// segments can exercise the configured mmap/readAt path.
 func buildBenchmarkStoreWithMmap(b *testing.B, entries int, mmapRead bool) *Store {
 	b.Helper()
 	dir := b.TempDir()
@@ -103,6 +109,8 @@ func buildBenchmarkStoreWithMmap(b *testing.B, entries int, mmapRead bool) *Stor
 	}
 	return store
 }
+
+// buildBenchmarkStore seeds a single large active segment for read benchmarks.
 func buildBenchmarkStore(b *testing.B, entries int) *Store {
 	b.Helper()
 	opts := DefaultOptions()
@@ -123,6 +131,9 @@ func buildBenchmarkStore(b *testing.B, entries int) *Store {
 	}
 	return store
 }
+
+// BenchmarkReadAcrossSegments measures the cost of crossing many small segments
+// with and without the segment reader cache.
 func BenchmarkReadAcrossSegments(b *testing.B) {
 	for _, cacheSize := range []int{0, 64} {
 		b.Run(fmt.Sprintf("cache=%d", cacheSize), func(b *testing.B) {
@@ -143,6 +154,8 @@ func BenchmarkReadAcrossSegments(b *testing.B) {
 	}
 }
 
+// buildCrossSegmentBenchmarkStore creates many small segments to stress reader
+// acquisition and cache behavior.
 func buildCrossSegmentBenchmarkStore(b *testing.B, cacheSize int) *Store {
 	b.Helper()
 	opts := DefaultOptions()
@@ -169,6 +182,8 @@ func buildCrossSegmentBenchmarkStore(b *testing.B, cacheSize int) *Store {
 	return store
 }
 
+// BenchmarkChecksumPayloadSizes compares checksum algorithms and the chunked CRC
+// path over representative payload sizes.
 func BenchmarkChecksumPayloadSizes(b *testing.B) {
 	for _, size := range []int{128, 1024, 64 << 10, 1 << 20} {
 		payload := bytes.Repeat([]byte("x"), size)
@@ -205,6 +220,8 @@ func BenchmarkChecksumPayloadSizes(b *testing.B) {
 	}
 }
 
+// BenchmarkEncodeRecordPayloadSizes compares allocated and pooled record encoding
+// for the checksum algorithms used by current records.
 func BenchmarkEncodeRecordPayloadSizes(b *testing.B) {
 	for _, size := range []int{128, 1024, 64 << 10, 1 << 20} {
 		payload := bytes.Repeat([]byte("x"), size)
@@ -247,6 +264,8 @@ func BenchmarkEncodeRecordPayloadSizes(b *testing.B) {
 		}
 	}
 }
+
+// payloadSizeName returns stable benchmark labels for common payload sizes.
 func payloadSizeName(size int) string {
 	switch size {
 	case 128:

@@ -13,6 +13,8 @@ import (
 
 const compactionManifestFileName = "compaction-manifest.json"
 
+// CompactionOptions controls which reclamation modes run and how aggressively
+// copy-compaction writes new segment bytes.
 type CompactionOptions struct {
 	DeleteFullyTrimmedSegments bool
 	CopyPartialSegments        bool
@@ -20,6 +22,8 @@ type CompactionOptions struct {
 	MaxBytesPerSecond          int64
 }
 
+// SegmentCompactionStats describes how much of one segment is still live under
+// the current per-stream trim watermarks.
 type SegmentCompactionStats struct {
 	SegmentID          uint64
 	Active             bool
@@ -33,6 +37,8 @@ type SegmentCompactionStats struct {
 	Streams            []SegmentStreamCompactionStats
 }
 
+// SegmentStreamCompactionStats is the per-stream breakdown nested inside a
+// segment-level compactability report.
 type SegmentStreamCompactionStats struct {
 	StreamID           string
 	MinSeq             uint64
@@ -46,6 +52,8 @@ type SegmentStreamCompactionStats struct {
 	CompactableRecords uint64
 }
 
+// CompactionResult reports what a compaction attempt changed and includes the
+// stats snapshot used to make the compaction decision.
 type CompactionResult struct {
 	CompactionID     string
 	DeletedSegments  []uint64
@@ -55,6 +63,8 @@ type CompactionResult struct {
 	CompactableStats []SegmentCompactionStats
 }
 
+// CompactedSegment records the old-to-new segment mapping produced by copying
+// live records out of a partially trimmed segment.
 type CompactedSegment struct {
 	OldSegmentID uint64
 	NewSegmentID uint64
@@ -62,6 +72,9 @@ type CompactedSegment struct {
 	LiveBytes    uint64
 }
 
+// compactionManifest is the crash-recovery marker written before deleting or
+// replacing segment files. Recovery replays the manifest before rebuilding
+// indexes so disk and in-memory state converge.
 type compactionManifest struct {
 	CompactionID    string                   `json:"compaction_id"`
 	DeletedSegments []uint64                 `json:"deleted_segments"`
@@ -71,11 +84,15 @@ type compactionManifest struct {
 	CompletedAtMs   int64                    `json:"completed_at_ms,omitempty"`
 }
 
+// compactionManifestCopy stores one planned segment replacement in the
+// manifest so recovery can finish or roll back temporary files.
 type compactionManifestCopy struct {
 	OldSegmentID uint64 `json:"old_segment_id"`
 	NewSegmentID uint64 `json:"new_segment_id"`
 }
 
+// segmentCopyPlan holds the live entries that will be rewritten from an old
+// segment into a newly allocated segment ID.
 type segmentCopyPlan struct {
 	oldSegmentID uint64
 	newSegmentID uint64
@@ -83,11 +100,15 @@ type segmentCopyPlan struct {
 	entries      []recoveredIndexEntry
 }
 
+// segmentStatsBuilder accumulates per-segment and per-stream stats before the
+// public compactability slice is sorted and cloned.
 type segmentStatsBuilder struct {
 	stats   SegmentCompactionStats
 	streams map[string]*SegmentStreamCompactionStats
 }
 
+// startBackgroundCompactor launches the optional periodic compaction loop. The
+// loop is owned by Store and stopped by Close through the stored cancel func.
 func (s *Store) startBackgroundCompactor() {
 	if s.options.CompactionInterval <= 0 {
 		return
@@ -118,6 +139,8 @@ func (s *Store) startBackgroundCompactor() {
 	}()
 }
 
+// stopBackgroundCompactor cancels the periodic compaction loop and waits for
+// it to exit before clearing lifecycle fields.
 func (s *Store) stopBackgroundCompactor() {
 	if s.compactorCancel == nil {
 		return
@@ -130,6 +153,8 @@ func (s *Store) stopBackgroundCompactor() {
 	s.compactorDone = nil
 }
 
+// DefaultCompactionOptions returns the foreground compaction defaults used when
+// callers do not explicitly select a mode.
 func DefaultCompactionOptions() CompactionOptions {
 	return CompactionOptions{
 		DeleteFullyTrimmedSegments: true,
@@ -139,6 +164,8 @@ func DefaultCompactionOptions() CompactionOptions {
 	}
 }
 
+// normalize fills compaction defaults and validates thresholds before a Store
+// lock is taken for the actual compaction pass.
 func (opts CompactionOptions) normalize() (CompactionOptions, error) {
 	if !opts.DeleteFullyTrimmedSegments && !opts.CopyPartialSegments {
 		defaults := DefaultCompactionOptions()
@@ -165,12 +192,17 @@ func (opts CompactionOptions) normalize() (CompactionOptions, error) {
 	return opts, nil
 }
 
+// CompactabilityStats returns a cloned snapshot so callers cannot mutate the
+// store's internal stream and segment accounting.
 func (s *Store) CompactabilityStats() []SegmentCompactionStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneSegmentCompactionStats(s.compactabilityStatsLocked())
 }
 
+// Compact reclaims bytes made obsolete by logical trims. It may delete fully
+// trimmed sealed segments or copy live records out of sparse sealed segments;
+// active segments and busy cached readers are never modified.
 func (s *Store) Compact(ctx context.Context, opts CompactionOptions) (CompactionResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -216,6 +248,8 @@ func (s *Store) Compact(ctx context.Context, opts CompactionOptions) (Compaction
 			NewSegmentID: plan.newSegmentID,
 		})
 	}
+	// The manifest is durable before any file removal or replacement so recovery
+	// can complete the same plan after a crash.
 	if err := s.writeCompactionManifestLocked(manifest); err != nil {
 		return CompactionResult{}, err
 	}
@@ -282,6 +316,8 @@ func (s *Store) Compact(ctx context.Context, opts CompactionOptions) (Compaction
 		result.RewrittenBytes += plan.stats.LiveBytes
 	}
 
+	// A second manifest write marks the plan complete after all in-memory and disk
+	// changes have been applied; recovery still treats the manifest as replayable.
 	manifest.CompletedAtMs = time.Now().UnixMilli()
 	if err := s.writeCompactionManifestLocked(manifest); err != nil {
 		return CompactionResult{}, err
@@ -289,6 +325,8 @@ func (s *Store) Compact(ctx context.Context, opts CompactionOptions) (Compaction
 	return result, syncDirBestEffort(s.dir)
 }
 
+// compactabilityStatsLocked derives segment liveness from stream indexes and
+// trim watermarks. The caller must hold s.mu.
 func (s *Store) compactabilityStatsLocked() []SegmentCompactionStats {
 	builders := make(map[uint64]*segmentStatsBuilder)
 	for streamID, state := range s.streams {
@@ -364,6 +402,8 @@ func (s *Store) compactabilityStatsLocked() []SegmentCompactionStats {
 	return out
 }
 
+// compactionPlansLocked converts stats into delete and copy plans while
+// avoiding active segments and segments with outstanding readers.
 func (s *Store) compactionPlansLocked(stats []SegmentCompactionStats, opts CompactionOptions) ([]uint64, []segmentCopyPlan) {
 	deleteIDs := make([]uint64, 0)
 	copyPlans := make([]segmentCopyPlan, 0)
@@ -391,6 +431,8 @@ func (s *Store) compactionPlansLocked(stats []SegmentCompactionStats, opts Compa
 	return deleteIDs, copyPlans
 }
 
+// liveEntriesForSegmentLocked returns the untrimmed records in physical offset
+// order so copy-compaction preserves on-disk append order within the segment.
 func (s *Store) liveEntriesForSegmentLocked(segmentID uint64) []recoveredIndexEntry {
 	entries := make([]recoveredIndexEntry, 0)
 	for streamID, state := range s.streams {
@@ -408,6 +450,8 @@ func (s *Store) liveEntriesForSegmentLocked(segmentID uint64) []recoveredIndexEn
 	return entries
 }
 
+// applyCompactionIndexChangesLocked removes deleted/replaced entries and inserts
+// rewritten entries, then re-sorts each stream by sequence.
 func (s *Store) applyCompactionIndexChangesLocked(deletedIDs []uint64, copyPlans []segmentCopyPlan) {
 	removed := make(map[uint64]struct{}, len(deletedIDs)+len(copyPlans))
 	for _, segmentID := range deletedIDs {
@@ -438,11 +482,15 @@ func (s *Store) applyCompactionIndexChangesLocked(deletedIDs []uint64, copyPlans
 	}
 }
 
+// writeCompactedSegmentLocked copies live records into temporary segment files,
+// fsyncs them, and atomically renames them into place. The caller holds s.mu.
 func (s *Store) writeCompactedSegmentLocked(ctx context.Context, plan *segmentCopyPlan, opts CompactionOptions) (err error) {
 	logTmp := compactTempPath(s.dir, plan.newSegmentID, ".log")
 	indexTmp := compactTempPath(s.dir, plan.newSegmentID, ".index")
 	logFinal := segmentPath(s.dir, plan.newSegmentID, ".log")
 	indexFinal := segmentPath(s.dir, plan.newSegmentID, ".index")
+	// cleanup remains true until both temp files have been renamed; this keeps
+	// partial copies from being treated as valid segments after an error.
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -475,6 +523,8 @@ func (s *Store) writeCompactedSegmentLocked(ctx context.Context, plan *segmentCo
 			_ = newFile.Close()
 			return err
 		}
+		// Re-read validation fences against stale or corrupt index entries before the
+		// compacted segment becomes durable.
 		if rec.StreamID != item.streamID || rec.Seq != item.entry.Seq || nextOffset-int64(item.entry.Offset) != int64(item.entry.Length) {
 			_ = newFile.Close()
 			return errCorruptRecord
@@ -528,6 +578,8 @@ func (s *Store) writeCompactedSegmentLocked(ctx context.Context, plan *segmentCo
 	return syncDirBestEffort(s.dir)
 }
 
+// rebuildIdempotencyLocked reconstructs duplicate-detection state from the
+// surviving index entries after compaction changes segment membership.
 func (s *Store) rebuildIdempotencyLocked() error {
 	bySegment := make(map[uint64][]recoveredIndexEntry)
 	for streamID, state := range s.streams {
@@ -567,6 +619,8 @@ func (s *Store) rebuildIdempotencyLocked() error {
 	return nil
 }
 
+// compactionSafeBeforeLocked snapshots trim watermarks into the manifest for
+// observability and crash-recovery auditing.
 func (s *Store) compactionSafeBeforeLocked() map[string]uint64 {
 	out := make(map[string]uint64)
 	for streamID, state := range s.streams {
@@ -577,6 +631,8 @@ func (s *Store) compactionSafeBeforeLocked() map[string]uint64 {
 	return out
 }
 
+// writeCompactionManifestLocked persists the manifest through a temp file and
+// rename so recovery never observes a partially written JSON document.
 func (s *Store) writeCompactionManifestLocked(manifest compactionManifest) error {
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -594,6 +650,8 @@ func (s *Store) writeCompactionManifestLocked(manifest compactionManifest) error
 	return syncDirBestEffort(s.dir)
 }
 
+// closeSegmentReaderLocked evicts and closes a cached reader when no active
+// ReadEach/ReadRawEach callback is using it.
 func (s *Store) closeSegmentReaderLocked(segmentID uint64) error {
 	reader := s.segmentReaders[segmentID]
 	if reader == nil {
@@ -611,11 +669,15 @@ func (s *Store) closeSegmentReaderLocked(segmentID uint64) error {
 	return reader.reader.Close()
 }
 
+// segmentReaderBusyLocked reports whether a segment has outstanding reader refs
+// and therefore cannot be safely deleted or replaced.
 func (s *Store) segmentReaderBusyLocked(segmentID uint64) bool {
 	reader := s.segmentReaders[segmentID]
 	return reader != nil && reader.refs > 0
 }
 
+// reconcileCompactionManifestBeforeRecover completes any recorded compaction
+// before normal log recovery rebuilds indexes from the remaining files.
 func reconcileCompactionManifestBeforeRecover(dir string) error {
 	manifest, ok, err := readCompactionManifest(dir)
 	if err != nil || !ok {
@@ -634,6 +696,7 @@ func reconcileCompactionManifestBeforeRecover(dir string) error {
 	return syncDirBestEffort(dir)
 }
 
+// readCompactionManifest loads the optional recovery marker from disk.
 func readCompactionManifest(dir string) (compactionManifest, bool, error) {
 	path := filepath.Join(dir, compactionManifestFileName)
 	data, err := os.ReadFile(path)
@@ -650,6 +713,8 @@ func readCompactionManifest(dir string) (compactionManifest, bool, error) {
 	return manifest, true, nil
 }
 
+// reconcileCopiedSegmentBeforeRecover finishes the temp-file rename sequence or
+// removes an incomplete copy when the old segment is still available.
 func reconcileCopiedSegmentBeforeRecover(dir string, copied compactionManifestCopy) error {
 	oldExists := fileExists(segmentPath(dir, copied.OldSegmentID, ".log"))
 	logFinal := segmentPath(dir, copied.NewSegmentID, ".log")
@@ -661,6 +726,8 @@ func reconcileCopiedSegmentBeforeRecover(dir string, copied compactionManifestCo
 	logTmpExists := fileExists(logTmp)
 	indexTmpExists := fileExists(indexTmp)
 
+	// A log temp file is promoted first only when both temp files exist, preserving
+	// the invariant that a final log is never accepted without an index path.
 	if !logFinalExists && logTmpExists && indexTmpExists {
 		if err := os.Rename(logTmp, logFinal); err != nil {
 			return err
@@ -675,6 +742,7 @@ func reconcileCopiedSegmentBeforeRecover(dir string, copied compactionManifestCo
 		indexFinalExists = true
 		indexTmpExists = false
 	}
+	// Once both final files exist, deleting the old segment completes the copy plan.
 	if logFinalExists && indexFinalExists {
 		return removeSegmentFilesOnDisk(dir, copied.OldSegmentID)
 	}
@@ -691,6 +759,8 @@ func reconcileCopiedSegmentBeforeRecover(dir string, copied compactionManifestCo
 	return nil
 }
 
+// removeSegmentFilesOnDisk deletes both index and log files and ignores missing
+// files so repeated recovery passes stay idempotent.
 func removeSegmentFilesOnDisk(dir string, segmentID uint64) error {
 	var err error
 	for _, ext := range []string{".index", ".log"} {
@@ -702,10 +772,14 @@ func removeSegmentFilesOnDisk(dir string, segmentID uint64) error {
 	return err
 }
 
+// compactTempPath returns the non-discoverable temp filename used during segment
+// copy. The suffix prevents discoverSegmentIDs from treating it as live data.
 func compactTempPath(dir string, segmentID uint64, ext string) string {
 	return filepath.Join(dir, fmt.Sprintf("segment-%08d%s.compact.tmp", segmentID, ext))
 }
 
+// maxSegmentIDOnDisk returns the highest existing log segment ID so new compacted
+// segments are allocated above every currently discoverable segment.
 func maxSegmentIDOnDisk(dir string) (uint64, error) {
 	segmentIDs, err := discoverSegmentIDs(dir, ".log")
 	if err != nil || len(segmentIDs) == 0 {
@@ -714,6 +788,8 @@ func maxSegmentIDOnDisk(dir string) (uint64, error) {
 	return segmentIDs[len(segmentIDs)-1], nil
 }
 
+// segmentStatByID returns the stats entry used to compute reclaimed bytes for a
+// deleted segment.
 func segmentStatByID(stats []SegmentCompactionStats, segmentID uint64) *SegmentCompactionStats {
 	for i := range stats {
 		if stats[i].SegmentID == segmentID {
@@ -723,6 +799,8 @@ func segmentStatByID(stats []SegmentCompactionStats, segmentID uint64) *SegmentC
 	return nil
 }
 
+// cloneSegmentCompactionStats performs a shallow copy plus per-segment stream
+// slice copies for safe caller ownership.
 func cloneSegmentCompactionStats(stats []SegmentCompactionStats) []SegmentCompactionStats {
 	out := append([]SegmentCompactionStats(nil), stats...)
 	for i := range out {
@@ -731,6 +809,8 @@ func cloneSegmentCompactionStats(stats []SegmentCompactionStats) []SegmentCompac
 	return out
 }
 
+// throttleCompactionWrite sleeps after each copied record to approximate the
+// configured byte-per-second limit while remaining cancelable through ctx.
 func throttleCompactionWrite(ctx context.Context, bytesWritten, maxBytesPerSecond int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -752,15 +832,21 @@ func throttleCompactionWrite(ctx context.Context, bytesWritten, maxBytesPerSecon
 	}
 }
 
+// newCompactionID creates a human-readable unique-enough ID for local manifest
+// diagnostics; it is not used as a distributed coordination token.
 func newCompactionID() string {
 	return fmt.Sprintf("compact-%d", time.Now().UnixNano())
 }
 
+// fileExists reports whether a path is present and readable by Stat.
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
 
+// syncDirBestEffort asks the filesystem to persist directory entry changes.
+// Some platforms reject directory sync, so failure to open the directory is
+// treated as non-fatal.
 func syncDirBestEffort(dir string) error {
 	file, err := os.Open(dir)
 	if err != nil {

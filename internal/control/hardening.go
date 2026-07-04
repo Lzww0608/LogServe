@@ -11,6 +11,8 @@ import (
 	"github.com/logserve/logserve/internal/observability"
 )
 
+// SetBackpressure persists queue, redelivery, and log-latency limits before applying
+// them to the live service configuration.
 func (s *Service) SetBackpressure(ctx context.Context, req *logservepb.SetBackpressureRequest) (*logservepb.SetBackpressureResponse, error) {
 	s.configMu.RLock()
 	queueHighWatermark := s.queueHighWatermark
@@ -18,6 +20,8 @@ func (s *Service) SetBackpressure(ctx context.Context, req *logservepb.SetBackpr
 	logAppendSlowLimit := s.logAppendSlowLimit
 	s.configMu.RUnlock()
 
+	// Zero request fields mean keep the current live value rather than resetting the
+	// corresponding backpressure setting.
 	if req.GetQueueHighWatermark() > 0 {
 		queueHighWatermark = req.GetQueueHighWatermark()
 	}
@@ -54,6 +58,8 @@ func (s *Service) SetBackpressure(ctx context.Context, req *logservepb.SetBackpr
 	}, nil
 }
 
+// GetDashboardSnapshot assembles a sorted, read-only view of queues, tasks,
+// workflows, actors, workers, models, log compaction, and materializer state.
 func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetDashboardSnapshotRequest) (*logservepb.DashboardSnapshot, error) {
 	var queueDepth uint32
 	if s.useSchedulerV2() {
@@ -153,6 +159,8 @@ func (s *Service) GetDashboardSnapshot(ctx context.Context, req *logservepb.GetD
 	}, nil
 }
 
+// metadataMaterializerSnapshot adapts optional metadata materializer metrics into
+// the dashboard response.
 func metadataMaterializerSnapshot(store metadata.Store) *logservepb.MetadataMaterializerStats {
 	reporter, ok := store.(interface {
 		MaterializerStats() metadata.MaterializerStats
@@ -179,6 +187,7 @@ func metadataMaterializerSnapshot(store metadata.Store) *logservepb.MetadataMate
 	}
 }
 
+// unixMilliOrZero converts zero times to zero so dashboard JSON omits fake epoch data.
 func unixMilliOrZero(value time.Time) int64 {
 	if value.IsZero() {
 		return 0
@@ -186,6 +195,7 @@ func unixMilliOrZero(value time.Time) int64 {
 	return value.UnixMilli()
 }
 
+// compactableLogStats totals compactable records and bytes across all log streams.
 func (s *Service) compactableLogStats(ctx context.Context) (uint64, uint64) {
 	resp, err := s.log.GetStreamStats(ctx, &logservepb.GetStreamStatsRequest{})
 	if err != nil {
@@ -201,10 +211,13 @@ func (s *Service) compactableLogStats(ctx context.Context) (uint64, uint64) {
 	return records, bytes
 }
 
+// taskStatusLister is an optional metadata-store fast path for listing running tasks.
 type taskStatusLister interface {
 	ListTasksByStatus(status logservepb.TaskStatus) []metadata.Task
 }
 
+// redeliverExpiredTasks routes redelivery through the legacy queue or indexed
+// scheduler implementation.
 func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
 	if s.useSchedulerV2() {
 		return s.redeliverExpiredTasksIndexed(ctx)
@@ -212,6 +225,8 @@ func (s *Service) redeliverExpiredTasks(ctx context.Context) error {
 	return s.redeliverExpiredTasksLegacy(ctx)
 }
 
+// redeliverExpiredTasksLegacy scans running tasks, appends redelivery events, and
+// requeues leases that exceeded the configured timeout.
 func (s *Service) redeliverExpiredTasksLegacy(ctx context.Context) error {
 	_, redeliveryTimeout, _ := s.getBackpressureConfig()
 	if redeliveryTimeout <= 0 {
@@ -256,6 +271,8 @@ func (s *Service) redeliverExpiredTasksLegacy(ctx context.Context) error {
 	return nil
 }
 
+// redeliverExpiredTasksIndexed uses scheduler deadline tracking to redeliver only
+// the leases that should have expired.
 func (s *Service) redeliverExpiredTasksIndexed(ctx context.Context) error {
 	_, redeliveryTimeout, _ := s.getBackpressureConfig()
 	if redeliveryTimeout <= 0 || s.scheduler == nil {
@@ -324,6 +341,7 @@ func (s *Service) redeliverExpiredTasksIndexed(ctx context.Context) error {
 	return nil
 }
 
+// appendTaskRedelivered writes the durable redelivery marker for a task lease.
 func (s *Service) appendTaskRedelivered(ctx context.Context, task metadata.Task) error {
 	payload, _ := json.Marshal(map[string]any{
 		"task_id":          task.TaskID,
@@ -340,6 +358,8 @@ func (s *Service) appendTaskRedelivered(ctx context.Context, task metadata.Task)
 	return err
 }
 
+// resyncSchedulerTask repairs scheduler state when a deadline heap entry no longer
+// matches current metadata.
 func (s *Service) resyncSchedulerTask(task metadata.Task, redeliveryTimeout time.Duration) {
 	if s.scheduler == nil {
 		return
@@ -354,6 +374,7 @@ func (s *Service) resyncSchedulerTask(task metadata.Task, redeliveryTimeout time
 	}
 }
 
+// cacheEntries returns sorted cached-model entries for dashboard output.
 func cacheEntries(worker metadata.Worker) []*logservepb.ModelCacheEntry {
 	entries := make([]*logservepb.ModelCacheEntry, 0, len(worker.CachedModels))
 	for key := range worker.CachedModels {
@@ -369,6 +390,7 @@ func cacheEntries(worker metadata.Worker) []*logservepb.ModelCacheEntry {
 	return entries
 }
 
+// splitModelKey decodes metadata model keys and supplies v1 when no version is present.
 func splitModelKey(key string) (string, string) {
 	for i := 0; i < len(key); i++ {
 		if key[i] == ':' {

@@ -1,3 +1,5 @@
+// Package actor defines the actor state model, event payload encoding, and
+// log replay helpers used by the control plane to recover actor state.
 package actor
 
 import (
@@ -11,6 +13,9 @@ import (
 	"github.com/logserve/logserve/internal/logrecord"
 )
 
+// State is the materialized actor metadata reconstructed from control-plane
+// events. JSON byte fields are treated as immutable snapshots and cloned when
+// state is created or replayed.
 type State struct {
 	ActorID                string
 	ClassName              string
@@ -31,6 +36,8 @@ type State struct {
 	UpdatedAtMs            int64
 }
 
+// EventPayload is the wire payload stored in actor log records. Most fields are
+// sparse because different actor event types populate different subsets.
 type EventPayload struct {
 	ActorID                string          `json:"actor_id,omitempty"`
 	ClassName              string          `json:"class_name,omitempty"`
@@ -54,16 +61,24 @@ type EventPayload struct {
 	TimestampMs            int64           `json:"timestamp_ms,omitempty"`
 }
 
+// ResultLoader resolves snapshot/result references during replay. It is only
+// required when replay needs to hydrate state from a snapshot reference.
 type ResultLoader interface {
 	LoadResult(ref string) ([]byte, error)
 }
 
+// errActorCreateEventNotFound marks logs that do not contain enough actor
+// history to materialize a state from scratch.
 var errActorCreateEventNotFound = errors.New("actor create event not found")
 
+// MarshalEventPayload encodes an actor event through the shared eventcodec
+// binary format used by newer log records.
 func MarshalEventPayload(payload EventPayload) ([]byte, error) {
 	return eventcodec.Marshal(eventcodec.KindActorEvent, eventPayloadMap(payload))
 }
 
+// UnmarshalEventPayload decodes actor event payloads, accepting both the
+// eventcodec format and the legacy JSON representation.
 func UnmarshalEventPayload(data []byte, payload *EventPayload) error {
 	if payload == nil {
 		return errors.New("actor event payload is nil")
@@ -80,6 +95,8 @@ func UnmarshalEventPayload(data []byte, payload *EventPayload) error {
 	return json.Unmarshal(data, payload)
 }
 
+// NewState builds the initial active actor state and applies the default
+// snapshot cadence when the caller leaves it unspecified.
 func NewState(actorID, className, classSource string, initArgsJSON []byte, snapshotEvery uint32, nowMs int64) State {
 	if snapshotEvery == 0 {
 		snapshotEvery = 25
@@ -96,15 +113,24 @@ func NewState(actorID, className, classSource string, initArgsJSON []byte, snaps
 	}
 }
 
+// ReplayResult returns the recovered state plus command counts used to compare
+// full-log replay with snapshot-assisted replay.
 type ReplayResult struct {
 	State                  State
 	FullReplayCommands     uint64
 	SnapshotReplayCommands uint64
 }
 
+// RecordIterator streams protobuf log records to replay without requiring the
+// caller to buffer an entire actor history in memory.
 type RecordIterator func(func(*logservepb.LogRecord) error) error
+
+// RawRecordIterator is the lower-level iterator used when callers already have
+// decoded raw logstore records.
 type RawRecordIterator func(func(logrecord.RawRecord) error) error
 
+// Replay materializes actor state from an in-memory slice of protobuf log
+// records.
 func Replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader) (ReplayResult, error) {
 	return ReplayEach(actorID, func(emit func(*logservepb.LogRecord) error) error {
 		for _, rec := range records {
@@ -116,6 +142,8 @@ func Replay(actorID string, records []*logservepb.LogRecord, loader ResultLoader
 	}, loader)
 }
 
+// ReplayEach adapts protobuf record iteration to raw-record replay and
+// rejects a nil iterator because a fresh replay needs actor history.
 func ReplayEach(actorID string, iterate RecordIterator, loader ResultLoader) (ReplayResult, error) {
 	if iterate == nil {
 		return ReplayResult{}, errors.New("record iterator is required")
@@ -127,6 +155,8 @@ func ReplayEach(actorID string, iterate RecordIterator, loader ResultLoader) (Re
 	}, loader)
 }
 
+// ReplayRawEach returns snapshot-assisted state while also computing the
+// comparable full-log command count when a full replay is possible.
 func ReplayRawEach(actorID string, iterate RawRecordIterator, loader ResultLoader) (ReplayResult, error) {
 	full, err := replayEach(actorID, iterate, loader, false)
 	if err != nil {
@@ -149,12 +179,17 @@ func ReplayRawEach(actorID string, iterate RawRecordIterator, loader ResultLoade
 		SnapshotReplayCommands: withSnapshot.SnapshotReplayCommands,
 	}, nil
 }
+
+// replayEach applies actor log records in order. With snapshots enabled, it
+// first hydrates the latest snapshot and then ignores older applied commands.
 func replayEach(actorID string, iterate RawRecordIterator, loader ResultLoader, useSnapshot bool) (ReplayResult, error) {
 	if iterate == nil {
 		return ReplayResult{}, errors.New("record iterator is required")
 	}
 	var state State
 	var snapshotCommandCount uint64
+	// Snapshot mode scans for the latest usable snapshot before applying the tail
+	// of the log; the iterator must therefore be reusable by its caller.
 	if useSnapshot {
 		if err := iterate(func(rec logrecord.RawRecord) error {
 			if rec.EventType != "ActorSnapshotCreated" {
@@ -234,6 +269,8 @@ func replayEach(actorID string, iterate RawRecordIterator, loader ResultLoader, 
 			}
 			state.UpdatedAtMs = payload.TimestampMs
 		case "ActorCommandApplied":
+			// Snapshot replay skips commands already represented in the loaded
+			// snapshot and only counts tail commands that must be reapplied.
 			if useSnapshot && payload.CommandCount <= snapshotCommandCount {
 				return nil
 			}
@@ -322,6 +359,8 @@ func replayEach(actorID string, iterate RawRecordIterator, loader ResultLoader, 
 	return ReplayResult{State: state, FullReplayCommands: commands}, nil
 }
 
+// ReplayFromStateEach continues replay from a supplied state, adapting protobuf
+// records to raw records when a tail iterator is provided.
 func ReplayFromStateEach(actorID string, initial State, iterate RecordIterator, loader ResultLoader) (ReplayResult, error) {
 	if iterate == nil {
 		return ReplayFromStateRawEach(actorID, initial, nil, loader)
@@ -333,6 +372,8 @@ func ReplayFromStateEach(actorID string, initial State, iterate RecordIterator, 
 	}, loader)
 }
 
+// ReplayFromStateRawEach clones the initial state and applies optional tail
+// records, loading snapshots if the tail contains snapshot events.
 func ReplayFromStateRawEach(actorID string, initial State, iterate RawRecordIterator, loader ResultLoader) (ReplayResult, error) {
 	state := cloneStateForReplay(initial)
 	if state.ActorID == "" {
@@ -458,6 +499,8 @@ func ReplayFromStateRawEach(actorID string, initial State, iterate RawRecordIter
 	return ReplayResult{State: state, SnapshotReplayCommands: commands}, nil
 }
 
+// eventPayloadMap converts sparse actor payload fields into eventcodec values
+// and records byte sizes for large JSON fields.
 func eventPayloadMap(payload EventPayload) map[string]any {
 	fields := make(map[string]any, 16)
 	if payload.ActorID != "" {
@@ -526,6 +569,7 @@ func eventPayloadMap(payload EventPayload) map[string]any {
 	return fields
 }
 
+// eventPayloadFromMap rebuilds an EventPayload from eventcodec-decoded fields.
 func eventPayloadFromMap(fields map[string]any) EventPayload {
 	return EventPayload{
 		ActorID:                eventcodec.StringValue(fields["actor_id"]),
@@ -550,12 +594,18 @@ func eventPayloadFromMap(fields map[string]any) EventPayload {
 		TimestampMs:            eventcodec.Int64Value(fields["timestamp_ms"]),
 	}
 }
+
+// cloneStateForReplay deep-copies mutable byte slices before replay mutates a
+// state value.
 func cloneStateForReplay(state State) State {
 	state.ClassSource = string([]byte(state.ClassSource))
 	state.InitArgsJSON = append([]byte(nil), state.InitArgsJSON...)
 	state.StateJSON = append([]byte(nil), state.StateJSON...)
 	return state
 }
+
+// Consistent compares the durable actor fields that should match between
+// metadata state and replayed state.
 func Consistent(a, b State) bool {
 	return a.ActorID == b.ActorID &&
 		a.ClassName == b.ClassName &&
@@ -569,10 +619,13 @@ func Consistent(a, b State) bool {
 		bytes.Equal(NormalizeJSON(a.StateJSON), NormalizeJSON(b.StateJSON))
 }
 
+// NowMs returns the current wall-clock time in milliseconds for actor events.
 func NowMs() int64 {
 	return time.Now().UnixMilli()
 }
 
+// NormalizeJSON compacts valid JSON for stable comparisons and preserves a
+// defensive copy of invalid or non-JSON data.
 func NormalizeJSON(data []byte) []byte {
 	if len(data) == 0 {
 		return nil

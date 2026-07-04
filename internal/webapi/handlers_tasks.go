@@ -1,5 +1,8 @@
 package webapi
 
+// This file implements task list, submit, detail, retry, resubmit, and cancel
+// HTTP endpoints.
+
 import (
 	"context"
 	"encoding/json"
@@ -17,6 +20,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// submitTaskRequest is the JSON shape accepted by the task submission endpoint.
+// It supports either args/kwargs fields or a prebuilt args_json envelope.
 type submitTaskRequest struct {
 	TaskName       string          `json:"task_name"`
 	FunctionName   string          `json:"function_name"`
@@ -29,6 +34,8 @@ type submitTaskRequest struct {
 	IdempotencyKey string          `json:"idempotency_key"`
 }
 
+// handleListTasks filters dashboard tasks by status, worker, workflow, and search
+// text before applying shared pagination.
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	dashboard, err := s.dashboard(r)
 	if err != nil {
@@ -76,6 +83,8 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSubmitTask validates source and argument JSON, submits a task to the
+// control plane, and optionally waits for terminal status.
 func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	var input submitTaskRequest
 	if err := decodeJSON(w, r, &input); err != nil {
@@ -124,6 +133,8 @@ func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, dto)
 }
 
+// handleGetTask reads authoritative task status and opportunistically merges
+// dashboard metadata such as task name and worker assignment.
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("task_id")
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
@@ -140,18 +151,27 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, dto)
 }
 
+// handleRetryTask resubmits a failed standalone task using the original submitted
+// task spec recovered from the log.
 func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 	s.handleTaskSubmitOperation(w, r, "retry")
 }
 
+// handleResubmitTask resubmits a standalone task regardless of current task
+// status, using the original submitted task spec recovered from the log.
 func (s *Server) handleResubmitTask(w http.ResponseWriter, r *http.Request) {
 	s.handleTaskSubmitOperation(w, r, "resubmit")
 }
 
+// handleCancelTask reports the current backend limitation rather than silently
+// pretending cancellation is supported.
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	writeAPIError(w, http.StatusNotImplemented, "UNSUPPORTED_OPERATION", "task cancellation is not supported by this backend")
 }
 
+// handleTaskSubmitOperation implements retry/resubmit by reading the original
+// TaskSubmitted event, rejecting derived tasks, and submitting a fresh task with
+// a console-scoped idempotency key.
 func (s *Server) handleTaskSubmitOperation(w http.ResponseWriter, r *http.Request, operation string) {
 	taskID := strings.TrimSpace(r.PathValue("task_id"))
 	if taskID == "" {
@@ -205,6 +225,8 @@ func (s *Server) handleTaskSubmitOperation(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, dto)
 }
 
+// readTaskSubmittedSpec scans the task-specific log stream for the original
+// TaskSubmitted event used to reconstruct retry/resubmit requests.
 func (s *Server) readTaskSubmittedSpec(ctx context.Context, taskID string) (*logservepb.TaskSpec, error) {
 	resp, err := s.clients.Log.ReadLog(ctx, &logservepb.ReadLogRequest{StreamId: "task:" + taskID, FromSeq: 1, Limit: maxLogReadLimit})
 	if err != nil {
@@ -225,10 +247,14 @@ func (s *Server) readTaskSubmittedSpec(ctx context.Context, taskID string) (*log
 	return nil, status.Error(codes.NotFound, "task submitted record not found")
 }
 
+// taskSubmittedPayload is the legacy JSON TaskSubmitted shape used before the
+// eventcodec encoded payload path.
 type taskSubmittedPayload struct {
 	TaskSpec json.RawMessage `json:"task_spec,omitempty"`
 }
 
+// unmarshalTaskSubmittedSpec accepts both eventcodec payloads and legacy JSON
+// payloads so retry/resubmit works across log format upgrades.
 func unmarshalTaskSubmittedSpec(data []byte) (*logservepb.TaskSpec, error) {
 	var fields map[string]any
 	encoded, err := eventcodec.Unmarshal(eventcodec.KindTaskSubmitted, data, &fields)
@@ -260,6 +286,9 @@ func unmarshalTaskSubmittedSpec(data []byte) (*logservepb.TaskSpec, error) {
 	return decoded, nil
 }
 
+// validateStandaloneTaskOperationSpec rejects workflow, actor, LLM, and internal
+// scheduling task specs because retry/resubmit cannot safely replay their hidden
+// execution context.
 func validateStandaloneTaskOperationSpec(spec *logservepb.TaskSpec) error {
 	if spec.GetWorkflowId() != "" || spec.GetStepId() != "" {
 		return status.Error(codes.FailedPrecondition, "task operation is not supported for workflow tasks")
@@ -275,6 +304,8 @@ func validateStandaloneTaskOperationSpec(spec *logservepb.TaskSpec) error {
 	}
 	return nil
 }
+
+// dashboardTaskByID finds optional dashboard metadata for a task status response.
 func dashboardTaskByID(tasks []TaskDTO, taskID string) TaskDTO {
 	for _, task := range tasks {
 		if task.TaskID == taskID {
@@ -284,6 +315,8 @@ func dashboardTaskByID(tasks []TaskDTO, taskID string) TaskDTO {
 	return TaskDTO{}
 }
 
+// mergeTaskDTO fills missing status-response fields with dashboard metadata
+// without overwriting authoritative task status, result, or error values.
 func mergeTaskDTO(primary, metadata TaskDTO) TaskDTO {
 	if metadata.TaskID == "" {
 		return primary
@@ -318,6 +351,8 @@ func mergeTaskDTO(primary, metadata TaskDTO) TaskDTO {
 	return primary
 }
 
+// waitTask polls task status until a terminal state or timeout, returning the
+// latest observed state on timeout.
 func (s *Server) waitTask(r *http.Request, taskID string, timeout time.Duration) (TaskDTO, error) {
 	ctx, cancel := requestContext(r, timeout)
 	defer cancel()
@@ -340,11 +375,13 @@ func (s *Server) waitTask(r *http.Request, taskID string, timeout time.Duration)
 	}
 }
 
+// waitRequested parses the optional wait query flag accepted by submit endpoints.
 func waitRequested(r *http.Request) bool {
 	value := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("wait")))
 	return value == "1" || value == "true" || value == "yes"
 }
 
+// waitTimeout parses timeout_ms and falls back when omitted or malformed.
 func waitTimeout(r *http.Request, fallback time.Duration) time.Duration {
 	value := strings.TrimSpace(r.URL.Query().Get("timeout_ms"))
 	if value == "" {

@@ -10,28 +10,36 @@ import (
 	"google.golang.org/grpc"
 )
 
+// acceptingLogClient is a log stub that accepts appends and returns empty reads.
 type acceptingLogClient struct{}
 
+// AppendLog acknowledges an append without storing it.
 func (c acceptingLogClient) AppendLog(context.Context, *logservepb.AppendLogRequest, ...grpc.CallOption) (*logservepb.AppendLogResponse, error) {
 	return &logservepb.AppendLogResponse{Seq: 1, TimestampMs: 1}, nil
 }
 
+// ReadLog returns an empty stream for tests that do not exercise replay.
 func (c acceptingLogClient) ReadLog(context.Context, *logservepb.ReadLogRequest, ...grpc.CallOption) (*logservepb.ReadLogResponse, error) {
 	return &logservepb.ReadLogResponse{}, nil
 }
 
+// ListStreams returns no streams for simple service tests.
 func (c acceptingLogClient) ListStreams(context.Context, *logservepb.ListStreamsRequest, ...grpc.CallOption) (*logservepb.ListStreamsResponse, error) {
 	return &logservepb.ListStreamsResponse{}, nil
 }
 
+// TrimStream is a no-op stub for simple service tests.
 func (c acceptingLogClient) TrimStream(context.Context, *logservepb.TrimStreamRequest, ...grpc.CallOption) (*logservepb.TrimStreamResponse, error) {
 	return &logservepb.TrimStreamResponse{}, nil
 }
 
+// GetStreamStats returns no stream statistics for simple service tests.
 func (c acceptingLogClient) GetStreamStats(context.Context, *logservepb.GetStreamStatsRequest, ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error) {
 	return &logservepb.GetStreamStatsResponse{}, nil
 }
 
+// TestSubmitTaskIdempotencyKeyAllowsSamePayload verifies semantically equivalent
+// JSON arguments reuse the same task id.
 func TestSubmitTaskIdempotencyKeyAllowsSamePayload(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), acceptingLogClient{}, nil, 0)
 
@@ -60,6 +68,8 @@ func TestSubmitTaskIdempotencyKeyAllowsSamePayload(t *testing.T) {
 	}
 }
 
+// TestSubmitTaskIdempotencyKeyRejectsDifferentPayload rejects key reuse with
+// different task arguments.
 func TestSubmitTaskIdempotencyKeyRejectsDifferentPayload(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), acceptingLogClient{}, nil, 0)
 
@@ -88,6 +98,8 @@ func TestSubmitTaskIdempotencyKeyRejectsDifferentPayload(t *testing.T) {
 	}
 }
 
+// TestSubmitWorkflowIdempotencyKeyRejectsDifferentDefinition rejects workflow key
+// reuse with a changed definition.
 func TestSubmitWorkflowIdempotencyKeyRejectsDifferentDefinition(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), acceptingLogClient{}, nil, 0)
 
@@ -114,6 +126,8 @@ func TestSubmitWorkflowIdempotencyKeyRejectsDifferentDefinition(t *testing.T) {
 	}
 }
 
+// TestCreateActorIdempotencyKeyRejectsDifferentPayload rejects actor key reuse with
+// changed class source or init payload.
 func TestCreateActorIdempotencyKeyRejectsDifferentPayload(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), acceptingLogClient{}, nil, 0)
 
@@ -140,6 +154,8 @@ func TestCreateActorIdempotencyKeyRejectsDifferentPayload(t *testing.T) {
 	}
 }
 
+// TestSubmitLLMIdempotencyKeyRejectsDifferentPrompt rejects LLM key reuse with a
+// changed prompt.
 func TestSubmitLLMIdempotencyKeyRejectsDifferentPrompt(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), acceptingLogClient{}, nil, 0)
 	if _, err := service.RegisterModel(context.Background(), &logservepb.RegisterModelRequest{

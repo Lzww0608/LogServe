@@ -1,5 +1,8 @@
 package metadata
 
+// This file tests async Postgres persistence with a recording SQL driver so the
+// materializer can be exercised without a real database server.
+
 import (
 	"context"
 	"database/sql"
@@ -14,28 +17,42 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// recordingPostgresDriverName names the in-process SQL driver used by async
+// materializer tests and benchmarks.
 const recordingPostgresDriverName = "logserve_recording_postgres"
 
+// init registers the recording driver once for the metadata test package.
 func init() {
 	sql.Register(recordingPostgresDriverName, recordingPostgresDriver{})
 }
 
+// recordingPostgresDriver resolves test DSNs to per-test recorders.
 type recordingPostgresDriver struct{}
 
+// recordingPostgresConn implements the small database/sql driver surface needed
+// by PostgresStore persistence helpers.
 type recordingPostgresConn struct {
 	recorder *recordingPostgresRecorder
 }
 
+// recordingPostgresTx is a no-op transaction used to test transactional code
+// paths without a database.
 type recordingPostgresTx struct{}
 
+// recordingPostgresRecorder captures executed SQL and can inject execution
+// failures for async error-path tests.
 type recordingPostgresRecorder struct {
 	mu      sync.Mutex
 	queries []string
 	err     error
 }
 
+// recordingPostgresRecorders maps DSNs to recorders so database/sql can open
+// independent connections for each test.
 var recordingPostgresRecorders sync.Map
 
+// openRecordingPostgresDB creates a unique recorder-backed DB handle for one
+// test or benchmark and cleans the registry on completion.
 func openRecordingPostgresDB(t testing.TB) (*sql.DB, *recordingPostgresRecorder) {
 	t.Helper()
 	dsn := t.Name() + ":" + time.Now().Format("150405.000000000")
@@ -49,6 +66,7 @@ func openRecordingPostgresDB(t testing.TB) (*sql.DB, *recordingPostgresRecorder)
 	return db, recorder
 }
 
+// Open resolves the DSN to its recorder and returns a lightweight test connection.
 func (recordingPostgresDriver) Open(name string) (driver.Conn, error) {
 	value, ok := recordingPostgresRecorders.Load(name)
 	if !ok {
@@ -57,22 +75,38 @@ func (recordingPostgresDriver) Open(name string) (driver.Conn, error) {
 	return &recordingPostgresConn{recorder: value.(*recordingPostgresRecorder)}, nil
 }
 
+// Prepare returns an error because production code under test uses ExecContext
+// directly.
 func (c *recordingPostgresConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("prepare is unsupported")
 }
-func (c *recordingPostgresConn) Close() error               { return nil }
-func (c *recordingPostgresConn) Begin() (driver.Tx, error)  { return recordingPostgresTx{}, nil }
+
+// Close satisfies driver.Conn; recorder-backed connections have no resources.
+func (c *recordingPostgresConn) Close() error { return nil }
+
+// Begin satisfies legacy transaction creation for database/sql.
+func (c *recordingPostgresConn) Begin() (driver.Tx, error) { return recordingPostgresTx{}, nil }
+
+// Ping satisfies driver.Pinger so OpenPostgresStore connectivity checks can pass.
 func (c *recordingPostgresConn) Ping(context.Context) error { return nil }
+
+// BeginTx returns a no-op transaction for batch materializer tests.
 func (c *recordingPostgresConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
 	return recordingPostgresTx{}, nil
 }
+
+// ExecContext records SQL text and returns the recorder-injected error if set.
 func (c *recordingPostgresConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
 	return c.recorder.exec(query)
 }
 
-func (recordingPostgresTx) Commit() error   { return nil }
+// Commit satisfies driver.Tx and intentionally has no side effects.
+func (recordingPostgresTx) Commit() error { return nil }
+
+// Rollback satisfies driver.Tx and intentionally has no side effects.
 func (recordingPostgresTx) Rollback() error { return nil }
 
+// exec records one query unless the recorder has been configured to fail.
 func (r *recordingPostgresRecorder) exec(query string) (driver.Result, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -83,12 +117,14 @@ func (r *recordingPostgresRecorder) exec(query string) (driver.Result, error) {
 	return driver.RowsAffected(1), nil
 }
 
+// fail configures subsequent ExecContext calls to return err.
 func (r *recordingPostgresRecorder) fail(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.err = err
 }
 
+// countContains counts recorded SQL statements containing a fragment.
 func (r *recordingPostgresRecorder) countContains(fragment string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -101,12 +137,15 @@ func (r *recordingPostgresRecorder) countContains(fragment string) int {
 	return count
 }
 
+// countAll returns the total number of recorded SQL executions.
 func (r *recordingPostgresRecorder) countAll() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.queries)
 }
 
+// TestPostgresStoreAsyncMaterializerCoalescesHeartbeats verifies repeated worker
+// heartbeats are coalesced into one durable write after explicit flush.
 func TestPostgresStoreAsyncMaterializerCoalescesHeartbeats(t *testing.T) {
 	db, recorder := openRecordingPostgresDB(t)
 	store := NewPostgresStoreWithOptions(db, PostgresOptions{
@@ -142,6 +181,8 @@ func TestPostgresStoreAsyncMaterializerCoalescesHeartbeats(t *testing.T) {
 	}
 }
 
+// TestPostgresStoreAsyncFlushErrorDoesNotBlockPrimaryPath ensures async write
+// failures do not make foreground task mutations fail before Flush.
 func TestPostgresStoreAsyncFlushErrorDoesNotBlockPrimaryPath(t *testing.T) {
 	db, recorder := openRecordingPostgresDB(t)
 	store := NewPostgresStoreWithOptions(db, PostgresOptions{
@@ -178,6 +219,8 @@ func TestPostgresStoreAsyncFlushErrorDoesNotBlockPrimaryPath(t *testing.T) {
 	}
 }
 
+// TestMaterializerStatsReportLagBeforeFirstFlush verifies pending lag is visible
+// before the first successful materializer flush and clears afterward.
 func TestMaterializerStatsReportLagBeforeFirstFlush(t *testing.T) {
 	materializer := NewMaterializer(nil, 64, time.Hour, 8, func(context.Context, []metadataDelta) error {
 		return nil
@@ -207,6 +250,9 @@ func TestMaterializerStatsReportLagBeforeFirstFlush(t *testing.T) {
 		t.Fatalf("eventual lag after flush = %s, want 0", stats.EventualLagEstimate)
 	}
 }
+
+// TestMaterializerFlushAllDrainsMultipleBatches verifies explicit flush drains
+// more pending deltas than batchMax by issuing multiple batches.
 func TestMaterializerFlushAllDrainsMultipleBatches(t *testing.T) {
 	var batches [][]metadataDelta
 	materializer := NewMaterializer(nil, 2, time.Hour, 8, func(_ context.Context, deltas []metadataDelta) error {

@@ -1,5 +1,7 @@
 package objectstore
 
+// This file implements a minimal S3-compatible object store using raw HTTP
+// requests and AWS Signature Version 4. It is used for S3 and MinIO deployments.
 import (
 	"bytes"
 	"context"
@@ -22,6 +24,8 @@ import (
 	"time"
 )
 
+// S3 multipart defaults balance memory use, object size support, and the S3
+// minimum part-size rule.
 const (
 	defaultS3MultipartThreshold = 64 << 20
 	defaultS3MultipartPartSize  = 16 << 20
@@ -29,6 +33,8 @@ const (
 	emptyPayloadSHA256          = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
 
+// S3Config contains endpoint, credential, bucket, and multipart settings for the
+// S3-compatible backend.
 type S3Config struct {
 	Endpoint           string
 	Bucket             string
@@ -40,6 +46,7 @@ type S3Config struct {
 	MultipartPartSize  int64
 }
 
+// S3Store writes immutable content-addressed objects to one configured bucket.
 type S3Store struct {
 	cfg       S3Config
 	client    *http.Client
@@ -47,6 +54,8 @@ type S3Store struct {
 	ensureErr error
 }
 
+// S3ConfigFromEnv builds S3Config from LOGSERVE_* variables with MINIO_* aliases
+// for local MinIO setups.
 func S3ConfigFromEnv() S3Config {
 	createBucket := os.Getenv("LOGSERVE_S3_CREATE_BUCKET") != "0"
 	return S3Config{
@@ -61,6 +70,8 @@ func S3ConfigFromEnv() S3Config {
 	}
 }
 
+// OpenS3 validates configuration, fills defaults, and constructs an HTTP-backed
+// store. It does not contact the endpoint until the first operation.
 func OpenS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 	if cfg.Endpoint == "" {
 		return nil, errors.New("LOGSERVE_S3_ENDPOINT is required for s3 result store")
@@ -93,14 +104,22 @@ func OpenS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 		ExpectContinueTimeout: time.Second,
 	}
 	store := &S3Store{cfg: cfg, client: &http.Client{Transport: transport}}
+
+	// Keep ctx in the signature for parity with other open helpers even though this
+	// constructor performs no network I/O.
 	_ = ctx
 	return store, nil
 }
 
+// Put spools the stream to a temp file to compute checksum and size before
+// issuing either a single PUT or a multipart upload.
 func (s *S3Store) Put(ctx context.Context, namespace string, r io.Reader, size int64) (string, error) {
 	if err := s.ensureBucket(ctx); err != nil {
 		return "", err
 	}
+
+	// S3 signing and checksum headers require the payload hash up front, so streaming
+	// uploads are first spooled to local temp storage.
 	file, tmpPath, actualSize, hashHex, hashBase64, err := spoolToTemp(ctx, r, size)
 	if err != nil {
 		return "", err
@@ -122,6 +141,8 @@ func (s *S3Store) Put(ctx context.Context, namespace string, r io.Reader, size i
 	return "s3://" + s.cfg.Bucket + "/" + key, nil
 }
 
+// Get opens an s3://bucket/key ref from the configured bucket and returns the
+// response body for the caller to close.
 func (s *S3Store) Get(ctx context.Context, ref string) (io.ReadCloser, ObjectInfo, error) {
 	key, err := s.keyFromRef(ref)
 	if err != nil {
@@ -135,10 +156,15 @@ func (s *S3Store) Get(ctx context.Context, ref string) (io.ReadCloser, ObjectInf
 	return resp.Body, info, nil
 }
 
+// ensureBucket creates the bucket at most once when enabled. A preexisting bucket
+// is treated as success for idempotent startup.
 func (s *S3Store) ensureBucket(ctx context.Context) error {
 	if !s.cfg.CreateBucket {
 		return nil
 	}
+
+	// sync.Once intentionally memoizes the first bucket-create result so concurrent
+	// Put calls do not stampede the object-store endpoint.
 	s.ensure.Do(func() {
 		err := s.doBucket(ctx, http.MethodPut, nil, 0, emptyPayloadSHA256, nil)
 		var statusErr *s3StatusError
@@ -150,6 +176,8 @@ func (s *S3Store) ensureBucket(ctx context.Context) error {
 	return s.ensureErr
 }
 
+// putSingle rewinds the spooled file and uploads it with metadata plus the S3
+// checksum header for non-multipart objects.
 func (s *S3Store) putSingle(ctx context.Context, key string, file *os.File, size int64, hashHex, hashBase64 string) error {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -159,6 +187,8 @@ func (s *S3Store) putSingle(ctx context.Context, key string, file *os.File, size
 	return s.do(ctx, http.MethodPut, key, file, size, hashHex, headers, nil)
 }
 
+// putMultipart runs the initiate/upload/complete sequence and aborts unfinished
+// uploads on any error path.
 func (s *S3Store) putMultipart(ctx context.Context, key string, file *os.File, size int64, hashHex string) error {
 	uploadID, err := s.createMultipartUpload(ctx, key, hashHex, size)
 	if err != nil {
@@ -167,6 +197,9 @@ func (s *S3Store) putMultipart(ctx context.Context, key string, file *os.File, s
 	completed := false
 	defer func() {
 		if !completed {
+
+			// Abort with a fresh background context because the caller context may already
+			// be canceled when cleanup is needed.
 			_ = s.abortMultipartUpload(context.Background(), key, uploadID)
 		}
 	}()
@@ -181,6 +214,8 @@ func (s *S3Store) putMultipart(ctx context.Context, key string, file *os.File, s
 	return nil
 }
 
+// createMultipartUpload starts an S3 multipart upload and attaches whole-object
+// checksum metadata to the object.
 func (s *S3Store) createMultipartUpload(ctx context.Context, key, hashHex string, size int64) (string, error) {
 	var result initiateMultipartUploadResult
 	headers := checksumMetadataHeaders(hashHex, size)
@@ -199,6 +234,8 @@ func (s *S3Store) createMultipartUpload(ctx context.Context, key, hashHex string
 	return result.UploadID, nil
 }
 
+// uploadParts uploads contiguous file sections serially and returns the ETags
+// required by CompleteMultipartUpload.
 func (s *S3Store) uploadParts(ctx context.Context, key, uploadID string, file *os.File, size int64) ([]completedPart, error) {
 	parts := make([]completedPart, 0, int((size+s.cfg.MultipartPartSize-1)/s.cfg.MultipartPartSize))
 	for offset, partNumber := int64(0), 1; offset < size; partNumber++ {
@@ -206,11 +243,16 @@ func (s *S3Store) uploadParts(ctx context.Context, key, uploadID string, file *o
 		if remaining := size - offset; remaining < partSize {
 			partSize = remaining
 		}
+
+		// SectionReader limits each request body to the current part without copying the
+		// spooled file into memory.
 		section := io.NewSectionReader(file, offset, partSize)
 		h := sha256.New()
 		if _, err := copyWithContext(ctx, h, section); err != nil {
 			return nil, err
 		}
+
+		// The same section is read once for its checksum and then rewound for upload.
 		if _, err := section.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -237,6 +279,8 @@ func (s *S3Store) uploadParts(ctx context.Context, key, uploadID string, file *o
 	return parts, nil
 }
 
+// completeMultipartUpload sends the part list and detects S3-compatible servers
+// that return HTTP 200 with an embedded XML error body.
 func (s *S3Store) completeMultipartUpload(ctx context.Context, key, uploadID string, parts []completedPart) error {
 	body, err := xml.Marshal(completeMultipartUploadRequest{Parts: parts})
 	if err != nil {
@@ -251,6 +295,9 @@ func (s *S3Store) completeMultipartUpload(ctx context.Context, key, uploadID str
 		if err != nil {
 			return err
 		}
+
+		// Some S3 APIs report complete-multipart failures inside a 200 response body, so
+		// the XML body must be inspected even after HTTP success.
 		if bytes.Contains(data, []byte("<Error>")) {
 			var s3Err s3ErrorResult
 			if err := xml.Unmarshal(data, &s3Err); err != nil {
@@ -262,19 +309,25 @@ func (s *S3Store) completeMultipartUpload(ctx context.Context, key, uploadID str
 	})
 }
 
+// abortMultipartUpload cancels an unfinished multipart upload to avoid orphaned
+// parts.
 func (s *S3Store) abortMultipartUpload(ctx context.Context, key, uploadID string) error {
 	query := url.Values{"uploadId": {uploadID}}
 	return s.doRequest(ctx, http.MethodDelete, s.objectURLWithQuery(key, query), nil, 0, emptyPayloadSHA256, nil, nil)
 }
 
+// do issues an object-scoped signed request for a bucket-relative key.
 func (s *S3Store) do(ctx context.Context, method, key string, body io.Reader, size int64, payloadHash string, headers http.Header, handle func(*http.Response) error) error {
 	return s.doRequest(ctx, method, s.objectURL(key), body, size, payloadHash, headers, handle)
 }
 
+// doBucket issues a signed bucket-level request.
 func (s *S3Store) doBucket(ctx context.Context, method string, body io.Reader, size int64, payloadHash string, headers http.Header) error {
 	return s.doRequest(ctx, method, s.bucketURL(), body, size, payloadHash, headers, nil)
 }
 
+// doRequest opens a signed HTTP request, closes the response body, and lets
+// callers parse success responses when needed.
 func (s *S3Store) doRequest(ctx context.Context, method, rawURL string, body io.Reader, size int64, payloadHash string, headers http.Header, handle func(*http.Response) error) error {
 	resp, err := s.openRequest(ctx, method, rawURL, body, size, payloadHash, headers)
 	if err != nil {
@@ -287,6 +340,8 @@ func (s *S3Store) doRequest(ctx context.Context, method, rawURL string, body io.
 	return nil
 }
 
+// openRequest sends a signed request and converts non-2xx responses into a
+// bounded s3StatusError.
 func (s *S3Store) openRequest(ctx context.Context, method, rawURL string, body io.Reader, size int64, payloadHash string, headers http.Header) (*http.Response, error) {
 	req, err := s.newRequest(ctx, method, rawURL, body, size, payloadHash, headers)
 	if err != nil {
@@ -298,12 +353,17 @@ func (s *S3Store) openRequest(ctx context.Context, method, rawURL string, body i
 	}
 	if resp.StatusCode >= 300 {
 		defer resp.Body.Close()
+
+		// Limit error-body reads so a failing object-store response cannot consume
+		// unbounded memory.
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, &s3StatusError{statusCode: resp.StatusCode, message: strings.TrimSpace(string(data))}
 	}
 	return resp, nil
 }
 
+// newRequest constructs and signs an S3 request with explicit payload hash and
+// content length when known.
 func (s *S3Store) newRequest(ctx context.Context, method, rawURL string, body io.Reader, size int64, payloadHash string, headers http.Header) (*http.Request, error) {
 	if body == nil {
 		body = http.NoBody
@@ -329,14 +389,17 @@ func (s *S3Store) newRequest(ctx context.Context, method, rawURL string, body io
 	return req, nil
 }
 
+// bucketURL returns the path-style bucket URL used for MinIO compatibility.
 func (s *S3Store) bucketURL() string {
 	return s.cfg.Endpoint + "/" + escapePath(s.cfg.Bucket)
 }
 
+// objectURL returns the escaped path-style URL for one object key.
 func (s *S3Store) objectURL(key string) string {
 	return s.bucketURL() + "/" + escapePath(key)
 }
 
+// objectURLWithQuery appends encoded S3 subresource query parameters.
 func (s *S3Store) objectURLWithQuery(key string, query url.Values) string {
 	rawURL := s.objectURL(key)
 	encoded := query.Encode()
@@ -346,6 +409,8 @@ func (s *S3Store) objectURLWithQuery(key string, query url.Values) string {
 	return rawURL + "?" + encoded
 }
 
+// keyFromRef validates an s3://bucket/key ref and ensures it targets this
+// store bucket.
 func (s *S3Store) keyFromRef(ref string) (string, error) {
 	const prefix = "s3://"
 	if !strings.HasPrefix(ref, prefix) {
@@ -362,11 +427,13 @@ func (s *S3Store) keyFromRef(ref string) (string, error) {
 	return key, nil
 }
 
+// s3StatusError carries HTTP status and a bounded response body snippet.
 type s3StatusError struct {
 	statusCode int
 	message    string
 }
 
+// Error formats an S3 HTTP failure for callers and tests.
 func (e *s3StatusError) Error() string {
 	if e.message == "" {
 		return fmt.Sprintf("s3 request failed: status %d", e.statusCode)
@@ -374,25 +441,32 @@ func (e *s3StatusError) Error() string {
 	return fmt.Sprintf("s3 request failed: status %d: %s", e.statusCode, e.message)
 }
 
+// initiateMultipartUploadResult decodes the UploadId from S3 initiate XML.
 type initiateMultipartUploadResult struct {
 	UploadID string `xml:"UploadId"`
 }
 
+// completeMultipartUploadRequest is the XML payload sent to finish multipart
+// uploads.
 type completeMultipartUploadRequest struct {
 	XMLName xml.Name        `xml:"CompleteMultipartUpload"`
 	Parts   []completedPart `xml:"Part"`
 }
 
+// completedPart records a completed part number and ETag for the final XML body.
 type completedPart struct {
 	PartNumber int    `xml:"PartNumber"`
 	ETag       string `xml:"ETag"`
 }
 
+// s3ErrorResult decodes embedded S3 error XML from successful HTTP responses.
 type s3ErrorResult struct {
 	Code    string `xml:"Code"`
 	Message string `xml:"Message"`
 }
 
+// signS3Request applies AWS Signature Version 4 using the request path, query,
+// signed headers, and payload hash.
 func signS3Request(req *http.Request, cfg S3Config, payloadHash string) {
 	amzDate := req.Header.Get("x-amz-date")
 	shortDate := amzDate[:8]
@@ -416,6 +490,8 @@ func signS3Request(req *http.Request, cfg S3Config, payloadHash string) {
 	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+cfg.AccessKey+"/"+scope+", SignedHeaders="+signedHeaders+", Signature="+signature)
 }
 
+// canonicalSignedHeaders returns the signed header list and canonical header
+// block required by SigV4.
 func canonicalSignedHeaders(req *http.Request) (string, string) {
 	values := map[string][]string{"host": {req.URL.Host}}
 	for name, headerValues := range req.Header {
@@ -423,6 +499,9 @@ func canonicalSignedHeaders(req *http.Request) (string, string) {
 		if lower == "authorization" {
 			continue
 		}
+
+		// Sign host and x-amz-* headers because those carry the payload hash, date,
+		// checksums, and metadata used by S3-compatible servers.
 		if lower == "host" || strings.HasPrefix(lower, "x-amz-") {
 			values[lower] = append(values[lower], headerValues...)
 		}
@@ -442,6 +521,8 @@ func canonicalSignedHeaders(req *http.Request) (string, string) {
 	return strings.Join(keys, ";"), canonical.String()
 }
 
+// normalizeHeaderValues collapses whitespace and joins repeated header values
+// according to SigV4 canonicalization rules.
 func normalizeHeaderValues(values []string) string {
 	normalized := make([]string, 0, len(values))
 	for _, value := range values {
@@ -450,6 +531,7 @@ func normalizeHeaderValues(values []string) string {
 	return strings.Join(normalized, ",")
 }
 
+// signingKey derives the SigV4 date/region/service signing key.
 func signingKey(secret, date, region string) []byte {
 	kDate := hmacSHA256([]byte("AWS4"+secret), []byte(date))
 	kRegion := hmacSHA256(kDate, []byte(region))
@@ -457,17 +539,21 @@ func signingKey(secret, date, region string) []byte {
 	return hmacSHA256(kService, []byte("aws4_request"))
 }
 
+// hmacSHA256 returns the HMAC-SHA256 digest for SigV4 key derivation and
+// signatures.
 func hmacSHA256(key, data []byte) []byte {
 	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write(data)
 	return mac.Sum(nil)
 }
 
+// sha256Hex returns a lowercase hex SHA-256 digest.
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
+// escapePath path-escapes each key segment while preserving slash separators.
 func escapePath(value string) string {
 	parts := strings.Split(filepathSlash(value), "/")
 	for i, part := range parts {
@@ -476,10 +562,13 @@ func escapePath(value string) string {
 	return strings.Join(parts, "/")
 }
 
+// filepathSlash normalizes Windows separators before building S3 keys or URLs.
 func filepathSlash(value string) string {
 	return strings.ReplaceAll(value, "\\", "/")
 }
 
+// checksumMetadataHeaders stores whole-object checksum and size as S3 user
+// metadata so later reads can recover ObjectInfo.
 func checksumMetadataHeaders(hashHex string, size int64) http.Header {
 	headers := http.Header{}
 	headers.Set("x-amz-meta-sha256", hashHex)
@@ -487,6 +576,8 @@ func checksumMetadataHeaders(hashHex string, size int64) http.Header {
 	return headers
 }
 
+// objectInfoFromS3Headers maps S3 response headers and user metadata into the
+// generic ObjectInfo shape.
 func objectInfoFromS3Headers(ref string, headers http.Header, contentLength int64) ObjectInfo {
 	metadata := make(map[string]string)
 	for name, values := range headers {
@@ -497,6 +588,9 @@ func objectInfoFromS3Headers(ref string, headers http.Header, contentLength int6
 		metadata[strings.TrimPrefix(lower, "x-amz-meta-")] = values[0]
 	}
 	size := contentLength
+
+	// Some S3-compatible responses omit Content-Length for streamed bodies; fall back
+	// to the size metadata written at Put time.
 	if size < 0 {
 		if parsed, err := strconv.ParseInt(metadata["size"], 10, 64); err == nil {
 			size = parsed
@@ -512,6 +606,8 @@ func objectInfoFromS3Headers(ref string, headers http.Header, contentLength int6
 	}
 }
 
+// spoolToTemp copies a stream to a temp file while computing both hex and base64
+// SHA-256 encodings needed by S3 requests.
 func spoolToTemp(ctx context.Context, r io.Reader, size int64) (*os.File, string, int64, string, string, error) {
 	file, err := os.CreateTemp("", "logserve-s3-object-*.tmp")
 	if err != nil {
@@ -540,6 +636,7 @@ func spoolToTemp(ctx context.Context, r io.Reader, size int64) (*os.File, string
 	return file, file.Name(), written, hex.EncodeToString(sum), base64.StdEncoding.EncodeToString(sum), nil
 }
 
+// envInt64 parses a positive int64 environment value or returns fallback.
 func envInt64(name string, fallback int64) int64 {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -552,6 +649,7 @@ func envInt64(name string, fallback int64) int64 {
 	return parsed
 }
 
+// firstNonEmpty returns the first non-empty string in a fallback chain.
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {

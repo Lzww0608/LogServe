@@ -1,4 +1,10 @@
+// Package webapi exposes LogServe control and log services as the HTTP API used
+// by the web console. It owns route registration, request auth, JSON DTOs, SSE
+// polling, and thin gRPC forwarding to the backend services.
 package webapi
+
+// This file wires the HTTP server, route table, static frontend fallback, and
+// dashboard snapshot helper.
 
 import (
 	"fmt"
@@ -10,6 +16,8 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// Server owns the HTTP mux, normalized configuration, backend clients, and small
+// in-memory caches used by web-console handlers.
 type Server struct {
 	cfg                   Config
 	clients               *Clients
@@ -17,6 +25,9 @@ type Server struct {
 	functionRegistryCache *functionRegistryCache
 }
 
+// NewServer validates authentication settings, dials backend gRPC clients, and
+// registers the HTTP routes. It returns an error before dialing when no usable
+// token is configured and unauthenticated mode is disabled.
 func NewServer(cfg Config) (*Server, error) {
 	normalizeAuthConfig(&cfg)
 	if !hasConfiguredToken(cfg) && !cfg.AllowUnauthenticated {
@@ -39,14 +50,20 @@ func NewServer(cfg Config) (*Server, error) {
 	return s, nil
 }
 
+// Handler returns the root HTTP handler wrapped with CORS, request-id, and auth
+// middleware.
 func (s *Server) Handler() http.Handler {
 	return s.withMiddleware(s.mux)
 }
 
+// Close releases backend gRPC connections held by the server.
 func (s *Server) Close() error {
 	return s.clients.Close()
 }
 
+// registerRoutes maps console API endpoints to handlers, role gates, and audit
+// action names. The role/action table is the authoritative backend permission
+// map for web-console requests.
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
 	s.handleRoute("GET /api/session", roleViewer, "read_session", s.handleSession)
@@ -86,6 +103,9 @@ func (s *Server) registerRoutes() {
 	s.handleRoute("GET /api/admin/config", roleAdmin, "read_admin_config", s.handleAdminConfig)
 	s.mux.HandleFunc("/", s.handleStatic)
 }
+
+// handleHealthz returns process liveness and configured backend addresses; it is
+// intentionally registered outside authenticated route handling.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"status":       "ok",
@@ -94,6 +114,8 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleStatic serves built web assets and falls back to index.html for SPA deep
+// links. API-looking paths are kept inside the JSON error contract.
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "API endpoint not found")
@@ -119,6 +141,8 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`<html><body><h1>LogServe Console</h1><p>Static frontend not found. Build web assets or run the Vite dev server.</p></body></html>`))
 }
 
+// dashboard fetches one control-plane snapshot and converts it to the stable web
+// DTO used by dashboard, list, and event handlers.
 func (s *Server) dashboard(r *http.Request) (DashboardDTO, error) {
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
 	defer cancel()

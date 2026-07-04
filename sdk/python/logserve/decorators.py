@@ -1,32 +1,43 @@
+# Workflow decorators record Python calls as LogServe task, workflow, actor, and LLM metadata.
 import functools
 import hashlib
 import inspect
 import json
 
 
+# A simple process-local trace stack; workflow definitions are expected to trace synchronously.
 _TRACE_STACK = []
+# Marker key used to serialize StepRef dependencies inside JSON args.
 _REF_KEY = "__step_ref__"
 
 
+# StepRef is the placeholder value returned by traced task calls inside workflows.
 class StepRef:
+    # Store the workflow step id represented by this dependency reference.
     def __init__(self, step_id):
         self.step_id = step_id
 
+    # Show the referenced step id in debugging output.
     def __repr__(self):
         return f"StepRef({self.step_id!r})"
 
 
+# WorkflowTraceContext accumulates a JSON DAG while a workflow function is executed.
 class WorkflowTraceContext:
+    # Track emitted steps and per-name counters for stable duplicate step ids.
     def __init__(self):
         self.steps = []
         self._name_counts = {}
 
+    # Record one @task invocation as a workflow step instead of executing it.
     def add_step(self, fn, args, kwargs):
+        # Duplicate Python function names get stable suffixed step ids within one workflow.
         base = getattr(fn, "__name__", "step")
         count = self._name_counts.get(base, 0) + 1
         self._name_counts[base] = count
         step_id = base if count == 1 else f"{base}_{count}"
 
+        # StepRef values embedded in args become JSON markers plus depends_on edges.
         encoded_args, deps_a = _encode_refs(list(args))
         encoded_kwargs, deps_k = _encode_refs(dict(kwargs))
         deps = sorted(set(deps_a + deps_k))
@@ -50,6 +61,7 @@ class WorkflowTraceContext:
         )
         return StepRef(step_id)
 
+    # Record one llm_generate call as a synthetic workflow step.
     def add_llm_step(
         self,
         model_name,
@@ -91,12 +103,14 @@ class WorkflowTraceContext:
         return StepRef(step_id)
 
 
+# Active workflow tracing is process-local and only exists during trace_workflow.
 def current_trace_context():
     if not _TRACE_STACK:
         return None
     return _TRACE_STACK[-1]
 
 
+# Execute a workflow function while collecting task and LLM step references.
 def trace_workflow(fn, *args, **kwargs):
     ctx = WorkflowTraceContext()
     _TRACE_STACK.append(ctx)
@@ -107,8 +121,11 @@ def trace_workflow(fn, *args, **kwargs):
     return ctx, result
 
 
+# Decorate a function as a LogServe task and make it traceable in workflows.
 def task(fn=None, *, retries=3, timeout_ms=30000):
+    # Support both @task and @task(...) call styles.
     def decorate(actual):
+        # During workflow tracing, return a StepRef instead of running user code.
         @functools.wraps(actual)
         def wrapper(*args, **kwargs):
             ctx = current_trace_context()
@@ -126,8 +143,11 @@ def task(fn=None, *, retries=3, timeout_ms=30000):
     return decorate(fn)
 
 
+# Decorate a function as a workflow entrypoint.
 def workflow(fn=None, *, retries=3, timeout_ms=30000):
+    # Support both @workflow and @workflow(...) call styles.
     def decorate(actual):
+        # Preserve call behavior while marking the callable for workflow submission.
         @functools.wraps(actual)
         def wrapper(*args, **kwargs):
             return actual(*args, **kwargs)
@@ -142,7 +162,9 @@ def workflow(fn=None, *, retries=3, timeout_ms=30000):
     return decorate(fn)
 
 
+# Decorate a class as a LogServe actor definition.
 def actor(cls=None, *, snapshot_every=25):
+    # Attach actor metadata without replacing the class object.
     def decorate(actual):
         setattr(actual, "_logserve_actor", True)
         setattr(actual, "_logserve_snapshot_every", snapshot_every)
@@ -153,13 +175,18 @@ def actor(cls=None, *, snapshot_every=25):
     return decorate(cls)
 
 
+# Encode Python values and StepRef placeholders into JSON-compatible objects.
 def encode_json(value):
     encoded, _ = _encode_refs(value)
     return encoded
 
 
+# Hash source text with the same sha256-prefix convention used by the client.
 def _source_hash(source):
     return "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+# Recursively replace StepRef values with dependency markers and collect dependencies.
 def _encode_refs(value):
     deps = []
     if isinstance(value, StepRef):
@@ -178,5 +205,6 @@ def _encode_refs(value):
             out[key] = encoded
             deps.extend(item_deps)
         return out, deps
+    # Validate that non-reference leaves are JSON serializable before returning them.
     json.dumps(value)
     return value, deps

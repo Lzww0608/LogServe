@@ -1,5 +1,7 @@
 package objectstore
 
+// This file defines the object-store abstraction used for larger runtime
+// payloads such as result blobs, snapshots, and checkpoint-adjacent artifacts.
 import (
 	"bytes"
 	"context"
@@ -11,11 +13,16 @@ import (
 	"strings"
 )
 
+// Store persists immutable objects and returns backend-specific refs that can be
+// stored in metadata or log records. Implementations should honor ctx while
+// copying data and reject unsupported ref schemes on Get.
 type Store interface {
 	Put(ctx context.Context, namespace string, r io.Reader, size int64) (string, error)
 	Get(ctx context.Context, ref string) (io.ReadCloser, ObjectInfo, error)
 }
 
+// ObjectInfo describes an opened object and carries backend checksum metadata
+// when available.
 type ObjectInfo struct {
 	Ref            string
 	Size           int64
@@ -25,6 +32,7 @@ type ObjectInfo struct {
 	Metadata       map[string]string
 }
 
+// PutBytes stores an in-memory byte slice through a Store and returns its ref.
 func PutBytes(ctx context.Context, s Store, ns string, data []byte) (string, error) {
 	if s == nil {
 		return "", errors.New("object store is nil")
@@ -32,6 +40,8 @@ func PutBytes(ctx context.Context, s Store, ns string, data []byte) (string, err
 	return s.Put(ctx, ns, bytes.NewReader(data), int64(len(data)))
 }
 
+// GetBytes reads an object into memory. maxBytes >= 0 enforces a hard size limit
+// before and during the read; maxBytes < 0 disables the limit.
 func GetBytes(ctx context.Context, s Store, ref string, maxBytes int64) ([]byte, error) {
 	if s == nil {
 		return nil, errors.New("object store is nil")
@@ -47,6 +57,9 @@ func GetBytes(ctx context.Context, s Store, ref string, maxBytes int64) ([]byte,
 	if maxBytes < 0 {
 		return io.ReadAll(rc)
 	}
+
+	// Read one byte past the limit so stores with unknown or stale size metadata are
+	// still bounded and rejected if the stream is too large.
 	limited := io.LimitReader(rc, maxBytes+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
@@ -58,6 +71,8 @@ func GetBytes(ctx context.Context, s Store, ref string, maxBytes int64) ([]byte,
 	return data, nil
 }
 
+// OpenFromEnv selects the configured object-store backend from environment
+// variables, defaulting to a local temp directory.
 func OpenFromEnv(ctx context.Context) (Store, error) {
 	kind := strings.ToLower(strings.TrimSpace(os.Getenv("LOGSERVE_RESULT_STORE")))
 	switch kind {

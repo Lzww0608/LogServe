@@ -1,5 +1,9 @@
 package metadata
 
+// This file contains the original mutex-backed metadata store. It is kept as a
+// simple reference implementation and as a compatibility baseline for the sharded
+// V2 store.
+
 import (
 	"errors"
 	"sync"
@@ -10,6 +14,9 @@ import (
 	"github.com/logserve/logserve/internal/workflow"
 )
 
+// Task is the scheduler-visible record for one unit of work. Lease fields fence
+// worker completions, while workflow, actor, and LLM fields attach the task to
+// higher-level runtime state.
 type Task struct {
 	TaskID                 string
 	TaskName               string
@@ -33,6 +40,8 @@ type Task struct {
 	UpdatedAtMs            int64
 }
 
+// Worker records scheduler capacity and liveness data for one worker process.
+// CachedModels and Labels are mutable maps and must be cloned at store boundaries.
 type Worker struct {
 	WorkerID      string
 	Address       string
@@ -43,6 +52,8 @@ type Worker struct {
 	LastHeartbeat int64
 }
 
+// MemoryStore is a single-lock in-memory Store implementation. It favors simple
+// correctness and defensive cloning over concurrency throughput.
 type MemoryStore struct {
 	mu                sync.RWMutex
 	tasks             map[string]Task
@@ -55,6 +66,8 @@ type MemoryStore struct {
 	models            map[string]*logservepb.ModelInfo
 }
 
+// NewLegacyMemoryStore constructs the original single-lock memory store used as a
+// compatibility baseline for tests and benchmarks.
 func NewLegacyMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		tasks:             make(map[string]Task),
@@ -68,6 +81,8 @@ func NewLegacyMemoryStore() *MemoryStore {
 	}
 }
 
+// CreateTask inserts a task unless the idempotency key already maps to an
+// existing task. The returned bool reports whether the existing task was reused.
 func (s *MemoryStore) CreateTask(task Task, idempotencyKey string) (Task, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -89,6 +104,7 @@ func (s *MemoryStore) CreateTask(task Task, idempotencyKey string) (Task, bool) 
 	return task, false
 }
 
+// GetTask returns a defensive copy of the task with the given ID.
 func (s *MemoryStore) GetTask(taskID string) (Task, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -96,6 +112,8 @@ func (s *MemoryStore) GetTask(taskID string) (Task, bool) {
 	return cloneTask(task), ok
 }
 
+// GetTaskByIdempotencyKey resolves a non-empty idempotency key to its original
+// task and returns a defensive copy.
 func (s *MemoryStore) GetTaskByIdempotencyKey(idempotencyKey string) (Task, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -110,6 +128,7 @@ func (s *MemoryStore) GetTaskByIdempotencyKey(idempotencyKey string) (Task, bool
 	return cloneTask(task), ok
 }
 
+// ListTasks snapshots every task without exposing store-owned byte slices.
 func (s *MemoryStore) ListTasks() []Task {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -121,6 +140,8 @@ func (s *MemoryStore) ListTasks() []Task {
 	return out
 }
 
+// LeaseTask moves a non-terminal task into RUNNING state and increments its
+// lease epoch so stale workers can be fenced at completion time.
 func (s *MemoryStore) LeaseTask(taskID, workerID string) (Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -140,6 +161,8 @@ func (s *MemoryStore) LeaseTask(taskID, workerID string) (Task, error) {
 	return cloneTask(task), nil
 }
 
+// ValidateTaskLease verifies that a worker still owns the current running lease.
+// Terminal tasks are treated as already settled and returned without error.
 func (s *MemoryStore) ValidateTaskLease(taskID, workerID string, leaseEpoch uint64) (Task, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -163,6 +186,8 @@ func (s *MemoryStore) ValidateTaskLease(taskID, workerID string, leaseEpoch uint
 	return cloneTask(task), nil
 }
 
+// RequeueExpiredRunningTasks scans all running tasks and returns those whose
+// lease age exceeded maxAge after moving them back to QUEUED.
 func (s *MemoryStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -192,6 +217,8 @@ func (s *MemoryStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task {
 	return requeued
 }
 
+// RequeueTaskIfLeaseExpired performs targeted lease recovery only when the caller
+// still references the current lease epoch for that running task.
 func (s *MemoryStore) RequeueTaskIfLeaseExpired(taskID string, leaseEpoch uint64, maxAge time.Duration) (Task, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -220,6 +247,8 @@ func (s *MemoryStore) RequeueTaskIfLeaseExpired(taskID string, leaseEpoch uint64
 	return cloneTask(requeuedTask), true
 }
 
+// CompleteTask persists a terminal task result after checking the worker and
+// lease epoch. Stale completions are rejected so requeued work cannot be overwritten.
 func (s *MemoryStore) CompleteTask(taskID, workerID string, leaseEpoch uint64, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -249,6 +278,8 @@ func (s *MemoryStore) CompleteTask(taskID, workerID string, leaseEpoch uint64, s
 	return cloneTask(task), nil
 }
 
+// RegisterModel stores model metadata, filling the same default version and
+// adapter values used by lookup paths.
 func (s *MemoryStore) RegisterModel(model *logservepb.ModelInfo) *logservepb.ModelInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -264,6 +295,7 @@ func (s *MemoryStore) RegisterModel(model *logservepb.ModelInfo) *logservepb.Mod
 	return cloneModel(clone)
 }
 
+// GetModel returns a cloned model registration, defaulting an empty version to v1.
 func (s *MemoryStore) GetModel(name, version string) (*logservepb.ModelInfo, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -274,6 +306,8 @@ func (s *MemoryStore) GetModel(name, version string) (*logservepb.ModelInfo, boo
 	return cloneModel(model), ok
 }
 
+// CreateWorkflow records initial workflow state or returns the prior state for a
+// repeated idempotency key.
 func (s *MemoryStore) CreateWorkflow(state workflow.State, idempotencyKey string) (workflow.State, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -291,6 +325,7 @@ func (s *MemoryStore) CreateWorkflow(state workflow.State, idempotencyKey string
 	return cloneWorkflow(state), false
 }
 
+// GetWorkflow returns a deep copy of workflow runtime state.
 func (s *MemoryStore) GetWorkflow(workflowID string) (workflow.State, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -298,6 +333,8 @@ func (s *MemoryStore) GetWorkflow(workflowID string) (workflow.State, bool) {
 	return cloneWorkflow(state), ok
 }
 
+// GetWorkflowByIdempotencyKey resolves a workflow idempotency key to the original
+// workflow state.
 func (s *MemoryStore) GetWorkflowByIdempotencyKey(idempotencyKey string) (workflow.State, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -312,6 +349,7 @@ func (s *MemoryStore) GetWorkflowByIdempotencyKey(idempotencyKey string) (workfl
 	return cloneWorkflow(state), ok
 }
 
+// ListWorkflows snapshots all workflow states with cloned step payloads.
 func (s *MemoryStore) ListWorkflows() []workflow.State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -323,6 +361,8 @@ func (s *MemoryStore) ListWorkflows() []workflow.State {
 	return out
 }
 
+// UpdateWorkflow runs fn under the store lock and commits the mutated workflow
+// state only if fn succeeds.
 func (s *MemoryStore) UpdateWorkflow(workflowID string, fn func(*workflow.State) error) (workflow.State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -339,6 +379,8 @@ func (s *MemoryStore) UpdateWorkflow(workflowID string, fn func(*workflow.State)
 	return cloneWorkflow(state), nil
 }
 
+// UpsertWorkflow installs a workflow snapshot and refreshes the idempotency index
+// when the state carries a key.
 func (s *MemoryStore) UpsertWorkflow(state workflow.State) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,6 +390,8 @@ func (s *MemoryStore) UpsertWorkflow(state workflow.State) {
 	}
 }
 
+// UpsertWorker registers or refreshes worker metadata while preserving the
+// current running task count for existing workers.
 func (s *MemoryStore) UpsertWorker(worker Worker) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -370,6 +414,8 @@ func (s *MemoryStore) UpsertWorker(worker Worker) {
 	s.workers[worker.WorkerID] = cloneWorker(worker)
 }
 
+// GetWorker returns a cloned worker record so Labels and CachedModels remain
+// owned by the store.
 func (s *MemoryStore) GetWorker(workerID string) (Worker, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -377,6 +423,8 @@ func (s *MemoryStore) GetWorker(workerID string) (Worker, bool) {
 	return cloneWorker(worker), ok
 }
 
+// ActiveWorkers returns workers whose heartbeat is fresh enough for scheduling;
+// non-positive maxAge disables the freshness filter.
 func (s *MemoryStore) ActiveWorkers(maxAge time.Duration) []Worker {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -392,6 +440,7 @@ func (s *MemoryStore) ActiveWorkers(maxAge time.Duration) []Worker {
 	return out
 }
 
+// ListWorkers snapshots all worker records.
 func (s *MemoryStore) ListWorkers() []Worker {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -403,6 +452,8 @@ func (s *MemoryStore) ListWorkers() []Worker {
 	return out
 }
 
+// Heartbeat updates worker liveness and, when provided, replaces the cached model
+// set with a cloned copy.
 func (s *MemoryStore) Heartbeat(workerID string, cachedModels map[string]bool) (Worker, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -422,6 +473,8 @@ func (s *MemoryStore) Heartbeat(workerID string, cachedModels map[string]bool) (
 	return cloneWorker(worker), ok
 }
 
+// IncrementWorkerLoad creates a default worker record if needed and increments
+// its running task count for scheduler placement decisions.
 func (s *MemoryStore) IncrementWorkerLoad(workerID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -437,6 +490,7 @@ func (s *MemoryStore) IncrementWorkerLoad(workerID string) {
 	s.workers[workerID] = worker
 }
 
+// DecrementWorkerLoad lowers a worker running count without letting it underflow.
 func (s *MemoryStore) DecrementWorkerLoad(workerID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -450,6 +504,8 @@ func (s *MemoryStore) DecrementWorkerLoad(workerID string) {
 	s.workers[workerID] = worker
 }
 
+// CreateActor records actor state or returns the existing state for a repeated
+// idempotency key.
 func (s *MemoryStore) CreateActor(state actor.State, idempotencyKey string) (actor.State, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -467,6 +523,7 @@ func (s *MemoryStore) CreateActor(state actor.State, idempotencyKey string) (act
 	return cloneActor(state), false
 }
 
+// GetActor returns a cloned actor state snapshot.
 func (s *MemoryStore) GetActor(actorID string) (actor.State, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -474,6 +531,8 @@ func (s *MemoryStore) GetActor(actorID string) (actor.State, bool) {
 	return cloneActor(state), ok
 }
 
+// GetActorByIdempotencyKey resolves an actor idempotency key to the original
+// actor state.
 func (s *MemoryStore) GetActorByIdempotencyKey(idempotencyKey string) (actor.State, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -488,6 +547,7 @@ func (s *MemoryStore) GetActorByIdempotencyKey(idempotencyKey string) (actor.Sta
 	return cloneActor(state), ok
 }
 
+// ListActors snapshots all actor states.
 func (s *MemoryStore) ListActors() []actor.State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -499,6 +559,8 @@ func (s *MemoryStore) ListActors() []actor.State {
 	return out
 }
 
+// UpdateActor applies fn to a private copy of actor state and commits it only
+// when fn succeeds.
 func (s *MemoryStore) UpdateActor(actorID string, fn func(*actor.State) error) (actor.State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -515,6 +577,8 @@ func (s *MemoryStore) UpdateActor(actorID string, fn func(*actor.State) error) (
 	return cloneActor(state), nil
 }
 
+// UpsertActor installs an actor snapshot and refreshes its idempotency index when
+// present.
 func (s *MemoryStore) UpsertActor(state actor.State) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -524,11 +588,14 @@ func (s *MemoryStore) UpsertActor(state actor.State) {
 	}
 }
 
+// cloneTask copies mutable task result bytes before crossing the store boundary.
 func cloneTask(task Task) Task {
 	task.ResultJSON = append([]byte(nil), task.ResultJSON...)
 	return task
 }
 
+// ModelKey builds the canonical name:version lookup key, defaulting an empty
+// version to v1 for compatibility with callers that omit it.
 func ModelKey(name, version string) string {
 	if version == "" {
 		version = "v1"
@@ -536,6 +603,7 @@ func ModelKey(name, version string) string {
 	return name + ":" + version
 }
 
+// ListModels returns cloned model registrations.
 func (s *MemoryStore) ListModels() []*logservepb.ModelInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -547,10 +615,13 @@ func (s *MemoryStore) ListModels() []*logservepb.ModelInfo {
 	return out
 }
 
+// cloneWorkflow delegates to the workflow package so nested step state is cloned
+// consistently with replay code.
 func cloneWorkflow(state workflow.State) workflow.State {
 	return workflow.CloneState(state)
 }
 
+// cloneWorkflowSteps deep-copies per-step result payloads for legacy callers.
 func cloneWorkflowSteps(source map[string]workflow.StepState) map[string]workflow.StepState {
 	out := make(map[string]workflow.StepState, len(source))
 	for id, step := range source {
@@ -560,6 +631,8 @@ func cloneWorkflowSteps(source map[string]workflow.StepState) map[string]workflo
 	return out
 }
 
+// cloneActor copies actor source and JSON payloads so caller mutation cannot
+// affect persisted actor state.
 func cloneActor(state actor.State) actor.State {
 	state.ClassSource = string([]byte(state.ClassSource))
 	state.InitArgsJSON = append([]byte(nil), state.InitArgsJSON...)
@@ -567,6 +640,7 @@ func cloneActor(state actor.State) actor.State {
 	return state
 }
 
+// cloneWorker deep-copies worker maps and normalizes zero capacity to one.
 func cloneWorker(worker Worker) Worker {
 	labels := make(map[string]string, len(worker.Labels))
 	for k, v := range worker.Labels {
@@ -580,6 +654,7 @@ func cloneWorker(worker Worker) Worker {
 	return worker
 }
 
+// cloneModelCache copies the worker model-cache set represented as a map.
 func cloneModelCache(source map[string]bool) map[string]bool {
 	out := make(map[string]bool, len(source))
 	for k, v := range source {
@@ -588,6 +663,7 @@ func cloneModelCache(source map[string]bool) map[string]bool {
 	return out
 }
 
+// cloneModel returns a detached protobuf model record.
 func cloneModel(model *logservepb.ModelInfo) *logservepb.ModelInfo {
 	if model == nil {
 		return nil

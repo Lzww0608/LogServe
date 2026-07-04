@@ -1,5 +1,8 @@
 package worker
 
+// This file protects the msgpack executor wire format used between the Go
+// worker and the Python subprocess.
+
 import (
 	"bytes"
 	"encoding/json"
@@ -8,6 +11,7 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+// TestExecutorMsgpackRequestKeepsJSONPayloadAsBytes verifies the msgpack request path preserves raw JSON args bytes.
 func TestExecutorMsgpackRequestKeepsJSONPayloadAsBytes(t *testing.T) {
 	args := json.RawMessage(`{"args":[1,2],"kwargs":{}}`)
 	data, err := marshalExecutorRequestMsgpack(executorRequest{
@@ -31,6 +35,7 @@ func TestExecutorMsgpackRequestKeepsJSONPayloadAsBytes(t *testing.T) {
 	}
 }
 
+// TestExecutorMsgpackResponseUsesRawJSONBytes verifies result_json and state_json stay raw JSON after response decoding.
 func TestExecutorMsgpackResponseUsesRawJSONBytes(t *testing.T) {
 	data, err := msgpack.Marshal(map[string]any{
 		"ok":          true,

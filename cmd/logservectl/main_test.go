@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+// TestLLMOutputIncludesCheckpointCacheMetrics verifies the CLI JSON shape
+// includes checkpoint-cache fields used by downstream tooling.
 func TestLLMOutputIncludesCheckpointCacheMetrics(t *testing.T) {
 	data, err := json.Marshal(llmOutput{
 		TaskID:             "task-1",

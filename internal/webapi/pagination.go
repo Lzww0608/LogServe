@@ -1,5 +1,8 @@
 package webapi
 
+// This file contains the shared offset-token pagination contract used by list
+// endpoints.
+
 import (
 	"fmt"
 	"net/http"
@@ -12,11 +15,15 @@ const (
 	maxListLimit     = 100
 )
 
+// paginationParams stores the bounded list limit and integer offset token parsed
+// from query parameters.
 type paginationParams struct {
 	Limit  int
 	Offset int
 }
 
+// paginationResult describes the slice window and next offset token returned to
+// list endpoints.
 type paginationResult struct {
 	Start         int
 	End           int
@@ -25,6 +32,8 @@ type paginationResult struct {
 	NextPageToken string
 }
 
+// parsePaginationParams validates limit and page_token against the shared list
+// pagination contract.
 func parsePaginationParams(r *http.Request, totalCount int) (paginationParams, error) {
 	if totalCount < 0 {
 		totalCount = 0
@@ -53,6 +62,8 @@ func parsePaginationParams(r *http.Request, totalCount int) (paginationParams, e
 	return paginationParams{Limit: limit, Offset: offset}, nil
 }
 
+// paginate clamps the requested offset to the collection size and computes the
+// next page token when more items remain.
 func paginate(totalCount int, params paginationParams) paginationResult {
 	start := params.Offset
 	if start > totalCount {

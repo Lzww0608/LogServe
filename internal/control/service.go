@@ -26,6 +26,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// This file implements the main control-plane service: task submission, worker
+// polling, workflow progression, result materialization, and queue signaling.
 const defaultResultInlineThreshold = 4096
 const largeActorStateLogThreshold = 4096
 const actorOwnerLease = 750 * time.Millisecond
@@ -36,10 +38,14 @@ const defaultRedeliveryTimeout = 30 * time.Second
 const defaultPollBatchLimit = 64
 const maxPollWaitTimeout = 5 * time.Second
 
+// taskSubmittedPayload is the legacy JSON wrapper for TaskSubmitted events.
+// Newer records use eventcodec, but bootstrap still accepts this shape.
 type taskSubmittedPayload struct {
 	TaskSpec json.RawMessage `json:"task_spec,omitempty"`
 }
 
+// taskLifecyclePayload is written to task lifecycle events and carries the lease
+// epoch so replay can fence stale starts, completions, and redeliveries.
 type taskLifecyclePayload struct {
 	TaskLeaseEpoch uint64          `json:"task_lease_epoch,omitempty"`
 	WorkerID       string          `json:"worker_id,omitempty"`
@@ -48,6 +54,9 @@ type taskLifecyclePayload struct {
 	TimestampMs    int64           `json:"timestamp_ms,omitempty"`
 }
 
+// Service owns the in-memory control-plane materialization backed by the log.
+// Its mutating RPCs append durable events before updating metadata so restart
+// recovery can rebuild state from log records when metadata is lost.
 type Service struct {
 	logservepb.UnimplementedControlServiceServer
 	meta                  metadata.Store
@@ -77,11 +86,15 @@ type Service struct {
 	taskNotifyCh          chan struct{}
 }
 
+// NewService constructs a Service with the default local object store for large
+// results and registered function sources.
 func NewService(meta metadata.Store, logClient logClient) *Service {
 	store, _ := objectstore.OpenLocal(filepath.Join(os.TempDir(), "logserve-objectstore"))
 	return NewServiceWithResultStore(meta, logClient, store, defaultResultInlineThreshold)
 }
 
+// NewServiceWithResultStore constructs a Service with explicit result storage.
+// Non-positive thresholds fall back to the default inline result size.
 func NewServiceWithResultStore(meta metadata.Store, logClient logClient, store objectstore.Store, threshold int) *Service {
 	if threshold <= 0 {
 		threshold = defaultResultInlineThreshold
@@ -110,6 +123,8 @@ func NewServiceWithResultStore(meta metadata.Store, logClient logClient, store o
 	}
 }
 
+// appendLog appends a control-plane event and records the observed latency for
+// dashboard reporting and backpressure decisions.
 func (s *Service) appendLog(ctx context.Context, req *logservepb.AppendLogRequest) (*logservepb.AppendLogResponse, error) {
 	start := time.Now()
 	resp, err := s.log.AppendLog(ctx, req)
@@ -121,6 +136,8 @@ func (s *Service) appendLog(ctx context.Context, req *logservepb.AppendLogReques
 	return resp, err
 }
 
+// metadataPersisted surfaces synchronous metadata persistence failures while
+// treating configured non-blocking persistence errors as observable warnings.
 func (s *Service) metadataPersisted() error {
 	reporter, ok := s.meta.(interface{ LastError() error })
 	if !ok {
@@ -136,6 +153,8 @@ func (s *Service) metadataPersisted() error {
 	return nil
 }
 
+// pollBatchLimit normalizes worker batch requests and caps them to the server
+// default so one poll cannot drain an unbounded number of tasks.
 func pollBatchLimit(requested uint32) int {
 	if requested == 0 {
 		return 1
@@ -146,6 +165,7 @@ func pollBatchLimit(requested uint32) int {
 	return int(requested)
 }
 
+// pollWaitTimeout converts long-poll milliseconds into a bounded duration.
 func pollWaitTimeout(waitMs int64) time.Duration {
 	if waitMs <= 0 {
 		return 0
@@ -157,6 +177,8 @@ func pollWaitTimeout(waitMs int64) time.Duration {
 	return wait
 }
 
+// pollTaskResponse keeps the legacy single Task field and the newer Tasks slice
+// consistent for batch-aware and older workers.
 func pollTaskResponse(tasks []*logservepb.TaskSpec) *logservepb.PollTaskResponse {
 	resp := &logservepb.PollTaskResponse{}
 	if len(tasks) == 0 {
@@ -168,6 +190,7 @@ func pollTaskResponse(tasks []*logservepb.TaskSpec) *logservepb.PollTaskResponse
 	return resp
 }
 
+// taskAvailableSignal returns the current long-poll wakeup channel under lock.
 func (s *Service) taskAvailableSignal() <-chan struct{} {
 	s.taskNotifyMu.Lock()
 	defer s.taskNotifyMu.Unlock()
@@ -177,6 +200,8 @@ func (s *Service) taskAvailableSignal() <-chan struct{} {
 	return s.taskNotifyCh
 }
 
+// notifyTaskAvailable wakes current long-pollers and installs a fresh channel for
+// future polls.
 func (s *Service) notifyTaskAvailable() {
 	if s == nil {
 		return
@@ -187,25 +212,33 @@ func (s *Service) notifyTaskAvailable() {
 		s.taskNotifyCh = make(chan struct{})
 		return
 	}
+	// Closing broadcasts to all current waiters; replacing the channel prevents
+	// later pollers from observing a permanently closed signal.
 	close(s.taskNotifyCh)
 	s.taskNotifyCh = make(chan struct{})
 }
+
+// getBackpressureConfig snapshots queue and redelivery limits under the config lock.
 func (s *Service) getBackpressureConfig() (uint32, time.Duration, time.Duration) {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
 	return s.queueHighWatermark, s.redeliveryTimeout, s.logAppendSlowLimit
 }
 
+// getSchedulingPolicy reads the current LLM scheduling policy safely.
 func (s *Service) getSchedulingPolicy() logservepb.SchedulingPolicy {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
 	return s.schedulingPolicy
 }
 
+// useSchedulerV2 reports whether the indexed scheduler is enabled and available.
 func (s *Service) useSchedulerV2() bool {
 	return s != nil && s.schedulerV2 && s.scheduler != nil
 }
 
+// syncSchedulerLLMStats copies LLM statistics into the indexed scheduler without
+// holding the stats lock while the scheduler updates its placement indexes.
 func (s *Service) syncSchedulerLLMStats() {
 	if s == nil || s.scheduler == nil {
 		return
@@ -219,6 +252,8 @@ func (s *Service) syncSchedulerLLMStats() {
 	s.scheduler.SyncLLMStats(snapshot)
 }
 
+// syncActiveSchedulerWorkers hydrates scheduler placement data from currently
+// live workers only.
 func (s *Service) syncActiveSchedulerWorkers() {
 	if s.scheduler == nil {
 		return
@@ -228,6 +263,8 @@ func (s *Service) syncActiveSchedulerWorkers() {
 	}
 }
 
+// syncSchedulerWorkers rebuilds scheduler worker views from all metadata workers
+// and then refreshes LLM placement statistics.
 func (s *Service) syncSchedulerWorkers() {
 	if s.scheduler == nil {
 		return
@@ -238,6 +275,8 @@ func (s *Service) syncSchedulerWorkers() {
 	s.syncSchedulerLLMStats()
 }
 
+// hydrateSchedulerWorkersIfNeeded lazily populates the scheduler after bootstrap or
+// tests that construct scheduler state before worker heartbeats.
 func (s *Service) hydrateSchedulerWorkersIfNeeded() {
 	if s.scheduler == nil || s.scheduler.WorkerCount() > 0 {
 		return
@@ -245,6 +284,7 @@ func (s *Service) hydrateSchedulerWorkersIfNeeded() {
 	s.syncActiveSchedulerWorkers()
 }
 
+// updateSchedulerWorker mirrors a single metadata worker into scheduler indexes.
 func (s *Service) updateSchedulerWorker(workerID string) {
 	if s.scheduler == nil || workerID == "" {
 		return
@@ -254,12 +294,15 @@ func (s *Service) updateSchedulerWorker(workerID string) {
 	}
 }
 
+// completeSchedulerRunning removes a task from indexed running-lease tracking.
 func (s *Service) completeSchedulerRunning(taskID string) {
 	if s != nil && s.scheduler != nil {
 		s.scheduler.CompleteRunning(taskID)
 	}
 }
 
+// schedulerSnapshot captures the worker-specific view used for one assignment pass,
+// including actor ownership and the next command sequence each actor can accept.
 func (s *Service) schedulerSnapshot(workerID string) workerSnapshot {
 	snapshot := workerSnapshot{
 		WorkerID:         workerID,
@@ -281,6 +324,7 @@ func (s *Service) schedulerSnapshot(workerID string) workerSnapshot {
 	return snapshot
 }
 
+// schedulerMetaFromTask projects metadata fields into the scheduler key space.
 func (s *Service) schedulerMetaFromTask(task metadata.Task) SchedMeta {
 	return SchedMeta{
 		TaskID:        task.TaskID,
@@ -295,6 +339,8 @@ func (s *Service) schedulerMetaFromTask(task metadata.Task) SchedMeta {
 	}
 }
 
+// schedulerLeaseDeadlineMs computes the indexed redelivery deadline for a running
+// task lease.
 func schedulerLeaseDeadlineMs(task metadata.Task, timeout time.Duration) int64 {
 	if timeout <= 0 || task.UpdatedAtMs == 0 {
 		return 0
@@ -302,6 +348,8 @@ func schedulerLeaseDeadlineMs(task metadata.Task, timeout time.Duration) int64 {
 	return task.UpdatedAtMs + timeout.Milliseconds()
 }
 
+// SubmitTask validates a user task, registers its Python function source or hash,
+// and enqueues it through the log-first task path.
 func (s *Service) SubmitTask(ctx context.Context, req *logservepb.SubmitTaskRequest) (*logservepb.SubmitTaskResponse, error) {
 	if req.GetTaskName() == "" {
 		return nil, errors.New("task_name is required")
@@ -332,6 +380,7 @@ func (s *Service) SubmitTask(ctx context.Context, req *logservepb.SubmitTaskRequ
 	return &logservepb.SubmitTaskResponse{TaskId: task.TaskID, Status: task.Status}, nil
 }
 
+// GetTaskStatus returns the current materialized task status from metadata.
 func (s *Service) GetTaskStatus(ctx context.Context, req *logservepb.GetTaskStatusRequest) (*logservepb.GetTaskStatusResponse, error) {
 	task, ok := s.meta.GetTask(req.GetTaskId())
 	if !ok {
@@ -340,6 +389,8 @@ func (s *Service) GetTaskStatus(ctx context.Context, req *logservepb.GetTaskStat
 	return taskStatusResponse(task), nil
 }
 
+// SubmitWorkflow parses and normalizes a workflow definition, records the start
+// event, materializes metadata, and schedules initially ready steps.
 func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWorkflowRequest) (*logservepb.SubmitWorkflowResponse, error) {
 	if req.GetWorkflowName() == "" {
 		return nil, errors.New("workflow_name is required")
@@ -418,6 +469,7 @@ func (s *Service) SubmitWorkflow(ctx context.Context, req *logservepb.SubmitWork
 	return &logservepb.SubmitWorkflowResponse{WorkflowId: workflowID, Status: logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING}, nil
 }
 
+// GetWorkflowStatus returns the current materialized workflow state.
 func (s *Service) GetWorkflowStatus(ctx context.Context, req *logservepb.GetWorkflowStatusRequest) (*logservepb.GetWorkflowStatusResponse, error) {
 	state, ok := s.meta.GetWorkflow(req.GetWorkflowId())
 	if !ok {
@@ -426,6 +478,8 @@ func (s *Service) GetWorkflowStatus(ctx context.Context, req *logservepb.GetWork
 	return workflowStatusResponse(state), nil
 }
 
+// ReplayWorkflow rebuilds one workflow from its log stream and compares it with
+// the current metadata materialization.
 func (s *Service) ReplayWorkflow(ctx context.Context, req *logservepb.ReplayWorkflowRequest) (*logservepb.ReplayWorkflowResponse, error) {
 	streamID := workflowStream(req.GetWorkflowId())
 	replayed, err := workflow.ReplayRawEach(req.GetWorkflowId(), func(emit func(logrecord.RawRecord) error) error {
@@ -442,6 +496,8 @@ func (s *Service) ReplayWorkflow(ctx context.Context, req *logservepb.ReplayWork
 	}, nil
 }
 
+// RegisterWorker records a worker registration event, upserts worker metadata, and
+// wakes pollers that may now have capacity to execute tasks.
 func (s *Service) RegisterWorker(ctx context.Context, req *logservepb.RegisterWorkerRequest) (*logservepb.RegisterWorkerResponse, error) {
 	if req.GetWorkerId() == "" {
 		return nil, errors.New("worker_id is required")
@@ -476,6 +532,7 @@ func (s *Service) RegisterWorker(ctx context.Context, req *logservepb.RegisterWo
 	return &logservepb.RegisterWorkerResponse{Accepted: true}, nil
 }
 
+// Heartbeat refreshes worker liveness, model cache metadata, and scheduler indexes.
 func (s *Service) Heartbeat(ctx context.Context, req *logservepb.HeartbeatRequest) (*logservepb.HeartbeatResponse, error) {
 	if req.GetWorkerId() == "" {
 		return nil, errors.New("worker_id is required")
@@ -489,12 +546,16 @@ func (s *Service) Heartbeat(ctx context.Context, req *logservepb.HeartbeatReques
 	return &logservepb.HeartbeatResponse{ServerTimeMs: time.Now().UnixMilli()}, nil
 }
 
+// PollTask leases immediately available work or waits up to the requested bounded
+// long-poll timeout for a task-available signal.
 func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest) (*logservepb.PollTaskResponse, error) {
 	if req.GetWorkerId() == "" {
 		return nil, errors.New("worker_id is required")
 	}
 	maxTasks := pollBatchLimit(req.GetMaxTasks())
 	wait := pollWaitTimeout(req.GetWaitTimeoutMs())
+	// Capture the current signal before polling so a concurrent enqueue either wakes
+	// this wait or is observed by the immediate poll below.
 	signal := s.taskAvailableSignal()
 	resp, err := s.pollTaskNow(ctx, req.GetWorkerId(), maxTasks)
 	if err != nil || resp.GetHasTask() || wait <= 0 {
@@ -513,6 +574,8 @@ func (s *Service) PollTask(ctx context.Context, req *logservepb.PollTaskRequest)
 	}
 }
 
+// pollTaskNow performs one non-blocking poll pass after first redelivering expired
+// leases so workers can pick up abandoned tasks.
 func (s *Service) pollTaskNow(ctx context.Context, workerID string, maxTasks int) (*logservepb.PollTaskResponse, error) {
 	if err := s.redeliverExpiredTasks(ctx); err != nil {
 		return nil, err
@@ -531,6 +594,8 @@ func (s *Service) pollTaskNow(ctx context.Context, workerID string, maxTasks int
 	return pollTaskResponse(tasks), nil
 }
 
+// pollTaskLegacy scans the FIFO queue and leases tasks that match the polling
+// worker, leaving blocked actor or LLM tasks in place.
 func (s *Service) pollTaskLegacy(workerID string, maxTasks int) ([]*logservepb.TaskSpec, error) {
 	tasks := make([]*logservepb.TaskSpec, 0, maxTasks)
 	s.queueMu.Lock()
@@ -570,6 +635,8 @@ func (s *Service) pollTaskLegacy(workerID string, maxTasks int) ([]*logservepb.T
 	return tasks, nil
 }
 
+// pollTaskIndexed asks Scheduler for assignable tasks and keeps scheduler state in
+// sync with metadata lease decisions.
 func (s *Service) pollTaskIndexed(workerID string, maxTasks int) ([]*logservepb.TaskSpec, error) {
 	s.hydrateSchedulerWorkersIfNeeded()
 	tasks := make([]*logservepb.TaskSpec, 0, maxTasks)
@@ -624,6 +691,8 @@ func (s *Service) pollTaskIndexed(workerID string, maxTasks int) ([]*logservepb.
 	return tasks, nil
 }
 
+// actorMailboxReady enforces per-actor ownership and command sequence ordering
+// before a task can be leased to a worker.
 func (s *Service) actorMailboxReady(task metadata.Task, workerID string) bool {
 	if task.ActorID == "" {
 		return true
@@ -639,6 +708,8 @@ func (s *Service) actorMailboxReady(task metadata.Task, workerID string) bool {
 	return commandSeq == state.CommandCount+1
 }
 
+// leasedTaskSpec returns the worker-facing task spec with lease epoch and fresh
+// actor ownership/state injected at dispatch time.
 func (s *Service) leasedTaskSpec(spec *logservepb.TaskSpec, leased metadata.Task) *logservepb.TaskSpec {
 	leasedSpec := cloneSpec(spec)
 	leasedSpec.TaskLeaseEpoch = leased.TaskLeaseEpoch
@@ -663,6 +734,8 @@ func (s *Service) leasedTaskSpec(spec *logservepb.TaskSpec, leased metadata.Task
 	return leasedSpec
 }
 
+// StartTask records that a validated lease has begun executing and materializes
+// workflow step start state when applicable.
 func (s *Service) StartTask(ctx context.Context, req *logservepb.StartTaskRequest) (*logservepb.StartTaskResponse, error) {
 	task, err := s.meta.ValidateTaskLease(req.GetTaskId(), req.GetWorkerId(), req.GetTaskLeaseEpoch())
 	if err != nil {
@@ -684,6 +757,9 @@ func (s *Service) StartTask(ctx context.Context, req *logservepb.StartTaskReques
 	}
 	return &logservepb.StartTaskResponse{Accepted: true}, nil
 }
+
+// CompleteTask validates the lease epoch, records terminal task state, updates
+// actor/workflow/LLM side materializations, and releases worker load.
 func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTaskRequest) (*logservepb.CompleteTaskResponse, error) {
 	if req.GetStatus() != logservepb.TaskStatus_TASK_STATUS_SUCCEEDED && req.GetStatus() != logservepb.TaskStatus_TASK_STATUS_FAILED {
 		return nil, errors.New("complete status must be SUCCEEDED or FAILED")
@@ -698,6 +774,8 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 		return nil, err
 	}
 	if validated.ActorID != "" {
+		// Apply actor state before appending task completion so replay observes the
+		// actor command and task terminal event in execution order.
 		if err := s.completeActorCall(ctx, validated, req); err != nil {
 			return nil, err
 		}
@@ -748,6 +826,8 @@ func (s *Service) CompleteTask(ctx context.Context, req *logservepb.CompleteTask
 	return &logservepb.CompleteTaskResponse{Accepted: true}, nil
 }
 
+// CompleteTasks applies CompleteTask independently for each batch item and reports
+// per-task errors without aborting the whole batch after a single bad item.
 func (s *Service) CompleteTasks(ctx context.Context, req *logservepb.CompleteTaskBatchRequest) (*logservepb.CompleteTaskBatchResponse, error) {
 	resp := &logservepb.CompleteTaskBatchResponse{Accepted: true}
 	if req == nil {
@@ -777,6 +857,7 @@ func (s *Service) CompleteTasks(ctx context.Context, req *logservepb.CompleteTas
 	return resp, nil
 }
 
+// appendTaskStarted writes the durable TaskStarted event for a specific lease.
 func (s *Service) appendTaskStarted(ctx context.Context, task metadata.Task, workerID string) error {
 	payload, err := marshalTaskLifecyclePayload(taskLifecyclePayload{
 		TaskLeaseEpoch: task.TaskLeaseEpoch,
@@ -795,6 +876,8 @@ func (s *Service) appendTaskStarted(ctx context.Context, task metadata.Task, wor
 	return err
 }
 
+// appendTaskTerminal writes either TaskCompleted or TaskFailed with lease-scoped
+// idempotency so stale completions do not overwrite newer redeliveries during replay.
 func (s *Service) appendTaskTerminal(ctx context.Context, task metadata.Task, status logservepb.TaskStatus, resultJSON []byte, taskErr string) error {
 	eventType := "TaskCompleted"
 	if status == logservepb.TaskStatus_TASK_STATUS_FAILED {
@@ -809,6 +892,8 @@ func (s *Service) appendTaskTerminal(ctx context.Context, task metadata.Task, st
 	return err
 }
 
+// taskTerminalLogPayload encodes terminal result, error, worker, and lease fields
+// into the lifecycle payload format used by bootstrap replay.
 func taskTerminalLogPayload(task metadata.Task, status logservepb.TaskStatus, resultJSON []byte, taskErr string) []byte {
 	payload, err := marshalTaskLifecyclePayload(taskLifecyclePayload{
 		TaskLeaseEpoch: task.TaskLeaseEpoch,
@@ -823,13 +908,20 @@ func taskTerminalLogPayload(task metadata.Task, status logservepb.TaskStatus, re
 	return payload
 }
 
+// taskTerminalIdempotencyKey scopes terminal events by task, event type, worker,
+// and lease epoch.
 func taskTerminalIdempotencyKey(taskID, eventType, workerID string, leaseEpoch uint64) string {
 	return fmt.Sprintf("%s:%s:%s:%d", taskID, eventType, workerID, leaseEpoch)
 }
+
+// enqueueTask submits a task without extra metadata mutation.
 func (s *Service) enqueueTask(ctx context.Context, spec *logservepb.TaskSpec) (metadata.Task, bool, error) {
 	return s.enqueueTaskWithMetadata(ctx, spec, nil)
 }
 
+// enqueueTaskWithMetadata is the shared log-first task submission path. It applies
+// backpressure, handles idempotency, persists the TaskSubmitted event, then updates
+// metadata and queue/scheduler indexes.
 func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.TaskSpec, mutate func(*metadata.Task)) (metadata.Task, bool, error) {
 	if spec.GetTaskId() == "" {
 		spec.TaskId = newTaskID()
@@ -869,6 +961,8 @@ func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.
 		}
 	}
 
+	// The submitted event is the source of truth; metadata and queue state are
+	// derived from it during bootstrap if the process exits after the log write.
 	payload, err := marshalTaskSubmittedPayload(spec)
 	if err != nil {
 		return metadata.Task{}, false, err
@@ -928,6 +1022,7 @@ func (s *Service) enqueueTaskWithMetadata(ctx context.Context, spec *logservepb.
 	return task, false, nil
 }
 
+// marshalTaskSubmittedPayload stores the cloned TaskSpec in compact eventcodec form.
 func marshalTaskSubmittedPayload(spec *logservepb.TaskSpec) ([]byte, error) {
 	specData, err := proto.Marshal(cloneSpec(spec))
 	if err != nil {
@@ -936,6 +1031,8 @@ func marshalTaskSubmittedPayload(spec *logservepb.TaskSpec) ([]byte, error) {
 	return eventcodec.Marshal(eventcodec.KindTaskSubmitted, map[string]any{"task_spec": specData})
 }
 
+// unmarshalTaskSubmittedSpec accepts both eventcodec records and legacy JSON
+// wrappers so old task logs remain replayable.
 func unmarshalTaskSubmittedSpec(data []byte) (*logservepb.TaskSpec, error) {
 	var fields map[string]any
 	encoded, err := eventcodec.Unmarshal(eventcodec.KindTaskSubmitted, data, &fields)
@@ -966,6 +1063,9 @@ func unmarshalTaskSubmittedSpec(data []byte) (*logservepb.TaskSpec, error) {
 	}
 	return decoded, nil
 }
+
+// scheduleReadySteps serializes workflow scheduling, creates task records for each
+// currently ready step, and records the StepScheduled event after task submission.
 func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) error {
 	s.workflowMu.Lock()
 	defer s.workflowMu.Unlock()
@@ -1041,9 +1141,14 @@ func (s *Service) scheduleReadySteps(ctx context.Context, workflowID string) err
 			"step_id":     stepDef.StepID,
 			"attempt":     attempt,
 		})
+		// Re-read state after each scheduling mutation so newly unblocked steps are based
+		// on persisted workflow metadata rather than the stale local snapshot.
 		state, _ = s.meta.GetWorkflow(workflowID)
 	}
 }
+
+// markWorkflowStepStarted records and materializes the first start of a workflow
+// step unless it has already reached a terminal step state.
 func (s *Service) markWorkflowStepStarted(ctx context.Context, task metadata.Task, workerID string) error {
 	s.workflowMu.Lock()
 	defer s.workflowMu.Unlock()
@@ -1080,6 +1185,9 @@ func (s *Service) markWorkflowStepStarted(ctx context.Context, task metadata.Tas
 	})
 	return err
 }
+
+// completeWorkflowStep records step success or failure, decides whether more steps
+// should be scheduled, and applies retry limits for failed steps.
 func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (bool, error) {
 	s.workflowMu.Lock()
 	defer s.workflowMu.Unlock()
@@ -1184,6 +1292,9 @@ func (s *Service) completeWorkflowStep(ctx context.Context, task metadata.Task, 
 	}
 	return false, nil
 }
+
+// completeWorkflow materializes the workflow result from the configured result step
+// and records the WorkflowCompleted event.
 func (s *Service) completeWorkflow(ctx context.Context, state workflow.State) error {
 	resultStep, ok := state.Step(state.Definition.ResultStepID)
 	if !ok {
@@ -1235,6 +1346,8 @@ func (s *Service) completeWorkflow(ctx context.Context, state workflow.State) er
 	}
 	return err
 }
+
+// failWorkflow records and materializes terminal workflow failure.
 func (s *Service) failWorkflow(ctx context.Context, state workflow.State, taskErr string) error {
 	now := workflow.NowMs()
 	payload, _ := workflow.MarshalEventPayload(workflow.EventPayload{
@@ -1259,6 +1372,8 @@ func (s *Service) failWorkflow(ctx context.Context, state workflow.State, taskEr
 	return err
 }
 
+// materializeResult keeps small results inline and spills large results to the
+// configured object store, returning either inline JSON or a reference.
 func (s *Service) materializeResult(ctx context.Context, namespace string, resultJSON []byte) (json.RawMessage, string, error) {
 	if len(resultJSON) > s.resultInlineThreshold && s.resultStore != nil {
 		ref, err := objectstore.PutBytes(ctx, s.resultStore, namespace, resultJSON)
@@ -1270,6 +1385,7 @@ func (s *Service) materializeResult(ctx context.Context, namespace string, resul
 	return append([]byte(nil), resultJSON...), "", nil
 }
 
+// LoadResult fetches a result reference from the configured object store.
 func (s *Service) LoadResult(ref string) ([]byte, error) {
 	if s.resultStore == nil {
 		return nil, errors.New("result store is not configured")
@@ -1277,13 +1393,17 @@ func (s *Service) LoadResult(ref string) ([]byte, error) {
 	return objectstore.GetBytes(context.Background(), s.resultStore, ref, -1)
 }
 
+// workflowDone reports whether every workflow step has succeeded.
 func workflowDone(state workflow.State) bool {
 	return state.AllStepsSucceeded()
 }
+
+// isTerminalTaskStatus reports whether a task status can no longer be leased.
 func isTerminalTaskStatus(status logservepb.TaskStatus) bool {
 	return status == logservepb.TaskStatus_TASK_STATUS_SUCCEEDED || status == logservepb.TaskStatus_TASK_STATUS_FAILED
 }
 
+// taskStatusResponse converts metadata task state into the public RPC response.
 func taskStatusResponse(task metadata.Task) *logservepb.GetTaskStatusResponse {
 	return &logservepb.GetTaskStatusResponse{
 		TaskId:      task.TaskID,
@@ -1296,6 +1416,7 @@ func taskStatusResponse(task metadata.Task) *logservepb.GetTaskStatusResponse {
 	}
 }
 
+// workflowStepDependsOn returns a copy of the dependency IDs for response shaping.
 func workflowStepDependsOn(def workflow.Definition, stepID string) []string {
 	step, ok := workflow.StepDefinitionByID(def, stepID)
 	if !ok || len(step.DependsOn) == 0 {
@@ -1304,6 +1425,8 @@ func workflowStepDependsOn(def workflow.Definition, stepID string) []string {
 	return append([]string(nil), step.DependsOn...)
 }
 
+// workflowStatusResponse converts workflow metadata into the public RPC response
+// while copying byte slices so callers cannot mutate internal state.
 func workflowStatusResponse(state workflow.State) *logservepb.GetWorkflowStatusResponse {
 	stepStates := state.StepStatesInOrder()
 	steps := make([]*logservepb.WorkflowStepState, 0, len(stepStates))
@@ -1337,6 +1460,9 @@ func workflowStatusResponse(state workflow.State) *logservepb.GetWorkflowStatusR
 		LatencyMs:     workflow.WorkflowLatencyMs(state),
 	}
 }
+
+// cloneSpec deep-copies mutable TaskSpec byte fields before specs enter shared
+// metadata, logs, queues, or worker responses.
 func cloneSpec(spec *logservepb.TaskSpec) *logservepb.TaskSpec {
 	if spec == nil {
 		return nil
@@ -1370,22 +1496,28 @@ func cloneSpec(spec *logservepb.TaskSpec) *logservepb.TaskSpec {
 	}
 }
 
+// newTaskID returns a log-friendly random task identifier.
 func newTaskID() string {
 	return "task-" + randomHex()
 }
 
+// newWorkflowID returns a log-friendly random workflow identifier.
 func newWorkflowID() string {
 	return "wf-" + randomHex()
 }
 
+// newActorID returns a log-friendly random actor identifier.
 func newActorID() string {
 	return "actor-" + randomHex()
 }
 
+// newActorCallID returns a log-friendly random actor call identifier.
 func newActorCallID() string {
 	return "actor-call-" + randomHex()
 }
 
+// randomHex returns 64 bits of random hex, falling back to a timestamp-derived
+// value only if the OS random source fails.
 func randomHex() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -1394,18 +1526,22 @@ func randomHex() string {
 	return hex.EncodeToString(b[:])
 }
 
+// taskStream maps a task ID to its durable log stream name.
 func taskStream(taskID string) string {
 	return "task:" + taskID
 }
 
+// workflowStream maps a workflow ID to its durable log stream name.
 func workflowStream(workflowID string) string {
 	return "wf:" + workflowID
 }
 
+// actorStream maps an actor ID to its durable log stream name.
 func actorStream(actorID string) string {
 	return "actor:" + actorID
 }
 
+// sortedWorkers returns a deterministic worker order without mutating the caller slice.
 func sortedWorkers(workers []metadata.Worker) []metadata.Worker {
 	out := append([]metadata.Worker(nil), workers...)
 	sort.Slice(out, func(i, j int) bool {

@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+// TestChecksumTypesAgreeWithChunkedPath verifies that every checksum type used by
+// the store produces identical values through one-shot and chunked helpers.
 func TestChecksumTypesAgreeWithChunkedPath(t *testing.T) {
 	payload := bytes.Repeat([]byte("chunked-checksum"), 8<<10)
 	for _, typ := range []ChecksumType{ChecksumTypeIEEE, ChecksumTypeCRC32C, ChecksumTypeXXH3, ChecksumTypeNone} {
@@ -31,6 +33,8 @@ func TestChecksumTypesAgreeWithChunkedPath(t *testing.T) {
 	}
 }
 
+// TestChecksumChunkedMatchesSingleShotForCRC32C covers the large-payload CRC32C
+// path used by streaming record verification.
 func TestChecksumChunkedMatchesSingleShotForCRC32C(t *testing.T) {
 	payload := bytes.Repeat([]byte("a"), checksumChunkSize*2+17)
 	single, err := checksumOnce(payload, ChecksumTypeCRC32C)
@@ -46,6 +50,8 @@ func TestChecksumChunkedMatchesSingleShotForCRC32C(t *testing.T) {
 	}
 }
 
+// TestVerifyChecksumDetectsCorruption ensures payload mutation is rejected by
+// checksum verification.
 func TestVerifyChecksumDetectsCorruption(t *testing.T) {
 	payload := []byte("payload-body")
 	sum, err := checksum(payload, ChecksumTypeCRC32C)
@@ -62,6 +68,8 @@ func TestVerifyChecksumDetectsCorruption(t *testing.T) {
 	}
 }
 
+// TestValidateChecksumTypeRejectsUnknown locks down validation for unsupported
+// on-disk checksum identifiers.
 func TestValidateChecksumTypeRejectsUnknown(t *testing.T) {
 	if err := validateChecksumType(ChecksumType(99)); err == nil {
 		t.Fatal("expected unsupported checksum type error")

@@ -1,5 +1,7 @@
 package objectstore
 
+// This file tests local and S3-compatible object-store behavior without
+// requiring an external object-store service.
 import (
 	"bytes"
 	"context"
@@ -14,6 +16,8 @@ import (
 	"testing"
 )
 
+// TestLocalPutGetBytesAndNoTempLeak verifies local content-addressed idempotency,
+// byte round-trips, and temp-file cleanup.
 func TestLocalPutGetBytesAndNoTempLeak(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -49,6 +53,8 @@ func TestLocalPutGetBytesAndNoTempLeak(t *testing.T) {
 	}
 }
 
+// TestLocalGetBytesLimitAndEscape verifies read-size enforcement and local ref
+// path traversal rejection.
 func TestLocalGetBytesLimitAndEscape(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenLocal(t.TempDir())
@@ -67,6 +73,8 @@ func TestLocalGetBytesLimitAndEscape(t *testing.T) {
 	}
 }
 
+// TestS3PutEnsuresBucketOnceAndSendsChecksumMetadata verifies bucket creation is
+// guarded by sync.Once and single PUTs include checksum metadata.
 func TestS3PutEnsuresBucketOnceAndSendsChecksumMetadata(t *testing.T) {
 	ctx := context.Background()
 	payload := []byte("def add(a, b):\n    return a + b\n")
@@ -141,6 +149,8 @@ func TestS3PutEnsuresBucketOnceAndSendsChecksumMetadata(t *testing.T) {
 	}
 }
 
+// TestS3MultipartUploadUsesParts verifies payloads above threshold use multipart
+// upload, per-part checksums, and final completion XML.
 func TestS3MultipartUploadUsesParts(t *testing.T) {
 	ctx := context.Background()
 	payload := bytes.Repeat([]byte("x"), 6<<20)

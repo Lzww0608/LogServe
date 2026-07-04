@@ -1,3 +1,5 @@
+// Workflow detail route for live DAG status, replay, and metadata consistency.
+
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
 import { parseEventData, type SSEMessage } from "../api/events";
@@ -15,6 +17,7 @@ import { formatTime } from "../utils/format";
 import { roleAtLeast } from "../utils/roles";
 import { errorMessage } from "../utils/status";
 
+// Render workflow detail, live step deltas, and replay consistency output.
 export function WorkflowDetailPage({ workflowID, session }: { workflowID: string; session?: ConsoleSession | null }) {
   const [workflow, setWorkflow] = useState<Workflow>();
   const [error, setError] = useState("");
@@ -28,6 +31,7 @@ export function WorkflowDetailPage({ workflowID, session }: { workflowID: string
     setReplay(null);
     setMessage("");
   }, [workflowID]);
+  // Apply workflow SSE deltas to the current workflow detail state.
   const handleMessage = useCallback((event: SSEMessage) => {
     if (event.event !== "workflow") return;
     const payload = parseEventData<{ workflow: Workflow }>(event);
@@ -36,6 +40,7 @@ export function WorkflowDetailPage({ workflowID, session }: { workflowID: string
   }, []);
   useEventStream({ stream: `wf:${workflowID}`, intervalMs: 1000 }, { onMessage: handleMessage, onError: setError }, [workflowID]);
 
+  // Request workflow replay and update the detail view with replayed metadata.
   const runReplay = async () => {
     if (!canReplay) {
       setMessage("Operator role is required to replay workflows.");
@@ -83,6 +88,7 @@ export function WorkflowDetailPage({ workflowID, session }: { workflowID: string
   );
 }
 
+// Render replay consistency status with the raw replay payload.
 function ReplaySummary({ replay }: { replay: unknown }) {
   const consistent = replayConsistency(replay);
   return (
@@ -96,6 +102,7 @@ function ReplaySummary({ replay }: { replay: unknown }) {
   );
 }
 
+// Recover the optional replay consistency flag from an unknown response shape.
 function replayConsistency(value: unknown): boolean | undefined {
   if (typeof value !== "object" || value === null || !("consistent_with_metadata" in value)) return undefined;
   const consistent = (value as { consistent_with_metadata?: unknown }).consistent_with_metadata;

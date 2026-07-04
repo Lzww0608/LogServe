@@ -1,5 +1,8 @@
 package webapi
 
+// This file exposes the function registry stream through list/detail HTTP
+// endpoints and maintains a small tailing cache for system:functions records.
+
 import (
 	"encoding/json"
 	"fmt"
@@ -12,6 +15,8 @@ import (
 
 const functionRegistryStreamID = "system:functions"
 
+// FunctionDTO describes a registered function source as discovered from the
+// system:functions log stream.
 type FunctionDTO struct {
 	FunctionHash string `json:"function_hash"`
 	SourceRef    string `json:"source_ref"`
@@ -20,11 +25,15 @@ type FunctionDTO struct {
 	TimestampMs  int64  `json:"timestamp_ms,omitempty"`
 }
 
+// functionRegistrySnapshot holds the sorted function list plus malformed record
+// count for diagnostics.
 type functionRegistrySnapshot struct {
 	Functions      []FunctionDTO
 	InvalidRecords uint64
 }
 
+// functionRegistryCache tails the function registry stream incrementally and
+// stores the latest record for each function hash.
 type functionRegistryCache struct {
 	mu             sync.Mutex
 	byHash         map[string]FunctionDTO
@@ -32,10 +41,13 @@ type functionRegistryCache struct {
 	invalidRecords uint64
 }
 
+// newFunctionRegistryCache initializes stream tailing from sequence 1.
 func newFunctionRegistryCache() *functionRegistryCache {
 	return &functionRegistryCache{byHash: make(map[string]FunctionDTO), nextSeq: 1}
 }
 
+// handleListFunctions returns cached function registry entries and includes an
+// invalid-record counter when malformed log events were skipped.
 func (s *Server) handleListFunctions(w http.ResponseWriter, r *http.Request) {
 	snapshot, err := s.functionRegistry(r)
 	if err != nil {
@@ -49,6 +61,7 @@ func (s *Server) handleListFunctions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, payload)
 }
 
+// handleGetFunction returns one function registry entry by hash.
 func (s *Server) handleGetFunction(w http.ResponseWriter, r *http.Request) {
 	functionHash := r.PathValue("function_hash")
 	if functionHash == "" {
@@ -69,6 +82,8 @@ func (s *Server) handleGetFunction(w http.ResponseWriter, r *http.Request) {
 	writeErr(w, fmt.Errorf("function %s not found", functionHash))
 }
 
+// functionRegistry tails system:functions from the cached next sequence, ignores
+// malformed FunctionRegistered records, and returns entries sorted newest first.
 func (s *Server) functionRegistry(r *http.Request) (functionRegistrySnapshot, error) {
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
 	defer cancel()
@@ -120,6 +135,8 @@ func (s *Server) functionRegistry(r *http.Request) (functionRegistrySnapshot, er
 			cache.byHash[function.FunctionHash] = function
 		}
 		nextSeq := batch[len(batch)-1].GetSeq() + 1
+		// Defensive stop: a non-increasing sequence would otherwise make the tail loop
+		// repeat forever on corrupt or unusual log-service output.
 		if nextSeq <= fromSeq {
 			break
 		}

@@ -1,3 +1,5 @@
+// Role-aware mock web API used by Playwright browser tests.
+
 import http from "node:http";
 
 const port = Number(process.env.LOGSERVE_MOCK_API_PORT ?? 43080);
@@ -40,6 +42,7 @@ const logStats = {
   "actor:actor-1": { stream_id: "actor:actor-1", first_seq: 1, next_seq: 2, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 }
 };
 
+// Serve deterministic mock API responses for the browser test suite.
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
   if (!url.pathname.startsWith("/api")) {
@@ -65,6 +68,7 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname.startsWith("/api/templates/") && url.pathname.endsWith("/run") && request.method === "POST") {
     const templateID = decodeURIComponent(url.pathname.split("/")[3] ?? "add_task");
     const template = templates.find((item) => item.id === templateID) ?? templates[0];
+    // Browser tests rely on this denial path to prove viewer/operator role gates are visible.
     if (!roleAtLeast(roleFromRequest(request), template.required_role)) {
       writeJSON(response, 403, { error: { code: "PERMISSION_DENIED", message: "insufficient role for this template" } });
       return;
@@ -230,6 +234,7 @@ server.listen(port, "127.0.0.1", () => {
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
 process.on("SIGINT", () => server.close(() => process.exit(0)));
 
+// Build a representative task detail fixture for list, detail, and action tests.
 function taskDetail(taskID, status = "SUCCEEDED") {
   return {
     task_id: taskID,
@@ -242,6 +247,7 @@ function taskDetail(taskID, status = "SUCCEEDED") {
   };
 }
 
+// Build a representative workflow fixture with steps for DAG tests.
 function workflowDetail(workflowID) {
   return {
     workflow_id: workflowID || "wf-1",
@@ -263,6 +269,7 @@ function workflowDetail(workflowID) {
   };
 }
 
+// Apply the same offset-token pagination shape used by the web API.
 function paginated(url, rows, key) {
   const limit = positiveInt(url.searchParams.get("limit"), 50);
   const offset = positiveInt(url.searchParams.get("page_token"), 0);
@@ -276,10 +283,12 @@ function paginated(url, rows, key) {
   };
 }
 
+// Parse mock query integers while falling back for invalid pagination values.
 function positiveInt(value, fallback) {
   const parsed = Number(value ?? "");
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+// Send a no-store JSON response from the mock server.
 function writeJSON(response, status, payload) {
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -288,6 +297,7 @@ function writeJSON(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
+// Send one SSE event and close the mock stream for deterministic tests.
 function writeSSE(response, event, payload) {
   response.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -297,6 +307,7 @@ function writeSSE(response, event, payload) {
   response.end(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
 }
 
+// Read and parse a mock request JSON body, tolerating empty or invalid input.
 function readJSON(request) {
   return new Promise((resolve) => {
     let body = "";
@@ -313,6 +324,7 @@ function readJSON(request) {
     });
   });
 }
+// Map browser test bearer tokens to the frontend roles exercised by permission tests.
 function roleFromRequest(request) {
   const value = String(request.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
   if (value === "viewer-token") return "viewer";
@@ -320,6 +332,7 @@ function roleFromRequest(request) {
   return "admin";
 }
 
+// Return the mock session permissions that mirror viewer/operator/admin UI gates.
 function permissionsForRole(role) {
   const permissions = ["read:dashboard", "read:tasks", "read:workflows", "read:logs", "read:templates"];
   if (roleAtLeast(role, "operator")) permissions.push("submit:tasks", "submit:workflows", "call:actors", "replay", "set:scheduling", "run:templates");
@@ -327,6 +340,7 @@ function permissionsForRole(role) {
   return permissions;
 }
 
+// Compare mock roles using the same rank semantics as the console UI.
 function roleAtLeast(role, minimum) {
   const ranks = { viewer: 1, operator: 2, admin: 3 };
   return (ranks[role] ?? 0) >= (ranks[minimum] ?? 0);

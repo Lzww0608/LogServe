@@ -1,3 +1,5 @@
+// Browser-side DTO types that mirror the web API JSON contract.
+
 export type ConsoleRole = "viewer" | "operator" | "admin";
 
 export interface ConsoleSession {

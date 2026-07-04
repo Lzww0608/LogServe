@@ -12,21 +12,25 @@ import (
 	"google.golang.org/grpc"
 )
 
+// llmStatsProbeLogClient detects accidental LLM stream scans during scheduling.
 type llmStatsProbeLogClient struct {
 	acceptingLogClient
 	listStreamsCalls atomic.Int64
 }
 
+// ListStreams counts calls so predicted scheduling can assert it uses materialized stats.
 func (c *llmStatsProbeLogClient) ListStreams(context.Context, *logservepb.ListStreamsRequest, ...grpc.CallOption) (*logservepb.ListStreamsResponse, error) {
 	c.listStreamsCalls.Add(1)
 	return &logservepb.ListStreamsResponse{}, nil
 }
 
+// llmBootstrapLogClient serves fixed LLM streams for stats bootstrap tests.
 type llmBootstrapLogClient struct {
 	acceptingLogClient
 	records map[string][]*logservepb.LogRecord
 }
 
+// ListStreams returns only synthetic LLM streams for llm: prefix scans.
 func (c llmBootstrapLogClient) ListStreams(_ context.Context, req *logservepb.ListStreamsRequest, _ ...grpc.CallOption) (*logservepb.ListStreamsResponse, error) {
 	if req.GetPrefix() != "llm:" {
 		return &logservepb.ListStreamsResponse{}, nil
@@ -38,6 +42,7 @@ func (c llmBootstrapLogClient) ListStreams(_ context.Context, req *logservepb.Li
 	return &logservepb.ListStreamsResponse{StreamIds: streams}, nil
 }
 
+// ReadLog returns synthetic LLM records when replay starts at the stream base.
 func (c llmBootstrapLogClient) ReadLog(_ context.Context, req *logservepb.ReadLogRequest, _ ...grpc.CallOption) (*logservepb.ReadLogResponse, error) {
 	records := c.records[req.GetStreamId()]
 	if req.GetFromSeq() > 1 {
@@ -46,6 +51,8 @@ func (c llmBootstrapLogClient) ReadLog(_ context.Context, req *logservepb.ReadLo
 	return &logservepb.ReadLogResponse{Records: records}, nil
 }
 
+// TestPredictedLatencySchedulerUsesMaterializedStatsWithoutListingLLMStreams ensures
+// predicted scheduling does not scan log streams on the hot assignment path.
 func TestPredictedLatencySchedulerUsesMaterializedStatsWithoutListingLLMStreams(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	logClient := &llmStatsProbeLogClient{}
@@ -122,6 +129,8 @@ func TestPredictedLatencySchedulerUsesMaterializedStatsWithoutListingLLMStreams(
 	}
 }
 
+// TestBootstrapLLMStatsRebuildsMaterializedStatsFromCompletionEvents verifies LLM
+// completion replay rebuilds latency/cache metrics.
 func TestBootstrapLLMStatsRebuildsMaterializedStatsFromCompletionEvents(t *testing.T) {
 	payload := mustMarshalLLMStatsPayload(t, map[string]any{
 		"task_id":             "task-bootstrap",
@@ -158,6 +167,8 @@ func TestBootstrapLLMStatsRebuildsMaterializedStatsFromCompletionEvents(t *testi
 	}
 }
 
+// TestBootstrapLLMStatsIsIdempotentWhenCalledMoreThanOnce verifies bootstrap resets
+// stats before replay so repeated calls do not double count.
 func TestBootstrapLLMStatsIsIdempotentWhenCalledMoreThanOnce(t *testing.T) {
 	payload := mustMarshalLLMStatsPayload(t, map[string]any{
 		"task_id":          "task-bootstrap-idempotent",
@@ -189,6 +200,8 @@ func TestBootstrapLLMStatsIsIdempotentWhenCalledMoreThanOnce(t *testing.T) {
 	}
 }
 
+// TestCompleteTaskDoesNotDoubleCountLLMStatsForDuplicateCompletion protects the
+// terminal-task fast path from folding LLM stats twice.
 func TestCompleteTaskDoesNotDoubleCountLLMStatsForDuplicateCompletion(t *testing.T) {
 	payload := mustMarshalLLMStatsPayload(t, map[string]any{
 		"task_id":          "task-llm-duplicate",
@@ -239,6 +252,7 @@ func TestCompleteTaskDoesNotDoubleCountLLMStatsForDuplicateCompletion(t *testing
 	}
 }
 
+// mustMarshalLLMStatsPayload marshals synthetic LLM event payloads for tests.
 func mustMarshalLLMStatsPayload(t *testing.T, value map[string]any) []byte {
 	t.Helper()
 	data, err := json.Marshal(value)

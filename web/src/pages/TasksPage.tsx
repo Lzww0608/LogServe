@@ -1,3 +1,5 @@
+// Task list route with filters and token-based pagination.
+
 import { useEffect, useMemo, useState } from "react";
 import { api, type TaskListQuery } from "../api/client";
 import { ErrorPanel } from "../components/ErrorPanel";
@@ -8,6 +10,7 @@ import { roleAtLeast } from "../utils/roles";
 
 const defaultPageSize = 50;
 
+// Render task filters and token-based list pagination.
 export function TasksPage({ session }: { session?: ConsoleSession | null }) {
   const initialFilters = taskFiltersFromSearch();
   const [query, setQuery] = useState(initialFilters.query);
@@ -16,6 +19,7 @@ export function TasksPage({ session }: { session?: ConsoleSession | null }) {
   const [workflowID, setWorkflowID] = useState(initialFilters.workflowID);
   const [pageSize, setPageSize] = useState(initialFilters.pageSize);
   const [pageIndex, setPageIndex] = useState(0);
+  // Keep previously returned page tokens so Previous can work with token-based pagination.
   const [pageTokens, setPageTokens] = useState<string[]>([""]);
 
   const trimmedQuery = query.trim();
@@ -76,12 +80,14 @@ export function TasksPage({ session }: { session?: ConsoleSession | null }) {
   );
 }
 
+// Format a paginated task range from offset-style page state.
 function pageLabel(itemName: string, pageIndex: number, pageSize: number, rowCount: number, totalCount?: number): string {
   if (rowCount === 0) return totalCount === 0 ? `0 ${itemName}` : `No ${itemName}`;
   const start = pageIndex * pageSize + 1;
   const end = start + rowCount - 1;
   return totalCount === undefined ? `${start}-${end} ${itemName}` : `${start}-${end} of ${totalCount} ${itemName}`;
 }
+// Seed task filters and page size from the current URL query string.
 function taskFiltersFromSearch() {
   const params = new URLSearchParams(window.location.search);
   const limit = Number(params.get("limit") ?? defaultPageSize);

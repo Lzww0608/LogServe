@@ -1,3 +1,5 @@
+// Small path router for the single-page LogServe console.
+
 import { ActorDetailPage } from "./pages/ActorDetailPage";
 import { ActorsPage } from "./pages/ActorsPage";
 import { AdminPage } from "./pages/AdminPage";
@@ -17,6 +19,7 @@ import { WorkflowDetailPage } from "./pages/WorkflowDetailPage";
 import { WorkflowsPage } from "./pages/WorkflowsPage";
 import type { ConsoleSession } from "./types/logserve";
 
+// Map the current path to the matching route component and pass session context where needed.
 export function renderRoute(path: string, routeKey = path, session?: ConsoleSession | null, onSessionChange?: () => void) {
   if (path === "/") return <OverviewPage key={routeKey} session={session} />;
   if (path === "/submit/task") return <SubmitTaskPage key={routeKey} session={session} />;
@@ -37,6 +40,7 @@ export function renderRoute(path: string, routeKey = path, session?: ConsoleSess
   return <NotFoundPage key={routeKey} />;
 }
 
+// Derive the top-bar title from static and detail route patterns.
 export function pathTitle(path: string) {
   if (path === "/") return "Overview";
   if (path.startsWith("/tasks/")) return "Task Detail";

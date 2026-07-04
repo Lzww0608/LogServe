@@ -1,3 +1,6 @@
+// Package logstore implements the local append-only log used by LogServe.
+// It owns segment files, per-stream indexes, logical retention, recovery,
+// duplicate suppression, optional mmap reads, and segment compaction.
 package logstore
 
 import (
@@ -44,9 +47,17 @@ const (
 	retentionFileName                         = "retention.json"
 )
 
+// errCorruptRecord marks a record that fails magic, version, length, or checksum
+// validation during recovery or indexed reads.
 var errCorruptRecord = errors.New("corrupt log record")
+
+// errCorruptIndex marks an index file whose structure or coverage cannot be
+// trusted; recovery falls back to scanning log segments when possible.
 var errCorruptIndex = errors.New("corrupt index")
 var indexCRCTable = crc32.MakeTable(crc32.Castagnoli)
+
+// recordEncodeBufferPool reuses medium-sized encode buffers on append-heavy
+// paths while avoiding retention of very large payload allocations.
 var recordEncodeBufferPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, 0, 64*1024)
@@ -56,6 +67,7 @@ var recordEncodeBufferPool = sync.Pool{
 
 const maxPooledRecordEncodeBuffer = 4 << 20
 
+// FsyncPolicy controls when append and index file writes are flushed to disk.
 type FsyncPolicy string
 
 const (
@@ -64,6 +76,8 @@ const (
 	FsyncInterval FsyncPolicy = "interval"
 )
 
+// Options configures segment sizing, durability policy, read caching, checksum
+// format, mmap reads, and background compaction behavior.
 type Options struct {
 	SegmentSizeBytes                 int64
 	FsyncPolicy                      FsyncPolicy
@@ -76,6 +90,8 @@ type Options struct {
 	MmapRead                         bool
 }
 
+// DefaultOptions returns conservative store defaults: CRC32C records, fsync on
+// each append, and bounded reader caching.
 func DefaultOptions() Options {
 	return Options{
 		SegmentSizeBytes:                 defaultSegmentSizeBytes,
@@ -88,6 +104,8 @@ func DefaultOptions() Options {
 	}
 }
 
+// normalize fills defaults, applies the mmap environment override, and rejects
+// invalid durability, checksum, or compaction settings before opening files.
 func (opts Options) normalize() (Options, error) {
 	if opts.SegmentSizeBytes <= 0 {
 		opts.SegmentSizeBytes = defaultSegmentSizeBytes
@@ -122,6 +140,8 @@ func (opts Options) normalize() (Options, error) {
 	if err := validateChecksumType(opts.ChecksumType); err != nil {
 		return Options{}, err
 	}
+	// The environment flag can only enable mmap reads; explicit false remains useful
+	// in code when the process environment is unset.
 	opts.MmapRead = opts.MmapRead || mmapReadFromEnv()
 	switch opts.FsyncPolicy {
 	case FsyncAlways, FsyncBatch, FsyncInterval:
@@ -131,6 +151,8 @@ func (opts Options) normalize() (Options, error) {
 	}
 }
 
+// Store is the single-process durable log. All mutable state below is guarded by
+// mu unless a helper name explicitly documents a locked precondition.
 type Store struct {
 	mu                 sync.Mutex
 	dir                string
@@ -148,6 +170,8 @@ type Store struct {
 	compactorDone      chan struct{}
 }
 
+// streamState tracks one stream's next sequence number, logical trim watermark,
+// and sorted physical index entries.
 type streamState struct {
 	streamID   string
 	nextSeq    uint64
@@ -155,6 +179,8 @@ type streamState struct {
 	entries    []streamIndexEntry
 }
 
+// streamIndexEntry maps a stream sequence to the byte range of its encoded
+// record inside a segment file.
 type streamIndexEntry struct {
 	Seq       uint64
 	SegmentID uint64
@@ -162,11 +188,15 @@ type streamIndexEntry struct {
 	Length    uint32
 }
 
+// recoveredIndexEntry pairs a stream ID with an index entry while rebuilding or
+// rewriting segment-level index files.
 type recoveredIndexEntry struct {
 	streamID string
 	entry    streamIndexEntry
 }
 
+// segmentReader is the cached reader wrapper with reference counts used to keep
+// compaction from deleting mapped or actively read segments.
 type segmentReader struct {
 	segmentID uint64
 	reader    SegmentReader
@@ -175,19 +205,26 @@ type segmentReader struct {
 	cached    bool
 }
 
+// retentionFile is the JSON snapshot of per-stream logical trim watermarks.
 type retentionFile struct {
 	Streams map[string]retentionStream `json:"streams"`
 }
 
+// retentionStream stores the persisted trim watermark and update timestamp for
+// one stream.
 type retentionStream struct {
 	TrimmedBeforeSeq uint64 `json:"trimmed_before_seq"`
 	UpdatedAtMs      int64  `json:"updated_at_ms"`
 }
 
+// Open creates or recovers a Store in dir using DefaultOptions.
 func Open(dir string) (*Store, error) {
 	return OpenWithOptions(dir, DefaultOptions())
 }
 
+// OpenWithOptions creates or recovers a Store with explicit options. It first
+// reconciles any compaction manifest, then rebuilds in-memory indexes before
+// opening the active segment for appends.
 func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	normalized, err := opts.normalize()
 	if err != nil {
@@ -222,6 +259,8 @@ func OpenWithOptions(dir string, opts Options) (*Store, error) {
 	return s, nil
 }
 
+// Close stops background compaction, flushes active files, and closes cached
+// segment readers. It is safe to call once the store is no longer in use.
 func (s *Store) Close() error {
 	s.stopBackgroundCompactor()
 
@@ -231,6 +270,9 @@ func (s *Store) Close() error {
 	return errors.Join(s.closeActiveFilesLocked(true), s.closeSegmentReadersLocked())
 }
 
+// Append validates and durably appends one record. It assigns the next sequence
+// for the stream, applies idempotency keys, and returns duplicate=true when an
+// earlier append with the same stream/key already exists.
 func (s *Store) Append(req AppendRequest) (Record, bool, error) {
 	if req.StreamID == "" {
 		return Record{}, false, errors.New("stream_id is required")
@@ -242,6 +284,8 @@ func (s *Store) Append(req AppendRequest) (Record, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Idempotency is checked under the store lock before assigning a new sequence so
+	// duplicate retries cannot create gaps or extra records.
 	if req.IdempotencyKey != "" {
 		if existing, ok := s.idempotency[idempotencyKey(req.StreamID, req.IdempotencyKey)]; ok {
 			return cloneRecord(existing), true, nil
@@ -299,6 +343,8 @@ func (s *Store) Append(req AppendRequest) (Record, bool, error) {
 	return rec, false, nil
 }
 
+// Read returns a cloned batch of records from one stream. A non-positive limit
+// uses the small default batch size expected by unary RPC callers.
 func (s *Store) Read(streamID string, fromSeq uint64, limit int) ([]Record, error) {
 	if limit <= 0 {
 		limit = 100
@@ -314,6 +360,8 @@ func (s *Store) Read(streamID string, fromSeq uint64, limit int) ([]Record, erro
 	return out, nil
 }
 
+// ReadEach snapshots matching index entries under lock, then releases the lock
+// while reading files and invoking emit so callbacks do not block appends.
 func (s *Store) ReadEach(streamID string, fromSeq uint64, limit int, emit func(Record) error) error {
 	if streamID == "" {
 		return errors.New("stream_id is required")
@@ -340,6 +388,8 @@ func (s *Store) ReadEach(streamID string, fromSeq uint64, limit int, emit func(R
 			end = min(start+limit, len(entries))
 		}
 		if start < end {
+			// Copy the selected index window before unlocking; compaction may rewrite stream
+			// entry slices after this point.
 			selected = append([]streamIndexEntry(nil), entries[start:end]...)
 		}
 	}
@@ -405,6 +455,8 @@ func (s *Store) ReadRawEach(streamID string, fromSeq uint64, limit int, emit fun
 			s.mu.Unlock()
 			return nil
 		}
+		// Freeze the stream high-water mark on the first batch so a raw scan observes a
+		// stable prefix even if concurrent appends add later records.
 		if !snapshotInitialized {
 			if state.trimBefore > nextSeq {
 				nextSeq = state.trimBefore
@@ -468,6 +520,8 @@ func (s *Store) ReadRawEach(streamID string, fromSeq uint64, limit int, emit fun
 	}
 }
 
+// Trim advances a stream's logical retention watermark. It does not delete bytes
+// directly; compaction later reclaims records below beforeSeq.
 func (s *Store) Trim(streamID string, beforeSeq uint64) (TrimStats, error) {
 	if streamID == "" {
 		return TrimStats{}, errors.New("stream_id is required")
@@ -502,6 +556,8 @@ func (s *Store) Trim(streamID string, beforeSeq uint64) (TrimStats, error) {
 	return s.streamStatsLocked(streamID), nil
 }
 
+// Stats returns sorted retention and compactability summaries for the selected
+// stream or prefix.
 func (s *Store) Stats(streamID, prefix string) []TrimStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -530,6 +586,8 @@ func (s *Store) Stats(streamID, prefix string) []TrimStats {
 	return out
 }
 
+// ListStreams returns sorted stream IDs that still have live index entries and
+// match the optional prefix.
 func (s *Store) ListStreams(prefix string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -547,6 +605,9 @@ func (s *Store) ListStreams(prefix string) []string {
 	return out
 }
 
+// recover rebuilds in-memory indexes from persisted segment metadata. It prefers
+// valid index files for speed and falls back to scanning log files when indexes
+// are missing, corrupt, or legacy.
 func (s *Store) recover() error {
 	segmentIDs, err := discoverSegmentIDs(s.dir, ".log")
 	if err != nil {
@@ -558,6 +619,8 @@ func (s *Store) recover() error {
 		return s.rewriteIndex()
 	}
 
+	// Fast recovery trusts index files only after coverage validation confirms that
+	// their byte ranges exactly cover every segment.
 	loadedFromIndex, usedLegacyIndex, err := s.loadFromIndexFiles(segmentIDs)
 	if err == nil && loadedFromIndex {
 		if usedLegacyIndex {
@@ -566,6 +629,8 @@ func (s *Store) recover() error {
 		return nil
 	}
 
+	// Any index-load failure discards partially hydrated state before replaying the
+	// authoritative log bytes.
 	s.resetRecoveredState()
 	for _, segmentID := range segmentIDs {
 		size, err := s.recoverSegment(segmentID)
@@ -579,6 +644,9 @@ func (s *Store) recover() error {
 	return s.rewriteIndex()
 }
 
+// loadFromIndexFiles hydrates stream indexes from all segment index files. The
+// boolean return distinguishes missing index files, legacy index formats, and
+// hard corruption.
 func (s *Store) loadFromIndexFiles(segmentIDs []uint64) (bool, bool, error) {
 	usedLegacyIndex := false
 	bySegment := make(map[uint64][]recoveredIndexEntry, len(segmentIDs))
@@ -623,11 +691,15 @@ func (s *Store) loadFromIndexFiles(segmentIDs []uint64) (bool, bool, error) {
 	return true, usedLegacyIndex, nil
 }
 
+// resetRecoveredState clears recovery-built indexes before the slower log scan
+// path repopulates them from scratch.
 func (s *Store) resetRecoveredState() {
 	s.streams = make(map[string]*streamState)
 	s.idempotency = make(map[string]Record)
 }
 
+// streamStateLocked returns or creates the state bucket for a stream. The caller
+// must hold s.mu or be in single-threaded open/recovery setup.
 func (s *Store) streamStateLocked(streamID string) *streamState {
 	state := s.streams[streamID]
 	if state == nil {
@@ -637,6 +709,8 @@ func (s *Store) streamStateLocked(streamID string) *streamState {
 	return state
 }
 
+// sortStreamEntries restores sequence order after recovery, which may discover
+// records by physical segment order rather than stream order.
 func (s *Store) sortStreamEntries() {
 	for _, state := range s.streams {
 		sort.Slice(state.entries, func(i, j int) bool {
@@ -645,6 +719,8 @@ func (s *Store) sortStreamEntries() {
 	}
 }
 
+// validateIndexedSegmentCoverage verifies that index entries form a contiguous
+// byte-for-byte cover of the segment file. Gaps or overrun force log replay.
 func validateIndexedSegmentCoverage(dir string, segmentID uint64, items []recoveredIndexEntry) error {
 	info, err := os.Stat(segmentPath(dir, segmentID, ".log"))
 	if err != nil {
@@ -666,6 +742,8 @@ func validateIndexedSegmentCoverage(dir string, segmentID uint64, items []recove
 	return nil
 }
 
+// hydrateIdempotencyFromIndex re-reads indexed records in physical order so the
+// duplicate map reflects the latest surviving record for each stream/key pair.
 func (s *Store) hydrateIdempotencyFromIndex(bySegment map[uint64][]recoveredIndexEntry, segmentIDs []uint64) error {
 	for _, segmentID := range segmentIDs {
 		items := bySegment[segmentID]
@@ -693,6 +771,9 @@ func (s *Store) hydrateIdempotencyFromIndex(bySegment map[uint64][]recoveredInde
 	return nil
 }
 
+// readSegmentIndex dispatches between current dictionary indexes, legacy binary
+// indexes, and the oldest JSON-line index format. The legacy flag asks recovery
+// to rewrite indexes after successful load.
 func readSegmentIndex(path string, segmentID uint64) ([]recoveredIndexEntry, bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -709,6 +790,8 @@ func readSegmentIndex(path string, segmentID uint64) ([]recoveredIndexEntry, boo
 	}
 
 	reader := bufio.NewReader(file)
+	// A four-byte probe keeps backward compatibility with pre-magic JSON indexes
+	// without consuming bytes from the buffered reader.
 	probe, err := reader.Peek(4)
 	if err != nil {
 		return nil, false, errCorruptIndex
@@ -733,6 +816,8 @@ func readSegmentIndex(path string, segmentID uint64) ([]recoveredIndexEntry, boo
 	return items, true, err
 }
 
+// readDictionarySegmentIndex decodes the current compact index format: a stream
+// dictionary followed by fixed-size entries and protected by one CRC32C.
 func readDictionarySegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndexEntry, error) {
 	header := make([]byte, indexFileHeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -770,6 +855,8 @@ func readDictionarySegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndex
 	if entryBytes%indexFixedEntrySize != 0 || uint64(entryBytes/indexFixedEntrySize) != entryCount {
 		return nil, errCorruptIndex
 	}
+	// The checksum covers the header fields except the checksum slot plus the whole
+	// payload, making dictionary and fixed-entry corruption detectable together.
 	expectedCRC := crc32.Checksum(header[:36], indexCRCTable)
 	expectedCRC = crc32.Update(expectedCRC, indexCRCTable, payload)
 	if actualCRC != expectedCRC {
@@ -827,6 +914,8 @@ func readDictionarySegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndex
 	return items, nil
 }
 
+// readLegacyBinarySegmentIndex reads the v1 per-entry binary index format and
+// returns entries for rewrite into the current dictionary format.
 func readLegacyBinarySegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndexEntry, error) {
 	items := make([]recoveredIndexEntry, 0)
 	for {
@@ -873,6 +962,8 @@ func readLegacyBinarySegmentIndex(r io.Reader, segmentID uint64) ([]recoveredInd
 	}
 }
 
+// readJSONSegmentIndex reads the oldest append-only JSON index format retained
+// for upgrade compatibility.
 func readJSONSegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndexEntry, error) {
 	decoder := json.NewDecoder(r)
 	items := make([]recoveredIndexEntry, 0)
@@ -905,6 +996,8 @@ func readJSONSegmentIndex(r io.Reader, segmentID uint64) ([]recoveredIndexEntry,
 	}
 }
 
+// loadRetention restores logical trim watermarks after index recovery so reads
+// and compaction honor previously trimmed prefixes.
 func (s *Store) loadRetention() error {
 	path := filepath.Join(s.dir, retentionFileName)
 	data, err := os.ReadFile(path)
@@ -931,6 +1024,8 @@ func (s *Store) loadRetention() error {
 	return nil
 }
 
+// persistRetentionLocked writes trim watermarks through a temp file and rename.
+// The caller must hold s.mu because it snapshots stream state.
 func (s *Store) persistRetentionLocked() error {
 	file := retentionFile{Streams: make(map[string]retentionStream, len(s.streams))}
 	now := time.Now().UnixMilli()
@@ -959,6 +1054,8 @@ func (s *Store) persistRetentionLocked() error {
 	return nil
 }
 
+// streamStatsLocked computes a stream summary from entries and trim watermark.
+// The caller must hold s.mu.
 func (s *Store) streamStatsLocked(streamID string) TrimStats {
 	state := s.streams[streamID]
 	trimmedBefore := uint64(0)
@@ -993,6 +1090,8 @@ func (s *Store) streamStatsLocked(streamID string) TrimStats {
 	return stats
 }
 
+// recoverSegment scans one log segment from offset zero, truncating the file at
+// the first unreadable or corrupt tail record to make recovery idempotent.
 func (s *Store) recoverSegment(segmentID uint64) (int64, error) {
 	path := segmentPath(s.dir, segmentID, ".log")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
@@ -1008,6 +1107,8 @@ func (s *Store) recoverSegment(segmentID uint64) (int64, error) {
 			break
 		}
 		if err != nil {
+			// This is recovery's partial-tail rule: bytes after the last valid record are
+			// discarded instead of poisoning the whole segment.
 			if truncateErr := file.Truncate(offset); truncateErr != nil {
 				return 0, truncateErr
 			}
@@ -1040,6 +1141,8 @@ func (s *Store) recoverSegment(segmentID uint64) (int64, error) {
 	return info.Size(), nil
 }
 
+// rewriteIndex replaces all segment index files from the current in-memory
+// stream entries after recovery, legacy upgrade, or log-scan fallback.
 func (s *Store) rewriteIndex() error {
 	indexIDs, err := discoverSegmentIDs(s.dir, ".index")
 	if err != nil {
@@ -1075,6 +1178,8 @@ func (s *Store) rewriteIndex() error {
 	return nil
 }
 
+// segmentIndexEntriesLocked collects all stream entries belonging to one segment
+// for index flush or rewrite. The caller must hold s.mu.
 func (s *Store) segmentIndexEntriesLocked(segmentID uint64) []recoveredIndexEntry {
 	entries := make([]recoveredIndexEntry, 0)
 	for streamID, state := range s.streams {
@@ -1091,6 +1196,8 @@ func (s *Store) segmentIndexEntriesLocked(segmentID uint64) []recoveredIndexEntr
 	return entries
 }
 
+// flushActiveIndexLocked rewrites the active segment index in place before sync
+// or close. The caller must hold s.mu.
 func (s *Store) flushActiveIndexLocked() error {
 	if s.indexFile == nil || s.activeSegmentID == 0 {
 		return nil
@@ -1104,6 +1211,8 @@ func (s *Store) flushActiveIndexLocked() error {
 	return writeSegmentIndex(s.indexFile, s.activeSegmentID, s.segmentIndexEntriesLocked(s.activeSegmentID))
 }
 
+// writeSegmentIndex writes the current dictionary-based segment index. Entries
+// are sorted by physical offset so recovery can validate full segment coverage.
 func writeSegmentIndex(w io.Writer, segmentID uint64, entries []recoveredIndexEntry) error {
 	entries = append([]recoveredIndexEntry(nil), entries...)
 	sort.Slice(entries, func(i, j int) bool {
@@ -1134,6 +1243,8 @@ func writeSegmentIndex(w io.Writer, segmentID uint64, entries []recoveredIndexEn
 	sort.Strings(streamIDs)
 	streamIDsByName := make(map[string]uint32, len(streamIDs))
 
+	// Stream IDs are stored once in a dictionary, then fixed-size entries refer to
+	// dictionary IDs to keep large multi-stream segments compact.
 	var dictionary bytes.Buffer
 	for i, streamID := range streamIDs {
 		streamIDID := uint32(i)
@@ -1176,6 +1287,9 @@ func writeSegmentIndex(w io.Writer, segmentID uint64, entries []recoveredIndexEn
 	return err
 }
 
+// acquireSegmentReader returns a ref-counted reader for a segment. It avoids
+// holding s.mu while opening files, then double-checks the cache to handle races
+// with another reader opener.
 func (s *Store) acquireSegmentReader(segmentID uint64) (*segmentReader, error) {
 	s.mu.Lock()
 	activeSegmentID := s.activeSegmentID
@@ -1207,6 +1321,8 @@ func (s *Store) acquireSegmentReader(segmentID uint64) (*segmentReader, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Another goroutine may have populated the cache while this one opened the file;
+	// close the extra descriptor and reuse the cached reader.
 	if existing := s.segmentReaders[segmentID]; existing != nil {
 		_ = segReader.Close()
 		existing.refs++
@@ -1222,6 +1338,8 @@ func (s *Store) acquireSegmentReader(segmentID uint64) (*segmentReader, error) {
 	return reader, nil
 }
 
+// releaseSegmentReader drops a reader reference and lets the LRU evict idle
+// cached readers when the cache is over capacity.
 func (s *Store) releaseSegmentReader(reader *segmentReader) {
 	if reader == nil {
 		return
@@ -1243,6 +1361,8 @@ func (s *Store) releaseSegmentReader(reader *segmentReader) {
 	s.evictSegmentReadersLocked()
 }
 
+// evictSegmentReadersLocked closes least-recently-used idle readers until the
+// cache fits the configured limit. Busy readers are skipped.
 func (s *Store) evictSegmentReadersLocked() {
 	limit := s.options.SegmentReaderCacheSize
 	if limit <= 0 {
@@ -1270,6 +1390,8 @@ func (s *Store) evictSegmentReadersLocked() {
 	}
 }
 
+// closeSegmentReadersLocked closes all cached segment readers during Store.Close
+// or fatal cleanup. The caller must hold s.mu.
 func (s *Store) closeSegmentReadersLocked() error {
 	var err error
 	for segmentID, reader := range s.segmentReaders {
@@ -1282,11 +1404,15 @@ func (s *Store) closeSegmentReadersLocked() error {
 	return err
 }
 
+// cachedSegmentReaderCount returns the number of cached readers for tests.
 func (s *Store) cachedSegmentReaderCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.segmentReaders)
 }
+
+// readIndexedRawRecordFromReader reads and validates one raw record from an
+// indexed byte range, reusing scratch for payload buffers when possible.
 func readIndexedRawRecordFromReader(reader *segmentReader, streamID string, entry streamIndexEntry, scratch *rawRecordReadScratch) (logrecord.RawRecord, error) {
 	const maxInt64 = uint64(1<<63 - 1)
 	if entry.Offset > maxInt64 {
@@ -1304,6 +1430,8 @@ func readIndexedRawRecordFromReader(reader *segmentReader, streamID string, entr
 	return rec, nil
 }
 
+// readIndexedRecordFromReader reads one indexed record and returns an owned
+// Record copy suitable for callers to retain or mutate.
 func readIndexedRecordFromReader(reader *segmentReader, streamID string, entry streamIndexEntry) (Record, error) {
 	const maxInt64 = uint64(1<<63 - 1)
 	if entry.Offset > maxInt64 {
@@ -1321,19 +1449,25 @@ func readIndexedRecordFromReader(reader *segmentReader, streamID string, entry s
 	return cloneRecord(rec), nil
 }
 
+// readIndexedRecordFromFile adapts an os.File to the shared indexed read path.
 func readIndexedRecordFromFile(file *os.File, streamID string, entry streamIndexEntry) (Record, error) {
 	return readIndexedRecordFromReader(&segmentReader{reader: &readAtSegmentReader{file: file}}, streamID, entry)
 }
 
+// readIndexedRawRecordFromFile adapts an os.File to the raw indexed read path
+// used by idempotency rebuild and compaction helpers.
 func readIndexedRawRecordFromFile(file *os.File, streamID string, entry streamIndexEntry, scratch *rawRecordReadScratch) (logrecord.RawRecord, error) {
 	return readIndexedRawRecordFromReader(&segmentReader{reader: &readAtSegmentReader{file: file}}, streamID, entry, scratch)
 }
 
+// mmapReadFromEnv parses the optional LOGSERVE_LOG_MMAP_READ flag.
 func mmapReadFromEnv() bool {
 	v := strings.TrimSpace(os.Getenv("LOGSERVE_LOG_MMAP_READ"))
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
+// ensureWritableSegmentLocked rolls the active segment when the next append would
+// exceed the configured segment size. The caller must hold s.mu.
 func (s *Store) ensureWritableSegmentLocked(recordLen int64) error {
 	if s.logFile == nil || s.indexFile == nil {
 		return errors.New("logstore is closed")
@@ -1344,6 +1478,8 @@ func (s *Store) ensureWritableSegmentLocked(recordLen int64) error {
 	return nil
 }
 
+// rollSegmentLocked closes and fsyncs the current active segment before opening
+// the next sequential segment ID. The caller must hold s.mu.
 func (s *Store) rollSegmentLocked() error {
 	if err := s.closeActiveFilesLocked(true); err != nil {
 		return err
@@ -1353,6 +1489,9 @@ func (s *Store) rollSegmentLocked() error {
 	return s.openActiveFilesLocked()
 }
 
+// openActiveFilesLocked opens the active log and index files and records the
+// current log size as the append offset. The caller must hold s.mu or be in
+// single-threaded open setup.
 func (s *Store) openActiveFilesLocked() error {
 	if s.activeSegmentID == 0 {
 		s.activeSegmentID = 1
@@ -1379,6 +1518,8 @@ func (s *Store) openActiveFilesLocked() error {
 	return nil
 }
 
+// closeActiveFilesLocked optionally flushes the active index/log pair before
+// closing descriptors. The caller must hold s.mu.
 func (s *Store) closeActiveFilesLocked(sync bool) error {
 	var err error
 	if sync {
@@ -1396,6 +1537,8 @@ func (s *Store) closeActiveFilesLocked(sync bool) error {
 	return err
 }
 
+// syncForPolicyLocked applies the configured durability policy after an append.
+// Batch mode defers fsync until close or segment roll.
 func (s *Store) syncForPolicyLocked() error {
 	switch s.options.FsyncPolicy {
 	case FsyncAlways:
@@ -1412,6 +1555,8 @@ func (s *Store) syncForPolicyLocked() error {
 	}
 }
 
+// syncFilesLocked fsyncs open log and index files and updates the interval timer
+// only when both sync operations succeed.
 func (s *Store) syncFilesLocked() error {
 	var err error
 	if s.logFile != nil {
@@ -1426,10 +1571,13 @@ func (s *Store) syncFilesLocked() error {
 	return err
 }
 
+// encodeRecord serializes a record into a newly allocated buffer.
 func encodeRecord(rec Record, typ ChecksumType) ([]byte, uint32, error) {
 	return encodeRecordWithBuffer(rec, typ, nil)
 }
 
+// encodeRecordPooled serializes a record using the shared buffer pool; callers
+// must return the buffer with putRecordEncodeBuffer when finished.
 func encodeRecordPooled(rec Record, typ ChecksumType) ([]byte, uint32, error) {
 	if typ == 0 {
 		typ = ChecksumTypeCRC32C
@@ -1446,6 +1594,9 @@ func encodeRecordPooled(rec Record, typ ChecksumType) ([]byte, uint32, error) {
 	}
 	return encoded, crc, nil
 }
+
+// encodeRecordWithBuffer writes the v2 binary record header and body into buf,
+// growing the buffer only when necessary.
 func encodeRecordWithBuffer(rec Record, typ ChecksumType, buf []byte) ([]byte, uint32, error) {
 	if typ == 0 {
 		typ = ChecksumTypeCRC32C
@@ -1472,6 +1623,8 @@ func encodeRecordWithBuffer(rec Record, typ ChecksumType, buf []byte) ([]byte, u
 	binary.BigEndian.PutUint32(buf[12:16], uint32(len(rec.Payload)))
 	binary.BigEndian.PutUint64(buf[16:24], rec.Seq)
 	binary.BigEndian.PutUint64(buf[24:32], uint64(rec.TimestampMs))
+	// Bytes 36:40 are the v2 extension area; currently only checksum type is stored,
+	// leaving two reserved bytes zeroed by the fresh or reused buffer slice.
 	binary.BigEndian.PutUint16(buf[36:38], uint16(typ))
 
 	pos := headerSize
@@ -1488,6 +1641,8 @@ func encodeRecordWithBuffer(rec Record, typ ChecksumType, buf []byte) ([]byte, u
 	return buf, crc, nil
 }
 
+// encodedRecordSize validates bounded string fields and returns the exact v2
+// encoded length before allocation or pool checkout.
 func encodedRecordSize(rec Record, typ ChecksumType) (int, error) {
 	if len(rec.StreamID) > 0xffff {
 		return 0, errors.New("stream_id too large")
@@ -1508,6 +1663,8 @@ func encodedRecordSize(rec Record, typ ChecksumType) (int, error) {
 	return headerSize + bodyLen, nil
 }
 
+// getRecordEncodeBuffer returns a pooled buffer unless the requested size is so
+// large that pooling would retain too much memory.
 func getRecordEncodeBuffer(size int) []byte {
 	if size > maxPooledRecordEncodeBuffer {
 		return make([]byte, size)
@@ -1520,6 +1677,8 @@ func getRecordEncodeBuffer(size int) []byte {
 	return buf[:size]
 }
 
+// putRecordEncodeBuffer returns medium buffers to the pool and drops oversized
+// buffers for the garbage collector.
 func putRecordEncodeBuffer(buf []byte) {
 	if cap(buf) == 0 || cap(buf) > maxPooledRecordEncodeBuffer {
 		return
@@ -1528,15 +1687,21 @@ func putRecordEncodeBuffer(buf []byte) {
 	recordEncodeBufferPool.Put(&buf)
 }
 
+// rawRecordReadScratch carries reusable header and body storage for raw reads.
+// Payload slices returned from raw readers may point into body or mmap data.
 type rawRecordReadScratch struct {
 	header [headerSize]byte
 	body   []byte
 }
 
+// readRecordAt reads one durable Record from a file offset using the shared
+// segmentIO decoder.
 func readRecordAt(file *os.File, offset int64) (Record, int64, error) {
 	return readRecordAtIO(&segmentIO{reader: &readAtSegmentReader{file: file}}, offset)
 }
 
+// readRecordAtIO decodes a raw record and copies its payload into an owned
+// Record value.
 func readRecordAtIO(io *segmentIO, offset int64) (Record, int64, error) {
 	var scratch rawRecordReadScratch
 	raw, checksumType, nextOffset, err := readRawRecordAtWithScratch(io, offset, &scratch)
@@ -1555,10 +1720,14 @@ func readRecordAtIO(io *segmentIO, offset int64) (Record, int64, error) {
 	}, nextOffset, nil
 }
 
+// readRawRecordAt reads one raw record from a file and returns its checksum type
+// plus the next byte offset.
 func readRawRecordAt(file *os.File, offset int64) (logrecord.RawRecord, ChecksumType, int64, error) {
 	return readRawRecordAtWithScratch(&segmentIO{reader: &readAtSegmentReader{file: file}}, offset, nil)
 }
 
+// readRawRecordAtWithScratch chooses the mmap fast path when a bounded header
+// slice is available; otherwise it falls back to ReadAt into scratch storage.
 func readRawRecordAtWithScratch(src *segmentIO, offset int64, scratch *rawRecordReadScratch) (logrecord.RawRecord, ChecksumType, int64, error) {
 	if scratch == nil {
 		scratch = &rawRecordReadScratch{}
@@ -1569,6 +1738,8 @@ func readRawRecordAtWithScratch(src *segmentIO, offset int64, scratch *rawRecord
 	return readRawRecordFromReadAt(src, offset, scratch)
 }
 
+// readRawRecordFromMmap decodes one record from mmap-backed slices without
+// copying the payload body unless checksum verification needs scratch state.
 func readRawRecordFromMmap(src *segmentIO, offset int64, baseHeader []byte, scratch *rawRecordReadScratch) (logrecord.RawRecord, ChecksumType, int64, error) {
 	if len(baseHeader) != legacyHeaderSize {
 		return logrecord.RawRecord{}, 0, offset, errCorruptRecord
@@ -1582,6 +1753,8 @@ func readRawRecordFromMmap(src *segmentIO, offset int64, baseHeader []byte, scra
 	switch recordVersion {
 	case recordVersionV1:
 	case recordVersionV2:
+		// v2 records extend the legacy 36-byte header with checksum type metadata while
+		// preserving the v1 body layout.
 		extension, ok := src.slice(offset+legacyHeaderSize, headerSize-legacyHeaderSize)
 		if !ok || len(extension) != headerSize-legacyHeaderSize {
 			return logrecord.RawRecord{}, 0, offset, errCorruptRecord
@@ -1631,6 +1804,8 @@ func readRawRecordFromMmap(src *segmentIO, offset int64, baseHeader []byte, scra
 	}, checksumType, offset + int64(headerLen+bodyLen), nil
 }
 
+// readRawRecordFromReadAt decodes one record by reading header and body ranges
+// into reusable scratch buffers.
 func readRawRecordFromReadAt(src *segmentIO, offset int64, scratch *rawRecordReadScratch) (logrecord.RawRecord, ChecksumType, int64, error) {
 	baseHeader := scratch.header[:legacyHeaderSize]
 	n, err := src.ReadAt(baseHeader, offset)
@@ -1653,6 +1828,8 @@ func readRawRecordFromReadAt(src *segmentIO, offset int64, scratch *rawRecordRea
 	switch recordVersion {
 	case recordVersionV1:
 	case recordVersionV2:
+		// ReadAt uses the same v2 extension layout as the mmap path, but reads it into
+		// scratch so the decoder can validate short headers.
 		extension := scratch.header[legacyHeaderSize:headerSize]
 		n, err = src.ReadAt(extension, offset+legacyHeaderSize)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -1703,6 +1880,10 @@ func readRawRecordFromReadAt(src *segmentIO, offset int64, scratch *rawRecordRea
 		CRC32:          expectedCRC,
 	}, checksumType, offset + int64(headerLen+bodyLen), nil
 }
+
+// readBodyVerifiedIO returns a checksum-verified body slice. It prefers mmap
+// slices, uses one-shot reads for small bodies, and streams CRC-friendly large
+// bodies in chunks.
 func readBodyVerifiedIO(src *segmentIO, offset int64, bodyLen int, checksumType ChecksumType, expectedCRC uint32, scratch *rawRecordReadScratch) ([]byte, error) {
 	if body, ok := src.slice(offset, bodyLen); ok {
 		if !verifyChecksum(body, checksumType, expectedCRC) {
@@ -1716,6 +1897,8 @@ func readBodyVerifiedIO(src *segmentIO, offset int64, bodyLen int, checksumType 
 	}
 	body := scratch.body[:bodyLen]
 
+	// Chunked verification avoids allocating a second payload-sized checksum buffer
+	// for large CRC records; XXH3 and None keep the simpler one-shot path.
 	useChunkedRead := bodyLen > checksumChunkSize &&
 		(checksumType == ChecksumTypeIEEE || checksumType == ChecksumTypeCRC32C)
 	if !useChunkedRead {
@@ -1757,10 +1940,13 @@ func readBodyVerifiedIO(src *segmentIO, offset int64, bodyLen int, checksumType 
 	return body, nil
 }
 
+// segmentPath constructs the discoverable filename for a segment log or index.
 func segmentPath(dir string, segmentID uint64, ext string) string {
 	return filepath.Join(dir, fmt.Sprintf("segment-%08d%s", segmentID, ext))
 }
 
+// discoverSegmentIDs scans segment filenames for the requested extension and
+// returns sorted numeric IDs.
 func discoverSegmentIDs(dir, ext string) ([]uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1788,16 +1974,21 @@ func discoverSegmentIDs(dir, ext string) ([]uint64, error) {
 	return out, nil
 }
 
+// cloneRecord deep-copies the payload while preserving record metadata.
 func cloneRecord(rec Record) Record {
 	rec.Payload = append([]byte(nil), rec.Payload...)
 	return rec
 }
 
+// idempotencyRecord strips payload bytes before storing duplicate-detection state
+// because duplicate responses only need metadata.
 func idempotencyRecord(rec Record) Record {
 	rec.Payload = nil
 	return rec
 }
 
+// idempotencyKey combines stream and caller key with a NUL separator so pairs
+// cannot collide through string concatenation.
 func idempotencyKey(streamID, key string) string {
 	return streamID + "\x00" + key
 }

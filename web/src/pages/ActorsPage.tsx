@@ -1,3 +1,5 @@
+// Actor registry route for creating actors and listing ownership state.
+
 import { useMemo, useState, type FormEvent } from "react";
 import { api } from "../api/client";
 import { CodeEditor } from "../components/CodeEditor";
@@ -14,6 +16,7 @@ import { errorMessage } from "../utils/status";
 import type { ConsoleSession } from "../types/logserve";
 import { roleAtLeast } from "../utils/roles";
 
+// Render actor inventory and the create-actor form for operator sessions.
 export function ActorsPage({ session }: { session?: ConsoleSession | null }) {
   const state = usePolling(() => api.actors(), 1000);
   const [className, setClassName] = useState("Counter");
@@ -25,6 +28,7 @@ export function ActorsPage({ session }: { session?: ConsoleSession | null }) {
 
   const validation = useMemo(() => validateActorCreateForm(className, classSource, initArgs), [className, classSource, initArgs]);
 
+  // Create an actor from class source plus init args, then refresh the inventory.
   const create = async (event: FormEvent) => {
     event.preventDefault();
     setMessage("");

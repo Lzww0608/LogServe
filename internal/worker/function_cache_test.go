@@ -1,5 +1,8 @@
 package worker
 
+// This file exercises the worker function-source cache across inline,
+// object-store-backed, and hash-mismatch paths.
+
 import (
 	"context"
 	"testing"
@@ -8,6 +11,7 @@ import (
 	"github.com/logserve/logserve/internal/objectstore"
 )
 
+// TestFunctionCacheLoadsVerifiesAndCachesSource verifies object-store loading, hash validation, and in-memory reuse.
 func TestFunctionCacheLoadsVerifiesAndCachesSource(t *testing.T) {
 	ctx := context.Background()
 	store, err := objectstore.OpenLocal(t.TempDir())
@@ -41,6 +45,7 @@ func TestFunctionCacheLoadsVerifiesAndCachesSource(t *testing.T) {
 	}
 }
 
+// TestFunctionCacheRejectsHashMismatch verifies fetched function source cannot be used under an incorrect hash.
 func TestFunctionCacheRejectsHashMismatch(t *testing.T) {
 	ctx := context.Background()
 	store, err := objectstore.OpenLocal(t.TempDir())

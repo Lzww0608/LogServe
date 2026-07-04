@@ -1,3 +1,4 @@
+# Regression tests for SDK idempotency semantics and source extraction boundaries.
 import sys
 import unittest
 from pathlib import Path
@@ -12,34 +13,43 @@ from logserve import client
 from logserve.decorators import actor, task, workflow
 
 
+# add is a plain function used to verify standalone task submission behavior.
 def add(a, b):
     return a + b
 
 
+# echo is a decorated task used as the workflow step in source extraction tests.
 @task
 def echo(value):
     return value
 
 
+# echo_workflow returns a StepRef so workflow submission can build a one-step DAG.
 @workflow
 def echo_workflow(value):
     return echo(value)
 
 
+# CounterActor is a small actor fixture for class-source extraction tests.
 @actor
 class CounterActor:
+    # Initialize deterministic actor state for source extraction assertions.
     def __init__(self):
         self.value = 0
 
+    # Mutate actor state so the fixture resembles a real actor method.
     def inc(self):
         self.value += 1
         return self.value
 
 
+# CapturingTransport records SDK transport calls without starting LogServe services.
 class CapturingTransport:
+    # Store captured command/payload pairs for each assertion.
     def __init__(self):
         self.calls = []
 
+    # Emulate the small subset of transport commands needed by these tests.
     def run(self, command, payload=None, **_kwargs):
         self.calls.append((command, payload or {}))
         if command == "submit":
@@ -51,7 +61,9 @@ class CapturingTransport:
         raise AssertionError(f"unexpected command {command}")
 
 
+# ClientIdempotencyTests locks down retry and source-shaping behavior in the SDK.
 class ClientIdempotencyTests(unittest.TestCase):
+    # Verify repeated submits stay non-idempotent unless the caller supplies a key.
     def test_submit_does_not_auto_dedupe_same_function_and_args(self):
         transport = CapturingTransport()
         sdk = client.LogServeClient(transport=transport)
@@ -63,6 +75,7 @@ class ClientIdempotencyTests(unittest.TestCase):
         self.assertEqual(transport.calls[1][1]["idempotency_key"], "")
         self.assertTrue(transport.calls[0][1]["function_hash"].startswith("sha256:"))
 
+    # Verify explicit task idempotency keys pass through unchanged.
     def test_submit_uses_explicit_idempotency_key_only_when_provided(self):
         transport = CapturingTransport()
         sdk = client.LogServeClient(transport=transport)
@@ -71,6 +84,7 @@ class ClientIdempotencyTests(unittest.TestCase):
 
         self.assertEqual(transport.calls[0][1]["idempotency_key"], "same-submit")
 
+    # Verify workflow submits default to an empty idempotency key.
     def test_workflow_submit_defaults_to_non_idempotent_submission(self):
         transport = CapturingTransport()
         sdk = client.LogServeClient(transport=transport)
@@ -80,6 +94,7 @@ class ClientIdempotencyTests(unittest.TestCase):
         self.assertEqual(transport.calls[0][0], "workflow-submit")
         self.assertEqual(transport.calls[0][1]["idempotency_key"], "")
 
+    # Verify traced step source contains the function body without module imports.
     def test_workflow_step_source_does_not_include_module_imports(self):
         transport = CapturingTransport()
         sdk = client.LogServeClient(transport=transport)
@@ -94,6 +109,7 @@ class ClientIdempotencyTests(unittest.TestCase):
         self.assertNotIn("import sys", step_source)
         self.assertNotIn("from pathlib", step_source)
 
+    # Verify actor class source extraction does not capture module imports.
     def test_actor_source_does_not_include_module_imports(self):
         transport = CapturingTransport()
         sdk = client.LogServeClient(transport=transport)
@@ -105,6 +121,7 @@ class ClientIdempotencyTests(unittest.TestCase):
         self.assertNotIn("import sys", actor_source)
         self.assertNotIn("from pathlib", actor_source)
 
+    # Verify module-level helpers delegate through the default client path.
     def test_module_level_submit_uses_default_client_transport(self):
         transport = CapturingTransport()
         with mock.patch.object(client, "_default_client", return_value=client.LogServeClient(transport=transport)):

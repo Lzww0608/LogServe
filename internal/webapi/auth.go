@@ -1,10 +1,15 @@
 package webapi
 
+// This file applies CORS, request-id propagation, and HTTP bearer
+// authentication before requests reach route handlers.
+
 import (
 	"net/http"
 	"strings"
 )
 
+// withMiddleware applies development CORS, injects request IDs for API routes,
+// and authenticates every API path except healthz before routing.
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.DevCORS {
@@ -33,6 +38,8 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// authorizedHTTP preserves the simple bearer-token check used by older tests and
+// helpers.
 func authorizedHTTP(header, token string) bool {
 	return tokenMatches(bearerToken(header), token)
 }

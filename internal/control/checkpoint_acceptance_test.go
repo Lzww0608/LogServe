@@ -18,6 +18,7 @@ import (
 	workflowpkg "github.com/logserve/logserve/internal/workflow"
 )
 
+// checkpointAcceptanceWorkload controls the generated acceptance scenario size.
 type checkpointAcceptanceWorkload struct {
 	Tasks      int `json:"tasks"`
 	Workflows  int `json:"workflows"`
@@ -26,6 +27,7 @@ type checkpointAcceptanceWorkload struct {
 	TailEvents int `json:"tail_events"`
 }
 
+// checkpointAcceptanceCheckpointSummary is the JSON report view of checkpoint size.
 type checkpointAcceptanceCheckpointSummary struct {
 	ID            string `json:"id"`
 	StreamCount   int    `json:"stream_count"`
@@ -35,6 +37,7 @@ type checkpointAcceptanceCheckpointSummary struct {
 	LLMStatsCount int    `json:"llm_stats_count"`
 }
 
+// checkpointAcceptanceReplayMetrics records replay cost for full and checkpoint paths.
 type checkpointAcceptanceReplayMetrics struct {
 	DurationMS   float64 `json:"duration_ms"`
 	ReadLogCalls int     `json:"read_log_calls"`
@@ -42,6 +45,7 @@ type checkpointAcceptanceReplayMetrics struct {
 	SeqOneReads  int     `json:"seq_1_reads_for_checkpointed_streams,omitempty"`
 }
 
+// checkpointAcceptanceReport is the optional JSON artifact emitted by the acceptance test.
 type checkpointAcceptanceReport struct {
 	Verdict          string                                `json:"verdict"`
 	GeneratedAtUTC   string                                `json:"generated_at_utc"`
@@ -55,6 +59,7 @@ type checkpointAcceptanceReport struct {
 	Failures         []string                              `json:"failures,omitempty"`
 }
 
+// checkpointAcceptancePendingTail lists entities that should receive post-checkpoint events.
 type checkpointAcceptancePendingTail struct {
 	TaskIDs         []string
 	WorkflowTaskIDs []string
@@ -62,6 +67,8 @@ type checkpointAcceptancePendingTail struct {
 	LLMTaskIDs      []string
 }
 
+// TestMetadataCheckpointAcceptanceReport builds a mixed workload, writes a checkpoint,
+// appends tails, compares full and checkpoint bootstrap, and optionally emits JSON.
 func TestMetadataCheckpointAcceptanceReport(t *testing.T) {
 	outPath := os.Getenv("LOGSERVE_CHECKPOINT_ACCEPTANCE_OUT")
 	if outPath == "" {
@@ -158,6 +165,7 @@ func TestMetadataCheckpointAcceptanceReport(t *testing.T) {
 	}
 }
 
+// checkpointAcceptanceWorkloadFromEnv reads bounded workload sizing from environment variables.
 func checkpointAcceptanceWorkloadFromEnv() checkpointAcceptanceWorkload {
 	return checkpointAcceptanceWorkload{
 		Tasks:      envIntMin("LOGSERVE_CHECKPOINT_ACCEPTANCE_TASKS", 120, 4),
@@ -167,6 +175,7 @@ func checkpointAcceptanceWorkloadFromEnv() checkpointAcceptanceWorkload {
 	}
 }
 
+// envIntMin returns an environment integer only when it meets a minimum size.
 func envIntMin(name string, fallback, minValue int) int {
 	value, err := strconv.Atoi(os.Getenv(name))
 	if err != nil || value < minValue {
@@ -175,6 +184,8 @@ func envIntMin(name string, fallback, minValue int) int {
 	return value
 }
 
+// buildCheckpointAcceptanceHistory creates pre-checkpoint task, workflow, actor, and
+// LLM history while holding back a subset for tail replay.
 func buildCheckpointAcceptanceHistory(t *testing.T, ctx context.Context, service *Service, logClient *countingReplayableLogClient, workload checkpointAcceptanceWorkload) (checkpointAcceptancePendingTail, error) {
 	t.Helper()
 	if _, err := service.RegisterWorker(ctx, &logservepb.RegisterWorkerRequest{WorkerId: "worker-1", Capacity: 8}); err != nil {
@@ -275,6 +286,8 @@ func buildCheckpointAcceptanceHistory(t *testing.T, ctx context.Context, service
 	return pending, nil
 }
 
+// appendCheckpointAcceptanceTail writes the post-checkpoint events that fast bootstrap
+// must replay from stream tails.
 func appendCheckpointAcceptanceTail(t *testing.T, ctx context.Context, service *Service, logClient *countingReplayableLogClient, pending checkpointAcceptancePendingTail) (int, error) {
 	t.Helper()
 	tailEvents := 0
@@ -310,6 +323,7 @@ func appendCheckpointAcceptanceTail(t *testing.T, ctx context.Context, service *
 	return tailEvents, nil
 }
 
+// completeAcceptanceTask leases, starts, and completes one task in the acceptance workload.
 func completeAcceptanceTask(ctx context.Context, service *Service, taskID, workerID string, result []byte) error {
 	leased, err := service.meta.LeaseTask(taskID, workerID)
 	if err != nil {
@@ -334,6 +348,7 @@ func completeAcceptanceTask(ctx context.Context, service *Service, taskID, worke
 	return err
 }
 
+// applyAcceptanceActorCommand appends and materializes one actor command application.
 func applyAcceptanceActorCommand(t *testing.T, service *Service, logClient *countingReplayableLogClient, actorID string, commandSeq uint64) {
 	t.Helper()
 	state, ok := service.meta.GetActor(actorID)
@@ -369,6 +384,7 @@ func applyAcceptanceActorCommand(t *testing.T, service *Service, logClient *coun
 	}
 }
 
+// runFullMetadataBootstrapForAcceptance measures explicit full replay without checkpoint acceleration.
 func runFullMetadataBootstrapForAcceptance(ctx context.Context, logClient *countingReplayableLogClient) (*Service, checkpointAcceptanceReplayMetrics, error) {
 	logClient.resetReadCounts()
 	metaStore := metadata.NewMemoryStore()
@@ -396,6 +412,8 @@ func runFullMetadataBootstrapForAcceptance(ctx context.Context, logClient *count
 	}, nil
 }
 
+// runCheckpointMetadataBootstrapForAcceptance measures normal bootstrap and counts
+// whether checkpointed streams were reread from sequence one.
 func runCheckpointMetadataBootstrapForAcceptance(ctx context.Context, logClient *countingReplayableLogClient, streams map[string]MetadataCheckpointStream) (*Service, checkpointAcceptanceReplayMetrics, error) {
 	logClient.resetReadCounts()
 	metaStore := metadata.NewMemoryStore()
@@ -413,6 +431,7 @@ func runCheckpointMetadataBootstrapForAcceptance(ctx context.Context, logClient 
 	}, nil
 }
 
+// checkpointAcceptanceServicesConsistent compares full and fast service metadata views.
 func checkpointAcceptanceServicesConsistent(full, fast *Service) (bool, []string) {
 	var failures []string
 	if len(full.meta.ListTasks()) != len(fast.meta.ListTasks()) {
@@ -447,6 +466,8 @@ func checkpointAcceptanceServicesConsistent(full, fast *Service) (bool, []string
 	return len(failures) == 0, failures
 }
 
+// checkpointAcceptanceCorruptFallback returns whether corrupt checkpoint data falls
+// back to full replay successfully.
 func checkpointAcceptanceCorruptFallback(ctx context.Context) bool {
 	logClient := newCountingReplayableLogClient()
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), logClient, nil, 0)
@@ -476,6 +497,7 @@ func checkpointAcceptanceCorruptFallback(ctx context.Context) bool {
 	return ok
 }
 
+// checkpointAcceptanceRetention returns whether checkpoint retention keeps the newest records.
 func checkpointAcceptanceRetention(ctx context.Context) bool {
 	logClient := newCountingReplayableLogClient()
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), logClient, nil, 0)
@@ -491,6 +513,7 @@ func checkpointAcceptanceRetention(ctx context.Context) bool {
 	return len(resp.GetRecords()) == 2 && resp.GetRecords()[0].GetSeq() == 3 && resp.GetRecords()[1].GetSeq() == 4
 }
 
+// writeCheckpointAcceptanceReport writes the optional acceptance JSON artifact.
 func writeCheckpointAcceptanceReport(path string, report checkpointAcceptanceReport) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -502,6 +525,7 @@ func writeCheckpointAcceptanceReport(path string, report checkpointAcceptanceRep
 	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
+// tailCount chooses a non-zero tail subset size for positive workloads.
 func tailCount(total int) int {
 	if total <= 0 {
 		return 0
@@ -513,6 +537,7 @@ func tailCount(total int) int {
 	return count
 }
 
+// workerFor alternates synthetic workload items across two workers.
 func workerFor(i int) string {
 	if i%2 == 0 {
 		return "worker-1"
@@ -520,11 +545,13 @@ func workerFor(i int) string {
 	return "worker-2"
 }
 
+// millisSince reports elapsed milliseconds rounded for stable JSON reports.
 func millisSince(start time.Time) float64 {
 	ms := float64(time.Since(start).Microseconds()) / 1000
 	return math.Round(ms*1000) / 1000
 }
 
+// ratioFloat returns a rounded ratio and avoids division by zero.
 func ratioFloat(num, den float64) float64 {
 	if den == 0 {
 		return 0
@@ -532,6 +559,7 @@ func ratioFloat(num, den float64) float64 {
 	return math.Round((num/den)*10000) / 10000
 }
 
+// compactStrings removes empty and adjacent duplicate failure labels from sorted input.
 func compactStrings(values []string) []string {
 	if len(values) == 0 {
 		return nil

@@ -1,3 +1,5 @@
+// Overview route for dashboard metrics and live SSE summary updates.
+
 import { useCallback, useState } from "react";
 import { parseEventData, type SSEMessage } from "../api/events";
 import { Kpi } from "../components/Kpi";
@@ -8,10 +10,12 @@ import { useEventStream } from "../hooks/useEventStream";
 import type { ConsoleSession, Dashboard } from "../types/logserve";
 import { roleAtLeast } from "../utils/roles";
 
+// Render the dashboard snapshot and apply live SSE status updates.
 export function OverviewPage({ session }: { session?: ConsoleSession | null }) {
   const [dashboard, setDashboard] = useState<Dashboard>();
   const [error, setError] = useState("");
   const [lastRefreshAt, setLastRefreshAt] = useState<number>();
+  // Apply dashboard SSE snapshots and record the last successful refresh time.
   const handleMessage = useCallback((message: SSEMessage) => {
     if (message.event !== "dashboard") return;
     const payload = parseEventData<{ dashboard: Dashboard }>(message);
@@ -89,6 +93,7 @@ export function OverviewPage({ session }: { session?: ConsoleSession | null }) {
   );
 }
 
+// Render control-plane health, session role, and request identity metadata.
 function HealthCard({ label, value, tone }: { label: string; value: string; tone: "good" | "warn" | "bad" }) {
   return (
     <div className="health-card">
@@ -98,6 +103,7 @@ function HealthCard({ label, value, tone }: { label: string; value: string; tone
   );
 }
 
+// Render aggregate workflow/task counters with computed completion progress.
 function ProgressCard({ label, value, detail }: { label: string; value: number; detail: string }) {
   const clamped = Math.max(0, Math.min(100, value));
   const tone = clamped >= 100 ? "bad" : clamped >= 70 ? "warn" : "";
@@ -109,6 +115,7 @@ function ProgressCard({ label, value, detail }: { label: string; value: number; 
   );
 }
 
+// Compute a percentage while treating non-positive denominators as empty.
 function percent(value: number, total: number): number {
   if (total <= 0) return 0;
   return (value / total) * 100;

@@ -13,30 +13,38 @@ import (
 	"google.golang.org/grpc"
 )
 
+// failingLogClient forces append failures to verify log-first mutation ordering.
 type failingLogClient struct {
 	appendErr error
 }
 
+// AppendLog always returns the configured append error.
 func (c failingLogClient) AppendLog(context.Context, *logservepb.AppendLogRequest, ...grpc.CallOption) (*logservepb.AppendLogResponse, error) {
 	return nil, c.appendErr
 }
 
+// ReadLog returns an empty stream for append-failure tests.
 func (c failingLogClient) ReadLog(context.Context, *logservepb.ReadLogRequest, ...grpc.CallOption) (*logservepb.ReadLogResponse, error) {
 	return &logservepb.ReadLogResponse{}, nil
 }
 
+// ListStreams returns no streams for append-failure tests.
 func (c failingLogClient) ListStreams(context.Context, *logservepb.ListStreamsRequest, ...grpc.CallOption) (*logservepb.ListStreamsResponse, error) {
 	return &logservepb.ListStreamsResponse{}, nil
 }
 
+// TrimStream is a no-op stub for append-failure tests.
 func (c failingLogClient) TrimStream(context.Context, *logservepb.TrimStreamRequest, ...grpc.CallOption) (*logservepb.TrimStreamResponse, error) {
 	return &logservepb.TrimStreamResponse{}, nil
 }
 
+// GetStreamStats returns no stats for append-failure tests.
 func (c failingLogClient) GetStreamStats(context.Context, *logservepb.GetStreamStatsRequest, ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error) {
 	return &logservepb.GetStreamStatsResponse{}, nil
 }
 
+// TestSubmitWorkflowAppendFailureDoesNotCreateMetadataOnlyWorkflow verifies workflow
+// metadata is not created when the start event cannot be appended.
 func TestSubmitWorkflowAppendFailureDoesNotCreateMetadataOnlyWorkflow(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	service := NewServiceWithResultStore(meta, failingLogClient{appendErr: errors.New("append down")}, nil, 0)
@@ -53,6 +61,8 @@ func TestSubmitWorkflowAppendFailureDoesNotCreateMetadataOnlyWorkflow(t *testing
 	}
 }
 
+// TestWorkflowScheduleBackpressureDoesNotLeavePhantomTaskID verifies failed step
+// enqueue does not leave a task ID in workflow metadata.
 func TestWorkflowScheduleBackpressureDoesNotLeavePhantomTaskID(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	service := NewServiceWithResultStore(meta, acceptingLogClient{}, nil, 0)
@@ -88,6 +98,8 @@ func TestWorkflowScheduleBackpressureDoesNotLeavePhantomTaskID(t *testing.T) {
 	}
 }
 
+// TestCreateActorAppendFailureDoesNotCreateMetadataOnlyActor verifies actor metadata
+// is not created when ActorCreated cannot be appended.
 func TestCreateActorAppendFailureDoesNotCreateMetadataOnlyActor(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	service := NewServiceWithResultStore(meta, failingLogClient{appendErr: errors.New("append down")}, nil, 0)
@@ -104,6 +116,8 @@ func TestCreateActorAppendFailureDoesNotCreateMetadataOnlyActor(t *testing.T) {
 	}
 }
 
+// TestRegisterModelAppendFailureDoesNotUpdateRegistry verifies model metadata only
+// changes after the log append succeeds.
 func TestRegisterModelAppendFailureDoesNotUpdateRegistry(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	service := NewServiceWithResultStore(meta, failingLogClient{appendErr: errors.New("append down")}, nil, 0)
@@ -119,6 +133,8 @@ func TestRegisterModelAppendFailureDoesNotUpdateRegistry(t *testing.T) {
 	}
 }
 
+// TestSetSchedulingPolicyAppendFailureDoesNotChangePolicy verifies policy changes
+// remain log-first.
 func TestSetSchedulingPolicyAppendFailureDoesNotChangePolicy(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), failingLogClient{appendErr: errors.New("append down")}, nil, 0)
 	before := service.getSchedulingPolicy()
@@ -134,6 +150,8 @@ func TestSetSchedulingPolicyAppendFailureDoesNotChangePolicy(t *testing.T) {
 	}
 }
 
+// TestRegisterWorkerAppendFailureDoesNotUpdateMetadata verifies worker metadata only
+// changes after the registration event is durable.
 func TestRegisterWorkerAppendFailureDoesNotUpdateMetadata(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	service := NewServiceWithResultStore(meta, failingLogClient{appendErr: errors.New("append down")}, nil, 0)
@@ -150,6 +168,8 @@ func TestRegisterWorkerAppendFailureDoesNotUpdateMetadata(t *testing.T) {
 	}
 }
 
+// TestSetBackpressureAppendFailureDoesNotChangeConfig verifies backpressure config
+// updates remain log-first.
 func TestSetBackpressureAppendFailureDoesNotChangeConfig(t *testing.T) {
 	service := NewServiceWithResultStore(metadata.NewMemoryStore(), failingLogClient{appendErr: errors.New("append down")}, nil, 0)
 	beforeWatermark, beforeRedelivery, beforeSlow := service.getBackpressureConfig()
@@ -169,6 +189,8 @@ func TestSetBackpressureAppendFailureDoesNotChangeConfig(t *testing.T) {
 	}
 }
 
+// TestRedeliveryAppendFailureDoesNotRequeueTask verifies failed redelivery logging
+// leaves the task running instead of creating metadata-only queue state.
 func TestRedeliveryAppendFailureDoesNotRequeueTask(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	task, duplicate := meta.CreateTask(metadata.Task{
@@ -204,6 +226,8 @@ func TestRedeliveryAppendFailureDoesNotRequeueTask(t *testing.T) {
 	}
 }
 
+// TestReplayTaskSpecIgnoresStaleCompletionAfterRedelivery verifies old terminal
+// events do not override a redelivered lease.
 func TestReplayTaskSpecIgnoresStaleCompletionAfterRedelivery(t *testing.T) {
 	spec := &logservepb.TaskSpec{
 		TaskId:         "task-stale-replay",
@@ -243,6 +267,8 @@ func TestReplayTaskSpecIgnoresStaleCompletionAfterRedelivery(t *testing.T) {
 	}
 }
 
+// TestReplayTaskSpecIgnoresStaleStartAndCompletionAfterRedelivery verifies stale
+// start and completion records are ignored after redelivery.
 func TestReplayTaskSpecIgnoresStaleStartAndCompletionAfterRedelivery(t *testing.T) {
 	spec := &logservepb.TaskSpec{
 		TaskId:         "task-stale-start-replay",
@@ -278,6 +304,8 @@ func TestReplayTaskSpecIgnoresStaleStartAndCompletionAfterRedelivery(t *testing.
 	}
 }
 
+// TestTaskTerminalIdempotencyKeyIncludesWorkerAndLeaseEpoch checks terminal event
+// keys fence different workers, lease epochs, and event types.
 func TestTaskTerminalIdempotencyKeyIncludesWorkerAndLeaseEpoch(t *testing.T) {
 	completedOld := taskTerminalIdempotencyKey("task-1", "TaskCompleted", "worker-1", 1)
 	completedNew := taskTerminalIdempotencyKey("task-1", "TaskCompleted", "worker-2", 2)
@@ -289,6 +317,8 @@ func TestTaskTerminalIdempotencyKeyIncludesWorkerAndLeaseEpoch(t *testing.T) {
 		t.Fatal("TaskCompleted and TaskFailed must not share the same idempotency key")
 	}
 }
+
+// taskRecord builds a synthetic task lifecycle record for replay tests.
 func taskRecord(eventType string, payload []byte) *logservepb.LogRecord {
 	return &logservepb.LogRecord{
 		StreamId:    "task:task-stale-replay",
@@ -299,6 +329,7 @@ func taskRecord(eventType string, payload []byte) *logservepb.LogRecord {
 	}
 }
 
+// minimalWorkflowDefinition returns a one-step workflow used across control tests.
 func minimalWorkflowDefinition(t *testing.T) []byte {
 	t.Helper()
 	return []byte(`{

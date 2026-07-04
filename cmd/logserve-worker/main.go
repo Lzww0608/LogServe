@@ -1,3 +1,5 @@
+// Command logserve-worker runs a standalone worker process that polls the
+// control plane, executes Python/actor/LLM tasks, and reports progress to logd.
 package main
 
 import (
@@ -11,6 +13,8 @@ import (
 	"github.com/logserve/logserve/internal/worker"
 )
 
+// main parses worker runtime settings and runs the worker until it exits or
+// reports a non-cancellation error.
 func main() {
 	cfg := worker.Config{}
 	pprofAddr := flag.String("pprof-addr", observability.PprofAddrFromEnv(), "optional pprof listen address, for example 127.0.0.1:6063")
@@ -21,6 +25,8 @@ func main() {
 	flag.StringVar(&cfg.ExecutorPath, "executor", "executor/python/server.py", "python executor path")
 	models := flag.String("models", "", "comma-separated cached models, for example model-A:v1,model-B:v1")
 	capacity := flag.Uint("capacity", 1, "worker task capacity")
+	// A zero pool size delegates sizing to worker.Run, which derives defaults
+	// from capacity while preserving actor ordering constraints.
 	flag.IntVar(&cfg.TaskPoolSize, "task-pool-size", 0, "local Python task executor pool size; 0 follows capacity")
 	flag.IntVar(&cfg.LLMPoolSize, "llm-pool-size", 0, "local LLM executor pool size; 0 follows capacity")
 	flag.IntVar(&cfg.ActorPoolSize, "actor-pool-size", 0, "local actor executor pool size; per-actor ordering is still enforced")
@@ -43,6 +49,8 @@ func main() {
 	}
 }
 
+// splitCSV trims optional model lists while preserving the nil value for an
+// unspecified cache list.
 func splitCSV(value string) []string {
 	if strings.TrimSpace(value) == "" {
 		return nil

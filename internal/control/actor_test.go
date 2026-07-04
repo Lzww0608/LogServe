@@ -14,11 +14,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// recordingLogClient captures append requests so actor tests can inspect durable
+// event ordering without running a real log service.
 type recordingLogClient struct {
 	mu      sync.Mutex
 	records []*logservepb.AppendLogRequest
 }
 
+// AppendLog records a cloned append request and returns a monotonic sequence number.
 func (c *recordingLogClient) AppendLog(_ context.Context, req *logservepb.AppendLogRequest, _ ...grpc.CallOption) (*logservepb.AppendLogResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -27,22 +30,27 @@ func (c *recordingLogClient) AppendLog(_ context.Context, req *logservepb.Append
 	return &logservepb.AppendLogResponse{Seq: uint64(len(c.records)), TimestampMs: actor.NowMs()}, nil
 }
 
+// ReadLog returns an empty stream because these tests only inspect appended events.
 func (c *recordingLogClient) ReadLog(context.Context, *logservepb.ReadLogRequest, ...grpc.CallOption) (*logservepb.ReadLogResponse, error) {
 	return &logservepb.ReadLogResponse{}, nil
 }
 
+// ListStreams returns no streams for actor tests that do not exercise bootstrap.
 func (c *recordingLogClient) ListStreams(context.Context, *logservepb.ListStreamsRequest, ...grpc.CallOption) (*logservepb.ListStreamsResponse, error) {
 	return &logservepb.ListStreamsResponse{}, nil
 }
 
+// TrimStream is a no-op stub for actor tests.
 func (c *recordingLogClient) TrimStream(context.Context, *logservepb.TrimStreamRequest, ...grpc.CallOption) (*logservepb.TrimStreamResponse, error) {
 	return &logservepb.TrimStreamResponse{}, nil
 }
 
+// GetStreamStats is a no-op stub for actor tests.
 func (c *recordingLogClient) GetStreamStats(context.Context, *logservepb.GetStreamStatsRequest, ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error) {
 	return &logservepb.GetStreamStatsResponse{}, nil
 }
 
+// countActorEvents counts captured actor events matching one actor stream and type.
 func (c *recordingLogClient) countActorEvents(actorID, eventType string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -55,6 +63,8 @@ func (c *recordingLogClient) countActorEvents(actorID, eventType string) int {
 	return count
 }
 
+// TestActorEpochFencingRejectsStaleCompletion verifies that an old owner cannot
+// mutate actor state after ownership epoch advances.
 func TestActorEpochFencingRejectsStaleCompletion(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	state := actor.NewState("actor-fence", "Counter", "class Counter: pass", []byte(`{"args":[],"kwargs":{}}`), 10, actor.NowMs())
@@ -93,6 +103,8 @@ func TestActorEpochFencingRejectsStaleCompletion(t *testing.T) {
 	}
 }
 
+// TestActorCommandSeqRejectsOutOfOrderCompletion verifies actor completions must
+// apply exactly in mailbox command order.
 func TestActorCommandSeqRejectsOutOfOrderCompletion(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	state := actor.NewState("actor-seq", "Counter", "class Counter: pass", []byte(`{"args":[],"kwargs":{}}`), 10, actor.NowMs())
@@ -133,6 +145,8 @@ func TestActorCommandSeqRejectsOutOfOrderCompletion(t *testing.T) {
 	}
 }
 
+// TestActorCommandSeqAdvancesAfterTimedOutSubmittedCommand protects the rule that
+// submitted-but-unfinished commands still reserve sequence numbers.
 func TestActorCommandSeqAdvancesAfterTimedOutSubmittedCommand(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	meta.UpsertWorker(metadata.Worker{
@@ -179,6 +193,8 @@ func TestActorCommandSeqAdvancesAfterTimedOutSubmittedCommand(t *testing.T) {
 	}
 }
 
+// TestActorCallDoesNotBlockMailboxWhileWaitingForResult verifies that waiting for a
+// result does not hold the per-actor submission lock.
 func TestActorCallDoesNotBlockMailboxWhileWaitingForResult(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	meta.UpsertWorker(metadata.Worker{
@@ -229,6 +245,8 @@ func TestActorCallDoesNotBlockMailboxWhileWaitingForResult(t *testing.T) {
 	<-firstDone
 }
 
+// TestPollTaskSkipsFutureActorCommandUntilMailboxReady ensures future command
+// sequences remain queued until prior actor commands complete.
 func TestPollTaskSkipsFutureActorCommandUntilMailboxReady(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	meta.UpsertWorker(metadata.Worker{WorkerID: "worker-1", Labels: map[string]string{}, CachedModels: map[string]bool{}, Capacity: 1, LastHeartbeat: actor.NowMs()})
@@ -270,6 +288,8 @@ func TestPollTaskSkipsFutureActorCommandUntilMailboxReady(t *testing.T) {
 	}
 }
 
+// TestPollTaskInjectsLatestActorStateForReadyCommand verifies dispatch uses current
+// actor metadata state rather than stale spec state.
 func TestPollTaskInjectsLatestActorStateForReadyCommand(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	meta.UpsertWorker(metadata.Worker{WorkerID: "worker-1", Labels: map[string]string{}, CachedModels: map[string]bool{}, Capacity: 1, LastHeartbeat: actor.NowMs()})
@@ -315,6 +335,8 @@ func TestPollTaskInjectsLatestActorStateForReadyCommand(t *testing.T) {
 	}
 }
 
+// TestPollTaskDispatchesQueuedActorCommandToRecoveredOwner verifies recovered owner
+// and epoch are injected when a queued actor task is leased.
 func TestPollTaskDispatchesQueuedActorCommandToRecoveredOwner(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	meta.UpsertWorker(metadata.Worker{WorkerID: "new-worker", Labels: map[string]string{}, CachedModels: map[string]bool{}, Capacity: 1, LastHeartbeat: actor.NowMs()})
@@ -365,11 +387,14 @@ func TestPollTaskDispatchesQueuedActorCommandToRecoveredOwner(t *testing.T) {
 	}
 }
 
+// waitForActorEventCount waits until the recording log has observed enough events.
 func waitForActorEventCount(t *testing.T, client *recordingLogClient, actorID, eventType string, want int) {
 	t.Helper()
 	waitForActorEventCountOrDone(t, client, actorID, eventType, want, nil)
 }
 
+// waitForActorEventCountOrDone also fails if the actor call finishes before the
+// expected event is logged.
 func waitForActorEventCountOrDone(t *testing.T, client *recordingLogClient, actorID, eventType string, want int, done <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

@@ -1,3 +1,5 @@
+// Actor detail route for inspecting state, invoking methods, and replaying actor history.
+
 import { useMemo, useState, type FormEvent } from "react";
 import { api } from "../api/client";
 import { DetailGrid } from "../components/DetailGrid";
@@ -13,6 +15,7 @@ import { firstValidationError, validateActorCallForm } from "../utils/formValida
 import { roleAtLeast } from "../utils/roles";
 import { errorMessage } from "../utils/status";
 
+// Render actor state with method-call and replay actions gated by role.
 export function ActorDetailPage({ actorID, session }: { actorID: string; session?: ConsoleSession | null }) {
   const state = usePolling(() => api.actor(actorID), 1000, [actorID]);
   const [method, setMethod] = useState("inc");
@@ -24,6 +27,7 @@ export function ActorDetailPage({ actorID, session }: { actorID: string; session
 
   const validation = useMemo(() => validateActorCallForm(method, args), [method, args]);
 
+  // Invoke one actor method and refresh state from the returned actor snapshot.
   const call = async (event: FormEvent) => {
     event.preventDefault();
     setMessage("");
@@ -48,6 +52,7 @@ export function ActorDetailPage({ actorID, session }: { actorID: string; session
     }
   };
 
+  // Replay actor history and expose the reconstructed state in the detail view.
   const replay = async () => {
     setMessage("");
     if (!canOperate) {

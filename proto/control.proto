@@ -4,7 +4,12 @@ package logserve.v1;
 
 option go_package = "github.com/logserve/logserve/gen/logservepb;logservepb";
 
+// control.proto defines LogServe control-plane RPC contracts for tasks,
+// workflows, actors, LLM execution, worker coordination, and dashboard state.
+
+// TaskStatus describes the lifecycle of a submitted task or actor call.
 enum TaskStatus {
+  // UNSPECIFIED is the proto3 zero value and represents unknown task state.
   TASK_STATUS_UNSPECIFIED = 0;
   TASK_STATUS_QUEUED = 1;
   TASK_STATUS_RUNNING = 2;
@@ -12,14 +17,19 @@ enum TaskStatus {
   TASK_STATUS_FAILED = 4;
 }
 
+// WorkflowStatus describes aggregate workflow execution state.
 enum WorkflowStatus {
+  // UNSPECIFIED is the proto3 zero value and represents unknown workflow state.
   WORKFLOW_STATUS_UNSPECIFIED = 0;
   WORKFLOW_STATUS_RUNNING = 1;
   WORKFLOW_STATUS_COMPLETED = 2;
   WORKFLOW_STATUS_FAILED = 3;
 }
 
+// WorkflowStepStatus describes one DAG step as it moves from scheduling to
+// terminal state.
 enum WorkflowStepStatus {
+  // UNSPECIFIED is the proto3 zero value and represents unknown step state.
   WORKFLOW_STEP_STATUS_UNSPECIFIED = 0;
   WORKFLOW_STEP_STATUS_SCHEDULED = 1;
   WORKFLOW_STEP_STATUS_STARTED = 2;
@@ -27,19 +37,24 @@ enum WorkflowStepStatus {
   WORKFLOW_STEP_STATUS_FAILED = 4;
 }
 
+// ActorStatus reports whether an actor can currently accept serialized commands.
 enum ActorStatus {
+  // UNSPECIFIED is the proto3 zero value and represents unknown actor state.
   ACTOR_STATUS_UNSPECIFIED = 0;
   ACTOR_STATUS_ACTIVE = 1;
   ACTOR_STATUS_UNAVAILABLE = 2;
 }
 
+// SchedulingPolicy selects the control-plane placement strategy for queued work.
 enum SchedulingPolicy {
+  // UNSPECIFIED is the proto3 zero value before the control plane applies its default.
   SCHEDULING_POLICY_UNSPECIFIED = 0;
   SCHEDULING_POLICY_RESOURCE_ONLY = 1;
   SCHEDULING_POLICY_LOCALITY_AWARE = 2;
   SCHEDULING_POLICY_PREDICTED_LATENCY = 3;
 }
 
+// ModelInfo describes a model or adapter known to the control plane.
 message ModelInfo {
   string name = 1;
   string version = 2;
@@ -48,11 +63,16 @@ message ModelInfo {
   string adapter = 5;
 }
 
+// ModelCacheEntry is the compact model identity workers report in heartbeats.
 message ModelCacheEntry {
   string name = 1;
   string version = 2;
 }
 
+// TaskSpec is the dispatch payload sent from control plane to workers.
+//
+// It intentionally combines plain tasks, workflow steps, actor commands, and LLM
+// requests because all of them flow through the same worker leasing path.
 message TaskSpec {
   string task_id = 1;
   string task_name = 2;
@@ -70,17 +90,28 @@ message TaskSpec {
   string actor_method = 14;
   bytes actor_state_json = 15;
   bytes actor_init_args_json = 16;
+
+  // actor_epoch fences actor state writes so stale completions cannot overwrite
+  // a newer actor ownership epoch.
   uint64 actor_epoch = 17;
   string llm_model_name = 18;
   string llm_model_version = 19;
   string llm_adapter = 20;
   uint32 llm_max_tokens = 21;
   int64 timeout_ms = 22;
+
+  // task_lease_epoch fences StartTask and CompleteTask against redelivery races.
   uint64 task_lease_epoch = 23;
+
+  // function_ref/function_hash identify cached or registry-backed function code;
+  // function_source remains available for inline submission paths.
   string function_ref = 24;
   string function_hash = 25;
 }
 
+// SubmitTaskRequest creates one standalone task.
+//
+// idempotency_key lets clients retry submission without creating duplicate work.
 message SubmitTaskRequest {
   string task_name = 1;
   string function_name = 2;
@@ -91,15 +122,18 @@ message SubmitTaskRequest {
   string function_hash = 7;
 }
 
+// SubmitTaskResponse returns the created or reused task id and initial status.
 message SubmitTaskResponse {
   string task_id = 1;
   TaskStatus status = 2;
 }
 
+// GetTaskStatusRequest selects one task by id.
 message GetTaskStatusRequest {
   string task_id = 1;
 }
 
+// GetTaskStatusResponse exposes the materialized state of one task.
 message GetTaskStatusResponse {
   string task_id = 1;
   TaskStatus status = 2;
@@ -110,6 +144,7 @@ message GetTaskStatusResponse {
   int64 updated_at_ms = 7;
 }
 
+// RegisterWorkerRequest advertises worker capacity, labels, and cached models.
 message RegisterWorkerRequest {
   string worker_id = 1;
   string address = 2;
@@ -118,41 +153,59 @@ message RegisterWorkerRequest {
   uint32 capacity = 5;
 }
 
+// RegisterWorkerResponse reports whether the control plane accepted the worker.
 message RegisterWorkerResponse {
   bool accepted = 1;
 }
 
+// HeartbeatRequest refreshes worker liveness and cache metadata.
 message HeartbeatRequest {
   string worker_id = 1;
   repeated ModelCacheEntry cached_models = 2;
 }
 
+// HeartbeatResponse returns server time so workers can observe clock-relative state.
 message HeartbeatResponse {
   int64 server_time_ms = 1;
 }
 
+// PollTaskRequest asks the scheduler for work for one worker.
+//
+// max_tasks enables batch polling; wait_timeout_ms allows long-poll behavior.
 message PollTaskRequest {
   string worker_id = 1;
   uint32 max_tasks = 2;
   int64 wait_timeout_ms = 3;
 }
 
+// PollTaskResponse supports both legacy single-task and batch-task responses.
+//
+// has_task/task are kept for older clients; tasks carries the batch form.
 message PollTaskResponse {
   bool has_task = 1;
   TaskSpec task = 2;
   repeated TaskSpec tasks = 3;
 }
 
+// StartTaskRequest claims a leased task before execution begins.
+//
+// task_lease_epoch must match the current lease to prevent stale workers from
+// starting redelivered work.
 message StartTaskRequest {
   string task_id = 1;
   string worker_id = 2;
   uint64 task_lease_epoch = 3;
 }
 
+// StartTaskResponse reports whether the lease claim was accepted.
 message StartTaskResponse {
   bool accepted = 1;
 }
 
+// CompleteTaskRequest finishes one leased task.
+//
+// actor_state_json and actor_epoch are populated for actor commands;
+// task_lease_epoch protects completion from stale workers after redelivery.
 message CompleteTaskRequest {
   string task_id = 1;
   string worker_id = 2;
@@ -164,25 +217,34 @@ message CompleteTaskRequest {
   uint64 task_lease_epoch = 8;
 }
 
+// CompleteTaskResponse reports whether the completion was applied.
 message CompleteTaskResponse {
   bool accepted = 1;
 }
 
+// CompleteTaskBatchRequest batches worker completions to reduce RPC overhead.
 message CompleteTaskBatchRequest {
   repeated CompleteTaskRequest tasks = 1;
 }
 
+// CompleteTaskBatchResult reports per-task acceptance and validation errors.
 message CompleteTaskBatchResult {
   string task_id = 1;
   bool accepted = 2;
   string error = 3;
 }
 
+// CompleteTaskBatchResponse reports aggregate and per-item batch completion
+// results.
 message CompleteTaskBatchResponse {
   bool accepted = 1;
   repeated CompleteTaskBatchResult results = 2;
 }
 
+// WorkflowStepState is the materialized view of one workflow DAG step.
+//
+// result_json carries inline results, while result_ref points to external object
+// storage when the result is too large for metadata.
 message WorkflowStepState {
   string step_id = 1;
   string task_name = 2;
@@ -198,21 +260,32 @@ message WorkflowStepState {
   repeated string depends_on = 12;
 }
 
+// SubmitWorkflowRequest creates a workflow from a JSON DAG definition.
+//
+// idempotency_key gives retry-safe submission semantics for the same logical
+// workflow request.
 message SubmitWorkflowRequest {
   string workflow_name = 1;
   bytes definition_json = 2;
   string idempotency_key = 3;
 }
 
+// SubmitWorkflowResponse returns the workflow id and initial aggregate status.
 message SubmitWorkflowResponse {
   string workflow_id = 1;
   WorkflowStatus status = 2;
 }
 
+// GetWorkflowStatusRequest selects one workflow by id.
 message GetWorkflowStatusRequest {
   string workflow_id = 1;
 }
 
+// GetWorkflowStatusResponse is the materialized workflow state returned to
+// clients.
+//
+// Steps are included so callers do not have to issue per-task lookups for DAG
+// progress, retries, results, and terminal errors.
 message GetWorkflowStatusResponse {
   string workflow_id = 1;
   string workflow_name = 2;
@@ -227,15 +300,24 @@ message GetWorkflowStatusResponse {
   int64 latency_ms = 11;
 }
 
+// ReplayWorkflowRequest asks the control plane to rebuild workflow state from logs.
 message ReplayWorkflowRequest {
   string workflow_id = 1;
 }
 
+// ReplayWorkflowResponse returns replayed workflow state plus a consistency flag.
+//
+// consistent_with_metadata compares log-derived state with the current metadata
+// materialization; false means replay found drift worth investigating.
 message ReplayWorkflowResponse {
   GetWorkflowStatusResponse replayed = 1;
   bool consistent_with_metadata = 2;
 }
 
+// CreateActorRequest creates a stateful actor from source and init args.
+//
+// snapshot_every controls optional command-count based snapshotting for faster
+// replay; zero leaves snapshot cadence to the implementation default.
 message CreateActorRequest {
   string class_name = 1;
   string class_source = 2;
@@ -244,6 +326,7 @@ message CreateActorRequest {
   uint32 snapshot_every = 5;
 }
 
+// CreateActorResponse returns actor identity, ownership, and epoch metadata.
 message CreateActorResponse {
   string actor_id = 1;
   ActorStatus status = 2;
@@ -251,6 +334,10 @@ message CreateActorResponse {
   uint64 epoch = 4;
 }
 
+// CallActorRequest submits one serialized actor method call.
+//
+// Actor calls flow through task scheduling but are sequenced by actor_id and
+// protected by idempotency_key for retry-safe command submission.
 message CallActorRequest {
   string actor_id = 1;
   string method_name = 2;
@@ -259,6 +346,7 @@ message CallActorRequest {
   int64 timeout_ms = 5;
 }
 
+// CallActorResponse reports the task-like status of an actor command.
 message CallActorResponse {
   string actor_id = 1;
   string call_id = 2;
@@ -268,10 +356,15 @@ message CallActorResponse {
   uint64 epoch = 6;
 }
 
+// GetActorStatusRequest selects one actor by id.
 message GetActorStatusRequest {
   string actor_id = 1;
 }
 
+// GetActorStatusResponse is the materialized actor state view.
+//
+// command_count counts applied commands; snapshot_ref and
+// snapshot_command_count describe the latest checkpoint used to shorten replay.
 message GetActorStatusResponse {
   string actor_id = 1;
   string class_name = 2;
@@ -286,10 +379,15 @@ message GetActorStatusResponse {
   int64 updated_at_ms = 11;
 }
 
+// ReplayActorRequest asks the control plane to rebuild actor state from logs.
 message ReplayActorRequest {
   string actor_id = 1;
 }
 
+// ReplayActorResponse returns replayed actor state and replay cost counters.
+//
+// full_replay_commands counts commands applied from the beginning;
+// snapshot_replay_commands counts commands applied after loading the snapshot.
 message ReplayActorResponse {
   GetActorStatusResponse replayed = 1;
   bool consistent_with_metadata = 2;
@@ -297,22 +395,30 @@ message ReplayActorResponse {
   uint64 snapshot_replay_commands = 4;
 }
 
+// RegisterModelRequest makes a model visible to scheduling and dashboard state.
 message RegisterModelRequest {
   ModelInfo model = 1;
 }
 
+// RegisterModelResponse returns the registered model record.
 message RegisterModelResponse {
   ModelInfo model = 1;
 }
 
+// SetSchedulingPolicyRequest changes the active placement policy.
 message SetSchedulingPolicyRequest {
   SchedulingPolicy policy = 1;
 }
 
+// SetSchedulingPolicyResponse echoes the policy that is now active.
 message SetSchedulingPolicyResponse {
   SchedulingPolicy policy = 1;
 }
 
+// SubmitLLMRequest creates an LLM-backed task.
+//
+// model_name/version/adapter select the target model, while idempotency_key
+// makes client retries safe at the control-plane submission boundary.
 message SubmitLLMRequest {
   string model_name = 1;
   string model_version = 2;
@@ -322,11 +428,13 @@ message SubmitLLMRequest {
   string idempotency_key = 6;
 }
 
+// SubmitLLMResponse returns the task id backing the LLM request.
 message SubmitLLMResponse {
   string task_id = 1;
   TaskStatus status = 2;
 }
 
+// LLMEvent records one replayable observation about LLM execution and cache use.
 message LLMEvent {
   string event_type = 1;
   int64 timestamp_ms = 2;
@@ -344,10 +452,15 @@ message LLMEvent {
   int64 eviction_count = 14;
 }
 
+// ReplayLLMRequest selects the LLM task whose events should be reconstructed.
 message ReplayLLMRequest {
   string task_id = 1;
 }
 
+// ReplayLLMResponse summarizes replayed LLM execution metrics.
+//
+// events preserves the underlying event stream so callers can audit how the
+// summary fields were derived.
 message ReplayLLMResponse {
   string task_id = 1;
   string model_name = 2;
@@ -364,18 +477,25 @@ message ReplayLLMResponse {
   int64 eviction_count = 13;
 }
 
+// SetBackpressureRequest updates runtime thresholds that affect scheduling
+// pressure.
+//
+// All values are expected to be positive when supplied through the web/API
+// validation layer.
 message SetBackpressureRequest {
   uint32 queue_high_watermark = 1;
   int64 redelivery_timeout_ms = 2;
   int64 log_append_slow_ms = 3;
 }
 
+// SetBackpressureResponse echoes the thresholds accepted by the control plane.
 message SetBackpressureResponse {
   uint32 queue_high_watermark = 1;
   int64 redelivery_timeout_ms = 2;
   int64 log_append_slow_ms = 3;
 }
 
+// DashboardTask is the compact task row used by dashboard snapshots.
 message DashboardTask {
   string task_id = 1;
   string task_name = 2;
@@ -390,6 +510,7 @@ message DashboardTask {
   int64 updated_at_ms = 11;
 }
 
+// DashboardWorkflow is the compact workflow row used by dashboard snapshots.
 message DashboardWorkflow {
   string workflow_id = 1;
   string workflow_name = 2;
@@ -397,6 +518,7 @@ message DashboardWorkflow {
   repeated WorkflowStepState steps = 4;
 }
 
+// DashboardWorker is the compact worker row used by dashboard snapshots.
 message DashboardWorker {
   string worker_id = 1;
   uint32 capacity = 2;
@@ -405,6 +527,7 @@ message DashboardWorker {
   int64 last_heartbeat_ms = 5;
 }
 
+// MetadataMaterializerStats exposes async metadata flush health and lag.
 message MetadataMaterializerStats {
   string mode = 1;
   uint64 pending_deltas = 2;
@@ -422,6 +545,11 @@ message MetadataMaterializerStats {
   int64 eventual_lag_estimate_ms = 14;
 }
 
+// DashboardSnapshot is an observational control-plane view, not a transactional
+// snapshot.
+//
+// The fields are intended for UI and diagnostics; individual sections may come
+// from materialized state that changes independently between refreshes.
 message DashboardSnapshot {
   uint32 queue_depth = 1;
   uint32 queue_high_watermark = 2;
@@ -439,28 +567,72 @@ message DashboardSnapshot {
   MetadataMaterializerStats metadata_materializer = 14;
 }
 
+// GetDashboardSnapshotRequest has no fields because the dashboard endpoint
+// currently returns one process-wide control-plane view.
 message GetDashboardSnapshotRequest {}
 
+// ControlService is the control-plane API for clients, workers, and the web UI.
 service ControlService {
+  // SubmitTask creates or reuses a standalone task.
   rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+
+  // GetTaskStatus returns materialized state for one task.
   rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+
+  // SubmitWorkflow creates or reuses a workflow from a JSON DAG definition.
   rpc SubmitWorkflow(SubmitWorkflowRequest) returns (SubmitWorkflowResponse);
+
+  // GetWorkflowStatus returns the materialized workflow and step states.
   rpc GetWorkflowStatus(GetWorkflowStatusRequest) returns (GetWorkflowStatusResponse);
+
+  // ReplayWorkflow rebuilds workflow state from the log for consistency checks.
   rpc ReplayWorkflow(ReplayWorkflowRequest) returns (ReplayWorkflowResponse);
+
+  // RegisterModel adds or updates a model record used by placement and UI views.
   rpc RegisterModel(RegisterModelRequest) returns (RegisterModelResponse);
+
+  // SetSchedulingPolicy changes the active task placement strategy.
   rpc SetSchedulingPolicy(SetSchedulingPolicyRequest) returns (SetSchedulingPolicyResponse);
+
+  // SubmitLLM creates an LLM task and returns its task id.
   rpc SubmitLLM(SubmitLLMRequest) returns (SubmitLLMResponse);
+
+  // ReplayLLM reconstructs LLM execution metrics from recorded events.
   rpc ReplayLLM(ReplayLLMRequest) returns (ReplayLLMResponse);
+
+  // SetBackpressure updates runtime scheduling and redelivery thresholds.
   rpc SetBackpressure(SetBackpressureRequest) returns (SetBackpressureResponse);
+
+  // GetDashboardSnapshot returns the current dashboard-oriented control view.
   rpc GetDashboardSnapshot(GetDashboardSnapshotRequest) returns (DashboardSnapshot);
+
+  // CreateActor creates or reuses a stateful actor.
   rpc CreateActor(CreateActorRequest) returns (CreateActorResponse);
+
+  // CallActor submits one serialized actor method call.
   rpc CallActor(CallActorRequest) returns (CallActorResponse);
+
+  // GetActorStatus returns materialized actor ownership, epoch, and state data.
   rpc GetActorStatus(GetActorStatusRequest) returns (GetActorStatusResponse);
+
+  // ReplayActor rebuilds actor state from the log and optional snapshots.
   rpc ReplayActor(ReplayActorRequest) returns (ReplayActorResponse);
+
+  // RegisterWorker announces worker capacity and cached model inventory.
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  // Heartbeat refreshes worker liveness and cache inventory.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // PollTask leases available work for a worker, optionally as a batch.
   rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
+
+  // StartTask records that a worker has begun a leased task.
   rpc StartTask(StartTaskRequest) returns (StartTaskResponse);
+
+  // CompleteTask records one task completion if the lease is still current.
   rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
+
+  // CompleteTasks records a batch of task completions with per-item results.
   rpc CompleteTasks(CompleteTaskBatchRequest) returns (CompleteTaskBatchResponse);
 }

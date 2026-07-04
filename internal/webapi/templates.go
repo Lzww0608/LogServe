@@ -1,5 +1,8 @@
 package webapi
 
+// This file defines built-in runnable console templates and the backend side
+// effects used to execute them.
+
 import (
 	"encoding/json"
 	"fmt"
@@ -10,6 +13,8 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// templateDTO describes a built-in runnable console example and the minimum role
+// required to execute it.
 type templateDTO struct {
 	ID             string `json:"id"`
 	Label          string `json:"label"`
@@ -20,14 +25,18 @@ type templateDTO struct {
 	Payload        any    `json:"payload,omitempty"`
 }
 
+// runTemplateRequest optionally supplies an idempotency key for a template run.
 type runTemplateRequest struct {
 	IdempotencyKey string `json:"idempotency_key"`
 }
 
+// handleListTemplates returns built-in templates without bulky source payloads.
 func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"templates": builtinTemplates(false)})
 }
 
+// handleGetTemplate returns one built-in template including its executable
+// payload for inspection by the console.
 func (s *Server) handleGetTemplate(w http.ResponseWriter, r *http.Request) {
 	template, ok := builtinTemplate(r.PathValue("template_id"), true)
 	if !ok {
@@ -37,6 +46,8 @@ func (s *Server) handleGetTemplate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, template)
 }
 
+// handleRunTemplate enforces the template-specific role gate, creates a default
+// idempotency key when needed, and runs the selected built-in example.
 func (s *Server) handleRunTemplate(w http.ResponseWriter, r *http.Request) {
 	templateID := strings.TrimSpace(r.PathValue("template_id"))
 	template, ok := builtinTemplate(templateID, false)
@@ -44,6 +55,8 @@ func (s *Server) handleRunTemplate(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "template not found")
 		return
 	}
+	// Templates can require a stricter role than the route-level operator gate, such
+	// as mock_llm_request needing admin because it registers a model.
 	if !roleAllows(principalFromRequest(r).Role, template.RequiredRole) {
 		writeAPIError(w, http.StatusForbidden, "PERMISSION_DENIED", "insufficient role for this template")
 		return
@@ -70,6 +83,8 @@ func (s *Server) handleRunTemplate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// runBuiltinTemplate dispatches template IDs to the concrete task, workflow,
+// actor, or LLM helper that performs backend side effects.
 func (s *Server) runBuiltinTemplate(r *http.Request, templateID, idempotencyKey string) (any, error) {
 	switch templateID {
 	case "add_task":
@@ -111,6 +126,8 @@ func (s *Server) runBuiltinTemplate(r *http.Request, templateID, idempotencyKey 
 	}
 }
 
+// runTaskTemplate submits a predefined task template and optionally waits for
+// terminal task status.
 func (s *Server) runTaskTemplate(r *http.Request, req *logservepb.SubmitTaskRequest) (TaskDTO, error) {
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
 	defer cancel()
@@ -125,6 +142,8 @@ func (s *Server) runTaskTemplate(r *http.Request, req *logservepb.SubmitTaskRequ
 	return dto, nil
 }
 
+// runWorkflowTemplate submits a predefined workflow definition and optionally
+// waits for terminal workflow status.
 func (s *Server) runWorkflowTemplate(r *http.Request, name string, definition []byte, idempotencyKey string) (WorkflowDTO, error) {
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
 	defer cancel()
@@ -143,6 +162,8 @@ func (s *Server) runWorkflowTemplate(r *http.Request, name string, definition []
 	return dto, nil
 }
 
+// runCounterTemplate creates a Counter actor and immediately calls inc(1), using
+// distinct idempotency suffixes for create and call operations.
 func (s *Server) runCounterTemplate(r *http.Request, idempotencyKey string) (map[string]any, error) {
 	ctx, cancel := requestContext(r, 35*time.Second)
 	defer cancel()
@@ -178,6 +199,8 @@ func (s *Server) runCounterTemplate(r *http.Request, idempotencyKey string) (map
 	}, nil
 }
 
+// runMockLLMTemplate registers the built-in mock model, explicitly audits that
+// model registration side effect, and submits a mock LLM task.
 func (s *Server) runMockLLMTemplate(r *http.Request, idempotencyKey string) (LLMDTO, error) {
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
 	defer cancel()
@@ -218,6 +241,7 @@ func (s *Server) runMockLLMTemplate(r *http.Request, idempotencyKey string) (LLM
 	return dto, nil
 }
 
+// builtinTemplates returns templates in the stable order used by the console UI.
 func builtinTemplates(includePayload bool) []templateDTO {
 	ids := []string{"add_task", "fail_task", "sleep_task", "simple_rag_workflow", "actor_counter", "mock_llm_request"}
 	out := make([]templateDTO, 0, len(ids))
@@ -228,6 +252,8 @@ func builtinTemplates(includePayload bool) []templateDTO {
 	return out
 }
 
+// builtinTemplate builds metadata for one known template and includes source
+// payloads only when requested by detail views.
 func builtinTemplate(id string, includePayload bool) (templateDTO, bool) {
 	template := templateDTO{RequiredRole: roleOperator}
 	switch id {
@@ -267,6 +293,8 @@ func builtinTemplate(id string, includePayload bool) (templateDTO, bool) {
 	return template, true
 }
 
+// simpleRAGWorkflowDefinition returns the built-in three-step DAG used by the
+// simple RAG workflow template.
 func simpleRAGWorkflowDefinition() map[string]any {
 	return map[string]any{
 		"workflow_name": "simple_rag",

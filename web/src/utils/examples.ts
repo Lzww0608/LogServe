@@ -1,3 +1,5 @@
+// Built-in Python and workflow examples used to seed console forms.
+
 export const addSource = `def add(a: int, b: int) -> int:
     return a + b
 `;

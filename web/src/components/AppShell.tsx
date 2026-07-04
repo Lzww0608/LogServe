@@ -1,8 +1,11 @@
+// Layout shell shared by all console routes.
+
 import type { ReactNode } from "react";
 import type { ConsoleSession } from "../types/logserve";
 import { Header } from "./Header";
 import { Sidebar } from "./Sidebar";
 
+// Compose the role-aware sidebar, top bar, and routed page content.
 export function AppShell({ path, title, session, sessionError, children }: { path: string; title: string; session?: ConsoleSession | null; sessionError?: string; children: ReactNode }) {
   return (
     <div className="shell">

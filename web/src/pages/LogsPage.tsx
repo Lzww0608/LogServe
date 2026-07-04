@@ -1,3 +1,5 @@
+// Log browser route for stream discovery, sequence pagination, and payload inspection.
+
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { InlineError } from "../components/ErrorPanel";
@@ -21,6 +23,7 @@ const prefixTabs = [
   { label: "LLM", value: "llm:" }
 ];
 
+// Render log stream search, sequence pagination, and payload inspection.
 export function LogsPage() {
   const [prefix, setPrefix] = useState("system:");
   const [streamQuery, setStreamQuery] = useState("");
@@ -30,6 +33,7 @@ export function LogsPage() {
   const [detailError, setDetailError] = useState("");
   const [recordPageSize, setRecordPageSize] = useState(defaultRecordPageSize);
   const [recordPageIndex, setRecordPageIndex] = useState(0);
+  // Store the starting sequence for each visited page because log pagination is next_seq-based.
   const [recordFromSeqs, setRecordFromSeqs] = useState<number[]>([1]);
   const [fromSeqText, setFromSeqText] = useState("1");
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -70,6 +74,7 @@ export function LogsPage() {
     }
     let cancelled = false;
     let timer: number | undefined;
+    // Load one log-record page and ignore late responses after stream changes.
     const loadDetail = async () => {
       try {
         const next = await api.logStream(selectedStream, currentFromSeq, recordPageSize);
@@ -100,6 +105,7 @@ export function LogsPage() {
   const nextSeq = detail?.next_seq ?? nextSeqFromRows(rows, currentFromSeq);
   const canNext = nextSeq > currentFromSeq && (Boolean(detail?.has_more) || (stats?.next_seq !== undefined && nextSeq < stats.next_seq));
 
+  // Reset record pagination to a user-entered sequence number.
   const jumpToSeq = () => {
     const parsed = Number(fromSeqText);
     if (!Number.isInteger(parsed) || parsed < 1) return;
@@ -168,6 +174,7 @@ export function LogsPage() {
   );
 }
 
+// Render the selected log record payload beside the record table.
 function PayloadDrawer({ record }: { record: LogRecord | null }) {
   if (!record) return <aside className="drawer-inline"><strong>Payload</strong><span className="subtle">Select a log record to inspect its payload.</span></aside>;
   return (
@@ -178,6 +185,7 @@ function PayloadDrawer({ record }: { record: LogRecord | null }) {
   );
 }
 
+// Choose the richest payload representation exposed by the backend DTO.
 function payloadValue(record: LogRecord): unknown {
   if (record.payload_json !== undefined) return record.payload_json;
   if (record.payload_text !== undefined) return record.payload_text;
@@ -185,17 +193,20 @@ function payloadValue(record: LogRecord): unknown {
   return null;
 }
 
+// Infer the next request sequence when the backend omits next_seq.
 function nextSeqFromRows(rows: LogStreamDetail["records"], fallback: number): number {
   if (!rows.length) return fallback;
   return rows[rows.length - 1].seq + 1;
 }
 
+// Describe the visible sequence range relative to the stream tail.
 function logPageLabel(rows: LogStreamDetail["records"], requestedFromSeq: number, streamNextSeq?: number): string {
   if (rows.length === 0) return streamNextSeq ? `No records from seq ${requestedFromSeq}` : "No records";
   const startSeq = rows[0].seq;
   const endSeq = rows[rows.length - 1].seq;
   return streamNextSeq === undefined ? `Seq ${startSeq}-${endSeq}` : `Seq ${startSeq}-${endSeq} before ${streamNextSeq}`;
 }
+// Constrain requested log page size to the backend-supported range.
 function clampRecordPageSize(value: string | number): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed)) return defaultRecordPageSize;

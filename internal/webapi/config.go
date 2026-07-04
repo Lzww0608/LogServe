@@ -1,5 +1,8 @@
 package webapi
 
+// This file owns environment-backed web API configuration and the role-token
+// normalization rules shared by server startup and tests.
+
 import (
 	"fmt"
 	"os"
@@ -8,6 +11,8 @@ import (
 	"time"
 )
 
+// Config contains the HTTP listen settings, backend addresses, auth tokens,
+// static asset path, CORS mode, and per-request backend timeout for webapi.
 type Config struct {
 	Addr                 string
 	ControlAddr          string
@@ -20,6 +25,8 @@ type Config struct {
 	RequestTimeout       time.Duration
 }
 
+// DefaultConfig reads LOGSERVE_WEB_* and backend address environment variables
+// and applies local-development defaults.
 func DefaultConfig() Config {
 	return Config{
 		Addr:        getenv("LOGSERVE_WEB_ADDR", "127.0.0.1:8080"),
@@ -38,6 +45,8 @@ func DefaultConfig() Config {
 	}
 }
 
+// normalizeAuthConfig trims role tokens and keeps the historical APIToken/admin
+// token aliases synchronized. Viewer/operator role tokens remain web-only.
 func normalizeAuthConfig(cfg *Config) {
 	cfg.APIToken = strings.TrimSpace(cfg.APIToken)
 	if cfg.RoleTokens == nil {
@@ -54,10 +63,14 @@ func normalizeAuthConfig(cfg *Config) {
 	}
 }
 
+// hasConfiguredToken reports whether backend/API authentication has at least one
+// admin-capable token configured.
 func hasConfiguredToken(cfg Config) bool {
 	return strings.TrimSpace(cfg.APIToken) != ""
 }
 
+// validateAuthConfig rejects duplicate role tokens so one presented bearer value
+// cannot ambiguously map to multiple roles.
 func validateAuthConfig(cfg Config) error {
 	seen := make(map[string]role)
 	for _, roleName := range []role{roleViewer, roleOperator, roleAdmin} {
@@ -72,6 +85,8 @@ func validateAuthConfig(cfg Config) error {
 	}
 	return nil
 }
+
+// getenv returns a trimmed environment value or the supplied fallback.
 func getenv(key, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
@@ -79,6 +94,8 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// getenvBool parses common boolean environment strings and falls back on empty
+// or unrecognized values.
 func getenvBool(key string, fallback bool) bool {
 	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
 	switch value {
@@ -91,6 +108,8 @@ func getenvBool(key string, fallback bool) bool {
 	}
 }
 
+// getenvInt parses an integer environment value and falls back on empty or
+// malformed input.
 func getenvInt(key string, fallback int) int {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {

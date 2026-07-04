@@ -1,16 +1,21 @@
+// Settings route for browser token management and session refresh.
+
 import { useState } from "react";
 import { getStoredToken, setStoredToken } from "../api/client";
 import type { ConsoleSession } from "../types/logserve";
 import { roleLabel } from "../utils/roles";
 
+// Render token save/clear controls that drive session refresh.
 export function SettingsPage({ session, onSessionChange }: { session?: ConsoleSession | null; onSessionChange?: () => void }) {
   const [token, setToken] = useState(getStoredToken());
   const [message, setMessage] = useState("");
+  // Save the entered token and trigger a session refresh in the app shell.
   const save = () => {
     setStoredToken(token);
     onSessionChange?.();
     setMessage("Saved");
   };
+  // Clear the stored token and reset visible session state.
   const clear = () => {
     setToken("");
     setStoredToken("");

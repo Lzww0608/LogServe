@@ -8,8 +8,12 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
+// checksumChunkSize bounds incremental checksum reads so large payloads do not
+// require an additional full-size buffer while being verified.
 const checksumChunkSize = 64 << 10
 
+// ChecksumType identifies the checksum algorithm stored in v2 record headers.
+// Older v1 records do not carry this field and are interpreted as IEEE CRC32.
 type ChecksumType uint16
 
 const (
@@ -24,6 +28,7 @@ var (
 	checksumIEEETable   = crc32.IEEETable
 )
 
+// String returns the stable diagnostic name for a checksum type.
 func (typ ChecksumType) String() string {
 	switch typ {
 	case ChecksumTypeIEEE:
@@ -39,6 +44,8 @@ func (typ ChecksumType) String() string {
 	}
 }
 
+// validateChecksumType rejects unknown checksum identifiers before they reach
+// the record encoder or recovery path.
 func validateChecksumType(typ ChecksumType) error {
 	switch typ {
 	case ChecksumTypeIEEE, ChecksumTypeCRC32C, ChecksumTypeXXH3, ChecksumTypeNone:
@@ -48,10 +55,13 @@ func validateChecksumType(typ ChecksumType) error {
 	}
 }
 
+// checksum computes the record-body checksum for the selected algorithm.
 func checksum(data []byte, typ ChecksumType) (uint32, error) {
 	return checksumOnce(data, typ)
 }
 
+// checksumOnce computes a checksum over a contiguous byte slice. It is used by
+// append and mmap-backed reads where the full body is already available.
 func checksumOnce(data []byte, typ ChecksumType) (uint32, error) {
 	switch typ {
 	case ChecksumTypeIEEE:
@@ -67,6 +77,8 @@ func checksumOnce(data []byte, typ ChecksumType) (uint32, error) {
 	}
 }
 
+// checksumChunked computes the same CRC values as checksumOnce while feeding
+// the data in fixed-size chunks; non-incremental algorithms still use one shot.
 func checksumChunked(data []byte, typ ChecksumType) (uint32, error) {
 	switch typ {
 	case ChecksumTypeIEEE:
@@ -98,20 +110,27 @@ func checksumChunked(data []byte, typ ChecksumType) (uint32, error) {
 	}
 }
 
+// verifyChecksum compares the computed checksum against the value stored in a
+// record header and treats unsupported algorithms as verification failures.
 func verifyChecksum(data []byte, typ ChecksumType, expected uint32) bool {
 	actual, err := checksum(data, typ)
 	return err == nil && actual == expected
 }
 
+// checksumAccumulator holds incremental CRC state for streaming verification.
+// XXH3 is intentionally excluded because the current read path only uses this
+// accumulator for algorithms supported by Go's incremental CRC APIs.
 type checksumAccumulator struct {
 	typ ChecksumType
 	crc uint32
 }
 
+// newChecksumAccumulator initializes an incremental checksum state.
 func newChecksumAccumulator(typ ChecksumType) checksumAccumulator {
 	return checksumAccumulator{typ: typ}
 }
 
+// update folds one chunk into the accumulator.
 func (a *checksumAccumulator) update(data []byte) error {
 	switch a.typ {
 	case ChecksumTypeIEEE:
@@ -125,6 +144,7 @@ func (a *checksumAccumulator) update(data []byte) error {
 	return nil
 }
 
+// sum returns the accumulated CRC value once all chunks have been processed.
 func (a *checksumAccumulator) sum() (uint32, error) {
 	switch a.typ {
 	case ChecksumTypeIEEE, ChecksumTypeCRC32C:

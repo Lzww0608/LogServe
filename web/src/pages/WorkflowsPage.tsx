@@ -1,3 +1,5 @@
+// Workflow list route with status filters and token-based pagination.
+
 import { useEffect, useMemo, useState } from "react";
 import { api, type WorkflowListQuery } from "../api/client";
 import { ErrorPanel } from "../components/ErrorPanel";
@@ -9,10 +11,12 @@ import { roleAtLeast } from "../utils/roles";
 
 const defaultPageSize = 50;
 
+// Render workflow filters and token-based list pagination.
 export function WorkflowsPage({ session }: { session?: ConsoleSession | null }) {
   const [status, setStatus] = useState("");
   const [pageSize, setPageSize] = useState(defaultPageSize);
   const [pageIndex, setPageIndex] = useState(0);
+  // Keep previously returned page tokens so Previous can work with token-based pagination.
   const [pageTokens, setPageTokens] = useState<string[]>([""]);
   const currentPageToken = pageTokens[pageIndex] ?? "";
 
@@ -62,6 +66,7 @@ export function WorkflowsPage({ session }: { session?: ConsoleSession | null }) 
   );
 }
 
+// Format a paginated workflow range from offset-style page state.
 function pageLabel(itemName: string, pageIndex: number, pageSize: number, rowCount: number, totalCount?: number): string {
   if (rowCount === 0) return totalCount === 0 ? `0 ${itemName}` : `No ${itemName}`;
   const start = pageIndex * pageSize + 1;

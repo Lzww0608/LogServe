@@ -1,3 +1,5 @@
+// Browser bootstrap for mounting the React console application.
+
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./app";

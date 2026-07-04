@@ -8,6 +8,7 @@ import (
 	"github.com/logserve/logserve/internal/metadata"
 )
 
+// llmPlacementScheduler builds worker placement state for locality and prediction benchmarks.
 func llmPlacementScheduler(workers int, cachedFraction float64) *Scheduler {
 	scheduler := newScheduler()
 	for i := 0; i < workers; i++ {
@@ -34,6 +35,7 @@ func llmPlacementScheduler(workers int, cachedFraction float64) *Scheduler {
 	return scheduler
 }
 
+// benchmarkPreferredLocalityWorker measures indexed locality lookup cost.
 func benchmarkPreferredLocalityWorker(b *testing.B, workers int) {
 	scheduler := llmPlacementScheduler(workers, divCachedFraction(workers))
 	key := modelKeyFromParts("model-A", "v1")
@@ -47,6 +49,7 @@ func benchmarkPreferredLocalityWorker(b *testing.B, workers int) {
 	}
 }
 
+// benchmarkPreferredLocalityWorkerNaive measures the scan-based comparison implementation.
 func benchmarkPreferredLocalityWorkerNaive(b *testing.B, workers int) {
 	scheduler := llmPlacementScheduler(workers, divCachedFraction(workers))
 	key := modelKeyFromParts("model-A", "v1")
@@ -60,6 +63,7 @@ func benchmarkPreferredLocalityWorkerNaive(b *testing.B, workers int) {
 	}
 }
 
+// benchmarkPreferredPredictedWorker measures predicted-latency placement lookup cost.
 func benchmarkPreferredPredictedWorker(b *testing.B, workers int) {
 	scheduler := llmPlacementScheduler(workers, divCachedFraction(workers))
 	key := modelKeyFromParts("model-A", "v1")
@@ -73,6 +77,8 @@ func benchmarkPreferredPredictedWorker(b *testing.B, workers int) {
 	}
 }
 
+// divCachedFraction keeps benchmark cache density high for small worker counts and
+// lower for larger counts.
 func divCachedFraction(workers int) float64 {
 	if workers <= 10 {
 		return 0.5
@@ -80,6 +86,8 @@ func divCachedFraction(workers int) float64 {
 	return 0.2
 }
 
+// preferredLocalityWorkerNaive is the benchmark baseline that scans every worker
+// instead of using the placement index.
 func (s *Scheduler) preferredLocalityWorkerNaive(key modelKey, createdAtMs, nowMs int64, waitMs int64) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -119,6 +127,7 @@ func (s *Scheduler) preferredLocalityWorkerNaive(key modelKey, createdAtMs, nowM
 	return bestWorker
 }
 
+// BenchmarkPreferredLocalityWorkerPlacementIndex measures cached placement lookup at multiple sizes.
 func BenchmarkPreferredLocalityWorkerPlacementIndex(b *testing.B) {
 	for _, workers := range []int{10, 100, 1000} {
 		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
@@ -127,6 +136,7 @@ func BenchmarkPreferredLocalityWorkerPlacementIndex(b *testing.B) {
 	}
 }
 
+// BenchmarkPreferredLocalityWorkerNaiveScan measures the scan baseline at multiple sizes.
 func BenchmarkPreferredLocalityWorkerNaiveScan(b *testing.B) {
 	for _, workers := range []int{10, 100, 1000} {
 		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
@@ -135,6 +145,7 @@ func BenchmarkPreferredLocalityWorkerNaiveScan(b *testing.B) {
 	}
 }
 
+// BenchmarkPreferredPredictedWorkerPlacementIndex measures predicted placement lookup at multiple sizes.
 func BenchmarkPreferredPredictedWorkerPlacementIndex(b *testing.B) {
 	for _, workers := range []int{10, 100, 1000} {
 		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
@@ -143,6 +154,8 @@ func BenchmarkPreferredPredictedWorkerPlacementIndex(b *testing.B) {
 	}
 }
 
+// TestPreferredPredictedWorkerStableTieBreak verifies equal predictions choose the
+// lexicographically smallest worker consistently.
 func TestPreferredPredictedWorkerStableTieBreak(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.UpsertWorker(metadata.Worker{WorkerID: "worker-b", Capacity: 2, LastHeartbeat: 1})

@@ -1,3 +1,5 @@
+// Test runner that starts the mock API, Vite, and Playwright in order.
+
 import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
 
@@ -39,6 +41,7 @@ try {
   process.exit(process.exitCode ?? 0);
 }
 
+// Spawn a long-lived helper process with inherited env plus test-specific overrides.
 function start(command, args, env) {
   const child = spawn(command, args, {
     cwd: process.cwd(),
@@ -51,9 +54,11 @@ function start(command, args, env) {
   return child;
 }
 
+// Poll a local HTTP endpoint until the child process is ready or exits early.
 function waitForHTTP(url, label, child, expectedText) {
   const deadline = Date.now() + 30_000;
   return new Promise((resolve, reject) => {
+    // Probe readiness while also checking whether the child exited early.
     const tryRequest = () => {
       const childExit = childExitError(child, label);
       if (childExit) {
@@ -84,6 +89,7 @@ function waitForHTTP(url, label, child, expectedText) {
         request.destroy(new Error(`${label} readiness request timed out`));
       });
     };
+    // Retry readiness probes until the deadline, then fail with the last observed error.
     const retryOrReject = (error) => {
       if (Date.now() >= deadline) {
         reject(new Error(`${label} was not ready at ${url}: ${error.message}`));
@@ -95,11 +101,13 @@ function waitForHTTP(url, label, child, expectedText) {
   });
 }
 
+// Report child-process early exit as a readiness failure.
 function childExitError(child, label) {
   if (child.exitCode === null && child.signalCode === null) return null;
   return new Error(`${label} process exited before readiness with code ${child.exitCode ?? "null"} signal ${child.signalCode ?? "null"}`);
 }
 
+// Terminate spawned servers, using taskkill on Windows to include child processes.
 function stop(child) {
   if (!child.pid || child.killed) return;
   if (process.platform === "win32") {
@@ -109,6 +117,7 @@ function stop(child) {
   child.kill("SIGTERM");
 }
 
+// Detect Lighthouse-only runs so reports and artifacts are separated from browser tests.
 function isLighthouseRun(args) {
   const grepIndex = args.findIndex((arg) => arg === "--grep" || arg.startsWith("--grep="));
   if (grepIndex < 0) return false;

@@ -1,3 +1,4 @@
+// Package workflow models LogServe workflow definitions, runtime state, argument resolution, and replay from the workflow event log.
 package workflow
 
 import (
@@ -10,6 +11,8 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// Definition is the durable workflow specification submitted to the control plane.
+// Defaults are applied by ParseDefinition before the definition is stored or scheduled.
 type Definition struct {
 	WorkflowName   string           `json:"workflow_name"`
 	FunctionSource string           `json:"function_source"`
@@ -22,6 +25,7 @@ type Definition struct {
 	TimeoutMs      int64            `json:"timeout_ms"`
 }
 
+// StepDefinition describes one executable node in a workflow DAG.
 type StepDefinition struct {
 	StepID          string          `json:"step_id"`
 	TaskName        string          `json:"task_name"`
@@ -39,6 +43,8 @@ type StepDefinition struct {
 	LLMMaxTokens    uint32          `json:"llm_max_tokens,omitempty"`
 }
 
+// State is the replayable runtime snapshot for a workflow execution.
+// The dag field is an in-memory acceleration structure rebuilt from Definition and StepState data.
 type State struct {
 	WorkflowID             string
 	WorkflowName           string
@@ -56,6 +62,7 @@ type State struct {
 	dag                    RuntimeDAG
 }
 
+// StepState records scheduler and execution progress for one workflow step.
 type StepState struct {
 	StepID            string
 	TaskName          string
@@ -73,6 +80,7 @@ type StepState struct {
 	LastScheduledAtMs int64
 }
 
+// RuntimeDAG keeps topological step state plus dependency counters and a ready queue for efficient scheduling.
 type RuntimeDAG struct {
 	steps         []StepState
 	byID          map[string]int
@@ -82,6 +90,7 @@ type RuntimeDAG struct {
 	readyHead     int
 }
 
+// ParseDefinition decodes a JSON workflow definition, applies defaults, validates the DAG, and returns steps in topological order.
 func ParseDefinition(data []byte) (Definition, error) {
 	var def Definition
 	if err := json.Unmarshal(data, &def); err != nil {
@@ -101,6 +110,8 @@ func ParseDefinition(data []byte) (Definition, error) {
 			def.Steps[i].TimeoutMs = def.TimeoutMs
 		}
 	}
+
+	// Historical definitions may omit result_step_id; the last submitted step becomes the result step.
 	if def.ResultStepID == "" && len(def.Steps) > 0 {
 		def.ResultStepID = def.Steps[len(def.Steps)-1].StepID
 	}
@@ -115,6 +126,7 @@ func ParseDefinition(data []byte) (Definition, error) {
 	return def, nil
 }
 
+// ValidateDefinition checks required step IDs, result step membership, dependency references, and cycles.
 func ValidateDefinition(def Definition) error {
 	if len(def.Steps) == 0 {
 		return errors.New("workflow must contain at least one step")
@@ -147,6 +159,8 @@ func ValidateDefinition(def Definition) error {
 	}
 	visiting := map[string]bool{}
 	visited := map[string]bool{}
+
+	// DFS keeps separate visiting and visited sets so back-edges are reported as dependency cycles.
 	var visit func(string) error
 	visit = func(stepID string) error {
 		if visiting[stepID] {
@@ -173,6 +187,7 @@ func ValidateDefinition(def Definition) error {
 	return nil
 }
 
+// NewState creates an initial running workflow state with a rebuilt runtime DAG and timestamps.
 func NewState(workflowID string, def Definition, nowMs int64) State {
 	def = normalizeDefinition(def)
 	dag := buildRuntimeDAG(def, nil)
@@ -188,6 +203,7 @@ func NewState(workflowID string, def Definition, nowMs int64) State {
 	}
 }
 
+// StepDefinitionByID finds the durable definition for a step ID.
 func StepDefinitionByID(def Definition, stepID string) (StepDefinition, bool) {
 	for _, step := range def.Steps {
 		if step.StepID == stepID {
@@ -197,6 +213,7 @@ func StepDefinitionByID(def Definition, stepID string) (StepDefinition, bool) {
 	return StepDefinition{}, false
 }
 
+// StepMaxAttempts returns the step-specific retry limit, falling back to the workflow default.
 func StepMaxAttempts(def Definition, stepID string) int {
 	step, ok := StepDefinitionByID(def, stepID)
 	if !ok || step.MaxAttempts <= 0 {
@@ -205,6 +222,7 @@ func StepMaxAttempts(def Definition, stepID string) int {
 	return step.MaxAttempts
 }
 
+// normalizeDefinition best-effort sorts steps topologically without rejecting already-validated callers.
 func normalizeDefinition(def Definition) Definition {
 	if ordered, err := topologicalStepDefinitions(def.Steps); err == nil {
 		def.Steps = ordered
@@ -212,6 +230,7 @@ func normalizeDefinition(def Definition) Definition {
 	return def
 }
 
+// topologicalStepDefinitions orders steps with Kahn's algorithm and reports unknown dependencies or cycles.
 func topologicalStepDefinitions(steps []StepDefinition) ([]StepDefinition, error) {
 	byID := make(map[string]int, len(steps))
 	for i, step := range steps {
@@ -229,6 +248,8 @@ func topologicalStepDefinitions(steps []StepDefinition) ([]StepDefinition, error
 			outgoing[depIdx] = append(outgoing[depIdx], i)
 		}
 	}
+
+	// The queue preserves the original order among simultaneously-ready steps, making scheduling deterministic.
 	queue := make([]int, 0, len(steps))
 	for i := range steps {
 		if indegree[i] == 0 {
@@ -252,6 +273,7 @@ func topologicalStepDefinitions(steps []StepDefinition) ([]StepDefinition, error
 	return ordered, nil
 }
 
+// buildRuntimeDAG merges durable step definitions with existing step state and initializes dependency counters plus the ready queue.
 func buildRuntimeDAG(def Definition, existing []StepState) RuntimeDAG {
 	def = normalizeDefinition(def)
 	existingByID := make(map[string]StepState, len(existing))
@@ -289,6 +311,8 @@ func buildRuntimeDAG(def Definition, existing []StepState) RuntimeDAG {
 				continue
 			}
 			dag.outgoing[depIdx] = append(dag.outgoing[depIdx], i)
+
+			// Only unfinished dependencies count; replayed successful steps unlock their downstream nodes immediately.
 			if dag.steps[depIdx].Status != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED {
 				dag.remainingDeps[i]++
 			}
@@ -302,6 +326,7 @@ func buildRuntimeDAG(def Definition, existing []StepState) RuntimeDAG {
 	return dag
 }
 
+// clone returns a deep copy of the runtime DAG so callers can mutate cloned State values independently.
 func (d RuntimeDAG) clone() RuntimeDAG {
 	out := RuntimeDAG{
 		steps:         cloneStepStates(d.steps),
@@ -320,6 +345,7 @@ func (d RuntimeDAG) clone() RuntimeDAG {
 	return out
 }
 
+// stepOrder returns the topological step ID order represented by the runtime DAG.
 func (d RuntimeDAG) stepOrder() []string {
 	out := make([]string, 0, len(d.steps))
 	for _, step := range d.steps {
@@ -328,6 +354,7 @@ func (d RuntimeDAG) stepOrder() []string {
 	return out
 }
 
+// stepReady reports whether a DAG index is schedulable: all dependencies are done, the step is scheduled, and no task is in flight.
 func (d RuntimeDAG) stepReady(idx int) bool {
 	if idx < 0 || idx >= len(d.steps) || idx >= len(d.remainingDeps) {
 		return false
@@ -338,6 +365,7 @@ func (d RuntimeDAG) stepReady(idx int) bool {
 		step.TaskID == ""
 }
 
+// popReady returns the next still-ready DAG index while skipping stale queue entries.
 func (d *RuntimeDAG) popReady() (int, bool) {
 	for d.readyHead < len(d.ready) {
 		idx := d.ready[d.readyHead]
@@ -346,11 +374,14 @@ func (d *RuntimeDAG) popReady() (int, bool) {
 			return idx, true
 		}
 	}
+
+	// Compact the queue after it is fully drained so old stale indices are not retained.
 	d.ready = nil
 	d.readyHead = 0
 	return 0, false
 }
 
+// ensureRuntime lazily rebuilds the in-memory DAG when a State was decoded or cloned without runtime fields.
 func (s *State) ensureRuntime() {
 	if s.dag.byID != nil && len(s.dag.steps) == len(s.StepOrder) {
 		return
@@ -358,8 +389,11 @@ func (s *State) ensureRuntime() {
 	s.RebuildRuntime()
 }
 
+// RebuildRuntime reconstructs the runtime DAG from durable definition and current step states.
 func (s *State) RebuildRuntime() {
 	var steps []StepState
+
+	// Preserve current step progress when rebuilding after status or task-ID transitions.
 	if s.dag.byID != nil {
 		steps = s.StepStatesInOrder()
 	}
@@ -368,6 +402,7 @@ func (s *State) RebuildRuntime() {
 	s.StepOrder = s.dag.stepOrder()
 }
 
+// Step returns a defensive copy of the current state for a step ID.
 func (s State) Step(stepID string) (StepState, bool) {
 	if s.dag.byID == nil {
 		s.RebuildRuntime()
@@ -378,6 +413,8 @@ func (s State) Step(stepID string) (StepState, bool) {
 	}
 	return cloneStepState(s.dag.steps[idx]), true
 }
+
+// UpdateStep applies a mutation callback to one step and rebuilds scheduling metadata when readiness can change.
 func (s *State) UpdateStep(stepID string, fn func(*StepState)) bool {
 	if fn == nil {
 		return false
@@ -395,12 +432,15 @@ func (s *State) UpdateStep(stepID string, fn func(*StepState)) bool {
 		step.StepID = stepID
 	}
 	s.dag.steps[idx] = cloneStepState(step)
+
+	// Status and task assignment affect ready-queue membership, so they require a DAG rebuild.
 	if step.Status != oldStatus || step.TaskID != oldTaskID {
 		s.RebuildRuntime()
 	}
 	return true
 }
 
+// StepAt returns the definition and state at a topological index.
 func (s State) StepAt(idx int) (StepDefinition, StepState, bool) {
 	if s.dag.byID == nil {
 		s.RebuildRuntime()
@@ -411,6 +451,7 @@ func (s State) StepAt(idx int) (StepDefinition, StepState, bool) {
 	return s.Definition.Steps[idx], cloneStepState(s.dag.steps[idx]), true
 }
 
+// StepStatesInOrder returns defensive copies of all step states in topological order.
 func (s State) StepStatesInOrder() []StepState {
 	if s.dag.byID == nil {
 		s.RebuildRuntime()
@@ -418,6 +459,7 @@ func (s State) StepStatesInOrder() []StepState {
 	return cloneStepStates(s.dag.steps)
 }
 
+// PopReadyStep returns the next ready step definition and state without marking it in-flight.
 func (s *State) PopReadyStep() (StepDefinition, StepState, bool) {
 	s.ensureRuntime()
 	for {
@@ -425,6 +467,8 @@ func (s *State) PopReadyStep() (StepDefinition, StepState, bool) {
 		if !ok {
 			return StepDefinition{}, StepState{}, false
 		}
+
+		// A stale runtime index can appear after decode/rebuild edge cases; skip it instead of panicking.
 		if idx >= len(s.Definition.Steps) {
 			continue
 		}
@@ -432,6 +476,7 @@ func (s *State) PopReadyStep() (StepDefinition, StepState, bool) {
 	}
 }
 
+// SetStepScheduled records that a workflow step has been assigned to a task attempt.
 func (s *State) SetStepScheduled(stepID, taskID string, attempt uint32, inputHash string, resolvedArgsJSON []byte, nowMs int64) bool {
 	s.ensureRuntime()
 	idx, ok := s.dag.byID[stepID]
@@ -453,6 +498,7 @@ func (s *State) SetStepScheduled(stepID, taskID string, attempt uint32, inputHas
 	return true
 }
 
+// SetStepStarted records the first worker start timestamp for a step task.
 func (s *State) SetStepStarted(stepID, taskID string, nowMs int64) bool {
 	s.ensureRuntime()
 	idx, ok := s.dag.byID[stepID]
@@ -460,6 +506,8 @@ func (s *State) SetStepStarted(stepID, taskID string, nowMs int64) bool {
 		return false
 	}
 	step := s.dag.steps[idx]
+
+	// Replayed or duplicate start events must not move an already-succeeded step backward.
 	if step.Status == logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SUCCEEDED {
 		return true
 	}
@@ -471,6 +519,7 @@ func (s *State) SetStepStarted(stepID, taskID string, nowMs int64) bool {
 	return true
 }
 
+// SetStepSucceeded stores a step result and unlocks downstream ready steps when this is the first success.
 func (s *State) SetStepSucceeded(stepID, taskID string, resultJSON []byte, resultRef string, nowMs, latencyMs int64) bool {
 	s.ensureRuntime()
 	idx, ok := s.dag.byID[stepID]
@@ -488,6 +537,8 @@ func (s *State) SetStepSucceeded(stepID, taskID string, resultJSON []byte, resul
 	step.LatencyMs = latencyMs
 	s.dag.steps[idx] = step
 	s.UpdatedAtMs = nowMs
+
+	// Duplicate success events are idempotent and must not decrement downstream dependency counters twice.
 	if wasSucceeded {
 		return true
 	}
@@ -505,6 +556,7 @@ func (s *State) SetStepSucceeded(stepID, taskID string, resultJSON []byte, resul
 	return true
 }
 
+// SetStepFailed records a failed step and optionally requeues it for retry when dependencies are still satisfied.
 func (s *State) SetStepFailed(stepID, taskID, stepErr string, retry bool, nowMs, latencyMs int64) bool {
 	s.ensureRuntime()
 	idx, ok := s.dag.byID[stepID]
@@ -529,6 +581,7 @@ func (s *State) SetStepFailed(stepID, taskID, stepErr string, retry bool, nowMs,
 	return true
 }
 
+// AllStepsSucceeded reports whether every step in the runtime DAG reached the succeeded status.
 func (s State) AllStepsSucceeded() bool {
 	if s.dag.byID == nil {
 		s.RebuildRuntime()
@@ -541,6 +594,7 @@ func (s State) AllStepsSucceeded() bool {
 	return true
 }
 
+// CloneState returns a deep copy of workflow state, including JSON payload slices and runtime DAG metadata.
 func CloneState(state State) State {
 	if state.dag.byID == nil {
 		state.RebuildRuntime()
@@ -552,6 +606,7 @@ func CloneState(state State) State {
 	return state
 }
 
+// CloneDefinition returns a deep copy of a workflow definition and all mutable slices.
 func CloneDefinition(def Definition) Definition {
 	def.ArgsJSON = append([]byte(nil), def.ArgsJSON...)
 	def.FunctionSource = string([]byte(def.FunctionSource))
@@ -564,6 +619,7 @@ func CloneDefinition(def Definition) Definition {
 	return def
 }
 
+// cloneStepStates deep-copies a slice of step states.
 func cloneStepStates(source []StepState) []StepState {
 	out := make([]StepState, len(source))
 	for i, step := range source {
@@ -572,12 +628,14 @@ func cloneStepStates(source []StepState) []StepState {
 	return out
 }
 
+// cloneStepState deep-copies JSON payload slices within one step state.
 func cloneStepState(step StepState) StepState {
 	step.ResultJSON = append([]byte(nil), step.ResultJSON...)
 	step.ResolvedArgsJSON = append([]byte(nil), step.ResolvedArgsJSON...)
 	return step
 }
 
+// stateJSON is the durable JSON shape for State without the in-memory runtime DAG.
 type stateJSON struct {
 	WorkflowID             string                    `json:"WorkflowID,omitempty"`
 	WorkflowName           string                    `json:"WorkflowName,omitempty"`
@@ -595,6 +653,7 @@ type stateJSON struct {
 	CompletedAtMs          int64                     `json:"CompletedAtMs,omitempty"`
 }
 
+// MarshalJSON serializes State using ordered step states and omits the derived runtime DAG.
 func (s State) MarshalJSON() ([]byte, error) {
 	if s.dag.byID == nil {
 		s.RebuildRuntime()
@@ -621,6 +680,7 @@ func (s State) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// UnmarshalJSON restores State from the durable JSON shape and rebuilds the runtime DAG.
 func (s *State) UnmarshalJSON(data []byte) error {
 	var raw stateJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -646,6 +706,8 @@ func (s *State) UnmarshalJSON(data []byte) error {
 		UpdatedAtMs:            raw.UpdatedAtMs,
 		CompletedAtMs:          raw.CompletedAtMs,
 	}
+
+	// Very old snapshots may omit Steps; rebuild scheduled step states from the definition.
 	if len(steps) == 0 && len(def.Steps) > 0 {
 		steps = buildRuntimeDAG(def, nil).steps
 	}
@@ -654,6 +716,7 @@ func (s *State) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// decodeStateSteps accepts the current ordered slice format and the legacy map keyed by step ID.
 func decodeStateSteps(raw json.RawMessage) ([]StepState, error) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
@@ -674,6 +737,8 @@ func decodeStateSteps(raw json.RawMessage) ([]StepState, error) {
 	for id := range legacy {
 		ids = append(ids, id)
 	}
+
+	// Sort legacy map keys to keep decode deterministic before the runtime DAG reapplies topological order.
 	sort.Strings(ids)
 	steps = make([]StepState, 0, len(ids))
 	for _, id := range ids {

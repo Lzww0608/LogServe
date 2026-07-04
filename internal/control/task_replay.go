@@ -6,6 +6,8 @@ import (
 	"github.com/logserve/logserve/internal/metadata"
 )
 
+// This file defines the task lifecycle replay state machine used by bootstrap and
+// metadata checkpoint tail replay.
 type taskReplayState struct {
 	spec                  *logservepb.TaskSpec
 	task                  metadata.Task
@@ -15,6 +17,7 @@ type taskReplayState struct {
 	ok                    bool
 }
 
+// replayTaskMetadataEach adapts protobuf log records into raw task replay state.
 func replayTaskMetadataEach(iterate func(func(*logservepb.LogRecord) error) error, initial *taskReplayState) (*taskReplayState, error) {
 	if iterate == nil {
 		return replayTaskMetadataRawEach(nil, initial)
@@ -26,6 +29,8 @@ func replayTaskMetadataEach(iterate func(func(*logservepb.LogRecord) error) erro
 	}, initial)
 }
 
+// replayTaskMetadataRawEach replays raw task records from an optional checkpointed
+// initial state.
 func replayTaskMetadataRawEach(iterate func(func(logrecord.RawRecord) error) error, initial *taskReplayState) (*taskReplayState, error) {
 	state := &taskReplayState{status: logservepb.TaskStatus_TASK_STATUS_QUEUED}
 	if initial != nil {
@@ -44,6 +49,8 @@ func replayTaskMetadataRawEach(iterate func(func(logrecord.RawRecord) error) err
 	}
 	return state, nil
 }
+
+// taskReplayStateFromCheckpoint seeds replay with checkpointed task metadata and spec.
 func taskReplayStateFromCheckpoint(task metadata.Task, spec *logservepb.TaskSpec) *taskReplayState {
 	if task.Status == logservepb.TaskStatus_TASK_STATUS_UNSPECIFIED {
 		task.Status = logservepb.TaskStatus_TASK_STATUS_QUEUED
@@ -57,10 +64,13 @@ func taskReplayStateFromCheckpoint(task metadata.Task, spec *logservepb.TaskSpec
 	}
 }
 
+// apply converts a protobuf record into raw form before applying it to replay state.
 func (s *taskReplayState) apply(rec *logservepb.LogRecord) error {
 	return s.applyRaw(logrecord.FromProto(rec))
 }
 
+// applyRaw folds one task lifecycle record into replay state while respecting lease
+// epochs and redelivery fences.
 func (s *taskReplayState) applyRaw(rec logrecord.RawRecord) error {
 	switch rec.EventType {
 	case "TaskSubmitted":
@@ -109,6 +119,8 @@ func (s *taskReplayState) applyRaw(rec logrecord.RawRecord) error {
 			}
 			return nil
 		}
+		// A start from an epoch that has already been redelivered is stale and must not
+		// move the task back to running during replay.
 		if payload.TaskLeaseEpoch <= s.redeliveredLeaseEpoch {
 			return nil
 		}
@@ -153,10 +165,14 @@ func (s *taskReplayState) applyRaw(rec logrecord.RawRecord) error {
 	}
 	return nil
 }
+
+// terminalEventApplies delegates lease-epoch fencing for completion/failure records.
 func (s *taskReplayState) terminalEventApplies(payload []byte) bool {
 	return taskTerminalEventApplies(s.status, s.leaseEpoch, s.redeliveredLeaseEpoch, payload)
 }
 
+// finalTask converts replay state into metadata and requeues in-flight running work
+// because no worker lease can be trusted across control restart.
 func (s *taskReplayState) finalTask() metadata.Task {
 	task := s.task
 	if s.spec != nil {

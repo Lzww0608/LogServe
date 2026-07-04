@@ -1,9 +1,12 @@
+// Playwright browser coverage for the LogServe console workflows.
+
 import { expect, test, chromium, type Page } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 test.describe.configure({ mode: "serial" });
 
+// Verifies settings saves token and sends it on console requests.
 test("settings saves token and sends it on console requests", async ({ page }) => {
   await page.goto("/settings");
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
@@ -21,12 +24,14 @@ test("settings saves token and sends it on console requests", async ({ page }) =
   await expectOverview(page);
 });
 
+// Verifies overview renders control-plane snapshot.
 test("overview renders control-plane snapshot", async ({ page }) => {
   await page.goto("/");
   await expectOverview(page);
   await expectNoDocumentOverflow(page);
 });
 
+// Verifies task and workflow lists render paginated API data.
 test("task and workflow lists render paginated API data", async ({ page }) => {
   await page.goto("/tasks");
   await expect(page.getByRole("link", { name: "task-queued-1" })).toBeVisible();
@@ -49,6 +54,7 @@ test("task and workflow lists render paginated API data", async ({ page }) => {
   await expect(page.locator(".sidebar a.active")).toHaveText("Workflow Builder");
   await expectNoDocumentOverflow(page);
 });
+// Verifies submit task navigates to task detail.
 test("submit task navigates to task detail", async ({ page }) => {
   await page.goto("/submit/task");
   await expect(page.getByRole("heading", { name: "Submit Task" })).toBeVisible();
@@ -71,6 +77,7 @@ test("submit task navigates to task detail", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Result" })).toBeVisible();
 });
 
+// Verifies template library lists and runs a built-in template.
 test("template library lists and runs a built-in template", async ({ page }) => {
   await page.goto("/templates");
   await expect(page.getByRole("heading", { name: "Templates" })).toBeVisible();
@@ -85,6 +92,7 @@ test("template library lists and runs a built-in template", async ({ page }) => 
   await expect(page.getByText("Last run: Add task")).toBeVisible();
   await expect(page.getByText("task-template-1")).toBeVisible();
 });
+// Verifies viewer role hides operator-only console actions.
 test("viewer role hides operator-only console actions", async ({ page }) => {
   await page.goto("/settings");
   await page.getByLabel("API token").fill("viewer-token");
@@ -101,6 +109,7 @@ test("viewer role hides operator-only console actions", async ({ page }) => {
   await page.goto("/workflows");
   await expect(page.getByRole("link", { name: "New" })).toHaveCount(0);
 });
+// Verifies workflow detail renders graphical DAG and step drawer.
 test("workflow detail renders graphical DAG and step drawer", async ({ page }) => {
   await page.goto("/workflows/wf-1");
   await expect(page.getByRole("heading", { name: "Workflow Detail" })).toBeVisible();
@@ -121,6 +130,7 @@ test("workflow detail renders graphical DAG and step drawer", async ({ page }) =
   await expect(page.getByText("Consistent", { exact: true })).toBeVisible();
   await expectNoDocumentOverflow(page);
 });
+// Verifies workflow builder validates structured DAG definition.
 test("workflow builder validates structured DAG definition", async ({ page }) => {
   await page.goto("/workflows/new");
   await expect(page.getByRole("heading", { name: "Workflow Builder" })).toBeVisible();
@@ -138,6 +148,7 @@ test("workflow builder validates structured DAG definition", async ({ page }) =>
   await expectNoDocumentOverflow(page);
 });
 
+// Verifies LLM page form accepts model and prompt interactions.
 test("LLM page form accepts model and prompt interactions", async ({ page }) => {
   await page.goto("/llm");
   await expect(page.getByRole("heading", { name: "LLM", exact: true })).toBeVisible();
@@ -171,6 +182,7 @@ test("LLM page form accepts model and prompt interactions", async ({ page }) => 
   await expect(page.getByText("Total latency")).toBeVisible();
 });
 
+// Verifies logs page switches stream groups and stream details.
 test("logs page switches stream groups and stream details", async ({ page }) => {
   await page.goto("/logs");
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
@@ -201,6 +213,7 @@ test("logs page switches stream groups and stream details", async ({ page }) => 
   await expectNoDocumentOverflow(page);
 });
 
+// Verifies mobile viewport screenshot has no collapsed console layout.
 test("mobile viewport screenshot has no collapsed console layout", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
@@ -210,6 +223,7 @@ test("mobile viewport screenshot has no collapsed console layout", async ({ page
   await page.screenshot({ path: testInfo.outputPath("mobile-overview.png"), fullPage: true });
 });
 
+// Verifies Lighthouse accessibility score is at least 90 @lighthouse.
 test("Lighthouse accessibility score is at least 90 @lighthouse", async ({ baseURL }, testInfo) => {
   const remoteDebuggingPort = 9222 + testInfo.workerIndex;
   const browser = await chromium.launch({
@@ -240,6 +254,7 @@ test("Lighthouse accessibility score is at least 90 @lighthouse", async ({ baseU
   }
 });
 
+// Assert the core overview sections that should render after dashboard SSE data arrives.
 async function expectOverview(page: Page): Promise<void> {
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   await expect(page.getByText("Queue Depth")).toBeVisible();
@@ -250,6 +265,7 @@ async function expectOverview(page: Page): Promise<void> {
   await expect(page.getByRole("heading", { name: "Workers" })).toBeVisible();
 }
 
+// Assert the document does not horizontally overflow the viewport.
 async function expectNoDocumentOverflow(page: Page): Promise<void> {
   const overflow = await page.evaluate(() => ({
     viewportWidth: document.documentElement.clientWidth,
@@ -258,6 +274,7 @@ async function expectNoDocumentOverflow(page: Page): Promise<void> {
   expect(overflow.scrollWidth, `document width ${overflow.scrollWidth} should fit viewport ${overflow.viewportWidth}`).toBeLessThanOrEqual(overflow.viewportWidth + 2);
 }
 
+// Assert the mobile shell stacks sidebar, header, and KPI grid without overlap.
 async function expectMobileShellLayout(page: Page): Promise<void> {
   const sidebar = await requiredBox(page, ".sidebar");
   const content = await requiredBox(page, ".content");
@@ -271,11 +288,13 @@ async function expectMobileShellLayout(page: Page): Promise<void> {
   }
 }
 
+// Read a required bounding box and fail the test if the element is not measurable.
 async function requiredBox(page: Page, selector: string) {
   const box = await page.locator(selector).boundingBox();
   expect(box, `${selector} should be visible and measurable`).not.toBeNull();
   return box!;
 }
+// Write Lighthouse artifacts after ensuring the Playwright output directory exists.
 async function writeArtifact(path: string, content: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, content, "utf8");

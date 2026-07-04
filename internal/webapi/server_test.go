@@ -1,5 +1,8 @@
 package webapi
 
+// This file exercises the web API through a fake gRPC client and real HTTP
+// handlers, covering auth, RBAC, SSE, templates, and DTO behavior.
+
 import (
 	"bufio"
 	"context"
@@ -19,6 +22,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// fakeClientConn is an in-memory grpc.ClientConnInterface used to exercise webapi
+// handlers without starting real control or log services.
 type fakeClientConn struct {
 	dashboard          *logservepb.DashboardSnapshot
 	taskStatus         *logservepb.GetTaskStatusResponse
@@ -37,6 +42,8 @@ type fakeClientConn struct {
 	calls              []string
 }
 
+// Invoke records the method/request and fills canned protobuf responses for the
+// subset of RPCs covered by webapi tests.
 func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply any, _ ...grpc.CallOption) error {
 	if method == logservepb.LogService_AppendLog_FullMethodName {
 		if in, ok := req.(*logservepb.AppendLogRequest); ok {
@@ -165,10 +172,13 @@ func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply
 	}
 }
 
+// NewStream reports unsupported streaming because these tests exercise unary
+// client calls through HTTP handlers.
 func (f *fakeClientConn) NewStream(context.Context, *grpc.StreamDesc, string, ...grpc.CallOption) (grpc.ClientStream, error) {
 	return nil, errors.New("streaming RPCs are not used by webapi tests")
 }
 
+// newTestServer wires a Server around fake control/log clients for handler tests.
 func newTestServer(conn *fakeClientConn, token string, allowUnauthenticated bool) *Server {
 	if conn == nil {
 		conn = &fakeClientConn{}
@@ -190,6 +200,8 @@ func newTestServer(conn *fakeClientConn, token string, allowUnauthenticated bool
 	return s
 }
 
+// TestMiddlewareRequiresBearerTokenForAPI verifies API routes reject missing or
+// incorrect bearer tokens and accept the configured token.
 func TestMiddlewareRequiresBearerTokenForAPI(t *testing.T) {
 	conn := &fakeClientConn{
 		dashboard: &logservepb.DashboardSnapshot{
@@ -230,6 +242,8 @@ func TestMiddlewareRequiresBearerTokenForAPI(t *testing.T) {
 	}
 }
 
+// TestHealthzBypassesAuth verifies the health endpoint remains available without
+// API credentials.
 func TestHealthzBypassesAuth(t *testing.T) {
 	srv := newTestServer(nil, "secret-token", false)
 
@@ -241,6 +255,8 @@ func TestHealthzBypassesAuth(t *testing.T) {
 	}
 }
 
+// TestAllowUnauthenticatedBypassesToken verifies local development mode bypasses
+// bearer-token checks.
 func TestAllowUnauthenticatedBypassesToken(t *testing.T) {
 	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{}}
 	srv := newTestServer(conn, "", true)
@@ -253,6 +269,8 @@ func TestAllowUnauthenticatedBypassesToken(t *testing.T) {
 	}
 }
 
+// TestDashboardSerializesEmptyCollectionsAsArrays locks down non-null JSON arrays
+// for dashboard collection fields.
 func TestDashboardSerializesEmptyCollectionsAsArrays(t *testing.T) {
 	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{}}
 	srv := newTestServer(conn, "secret-token", false)
@@ -278,6 +296,8 @@ func TestDashboardSerializesEmptyCollectionsAsArrays(t *testing.T) {
 	}
 }
 
+// TestDecodeJSONRejectsTrailingValue verifies strict request-body decoding rejects
+// multiple top-level JSON values.
 func TestDecodeJSONRejectsTrailingValue(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"task_name":"x"} {"task_name":"y"}`))
 	var input submitTaskRequest
@@ -292,6 +312,8 @@ func TestDecodeJSONRejectsTrailingValue(t *testing.T) {
 	}
 }
 
+// TestGetTaskMergesDashboardMetadata ensures task detail responses combine
+// authoritative status with dashboard-only metadata.
 func TestGetTaskMergesDashboardMetadata(t *testing.T) {
 	conn := &fakeClientConn{
 		taskStatus: &logservepb.GetTaskStatusResponse{
@@ -331,6 +353,8 @@ func TestGetTaskMergesDashboardMetadata(t *testing.T) {
 	}
 }
 
+// TestListTasksFiltersAndPaginates covers task status filtering, search, and
+// pagination metadata.
 func TestListTasksFiltersAndPaginates(t *testing.T) {
 	conn := &fakeClientConn{
 		dashboard: &logservepb.DashboardSnapshot{Tasks: []*logservepb.DashboardTask{
@@ -382,6 +406,9 @@ func TestListTasksFiltersAndPaginates(t *testing.T) {
 		t.Fatalf("second page = %+v", secondPayload)
 	}
 }
+
+// TestListPaginationRejectsInvalidQuery verifies shared pagination validation is
+// surfaced as a bad request.
 func TestListPaginationRejectsInvalidQuery(t *testing.T) {
 	cases := []string{
 		"/api/tasks?limit=0",
@@ -401,6 +428,9 @@ func TestListPaginationRejectsInvalidQuery(t *testing.T) {
 		}
 	}
 }
+
+// TestTaskOperationRequiresToken verifies retry/resubmit endpoints remain protected
+// by API authentication.
 func TestTaskOperationRequiresToken(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newTestServer(conn, "secret-token", false)
@@ -416,6 +446,8 @@ func TestTaskOperationRequiresToken(t *testing.T) {
 	}
 }
 
+// TestRetryFailedTaskSubmitsOriginalSpecAsNewTask verifies retry recovers the
+// original TaskSubmitted spec and submits a fresh task.
 func TestRetryFailedTaskSubmitsOriginalSpecAsNewTask(t *testing.T) {
 	conn := &fakeClientConn{
 		taskStatus: &logservepb.GetTaskStatusResponse{TaskId: "task-1", Status: logservepb.TaskStatus_TASK_STATUS_FAILED, Error: "boom"},
@@ -463,6 +495,8 @@ func TestRetryFailedTaskSubmitsOriginalSpecAsNewTask(t *testing.T) {
 	}
 }
 
+// TestResubmitTaskSubmitsOriginalSpecAsNewTask verifies resubmit works from the
+// original submitted spec without requiring failed status.
 func TestResubmitTaskSubmitsOriginalSpecAsNewTask(t *testing.T) {
 	conn := &fakeClientConn{
 		taskStatus: &logservepb.GetTaskStatusResponse{TaskId: "task-1", Status: logservepb.TaskStatus_TASK_STATUS_SUCCEEDED},
@@ -497,6 +531,7 @@ func TestResubmitTaskSubmitsOriginalSpecAsNewTask(t *testing.T) {
 	}
 }
 
+// TestRetryRejectsNonFailedTask ensures retry is limited to failed tasks.
 func TestRetryRejectsNonFailedTask(t *testing.T) {
 	conn := &fakeClientConn{taskStatus: &logservepb.GetTaskStatusResponse{TaskId: "task-1", Status: logservepb.TaskStatus_TASK_STATUS_RUNNING}}
 	srv := newTestServer(conn, "secret-token", false)
@@ -514,6 +549,8 @@ func TestRetryRejectsNonFailedTask(t *testing.T) {
 	}
 }
 
+// TestTaskOperationRejectsDerivedTask verifies retry/resubmit reject workflow,
+// actor, LLM, or internally scheduled task specs.
 func TestTaskOperationRejectsDerivedTask(t *testing.T) {
 	conn := &fakeClientConn{
 		taskStatus: &logservepb.GetTaskStatusResponse{TaskId: "task-step", Status: logservepb.TaskStatus_TASK_STATUS_FAILED},
@@ -543,6 +580,8 @@ func TestTaskOperationRejectsDerivedTask(t *testing.T) {
 	}
 }
 
+// TestCancelTaskReturnsUnsupported documents the current unsupported cancellation
+// endpoint behavior.
 func TestCancelTaskReturnsUnsupported(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newTestServer(conn, "secret-token", false)
@@ -563,6 +602,8 @@ func TestCancelTaskReturnsUnsupported(t *testing.T) {
 	}
 }
 
+// taskSubmittedRecord builds an encoded TaskSubmitted log record for retry and
+// resubmit tests.
 func taskSubmittedRecord(t *testing.T, spec *logservepb.TaskSpec) *logservepb.LogRecord {
 	t.Helper()
 	specData, err := proto.Marshal(spec)
@@ -580,6 +621,9 @@ func taskSubmittedRecord(t *testing.T, spec *logservepb.TaskSpec) *logservepb.Lo
 		Payload:   payload,
 	}
 }
+
+// TestListWorkflowsFiltersAndPaginates covers workflow status filtering and shared
+// pagination metadata.
 func TestListWorkflowsFiltersAndPaginates(t *testing.T) {
 	conn := &fakeClientConn{
 		dashboard: &logservepb.DashboardSnapshot{Workflows: []*logservepb.DashboardWorkflow{
@@ -629,6 +673,9 @@ func TestListWorkflowsFiltersAndPaginates(t *testing.T) {
 		t.Fatalf("second workflow page = %+v", secondPayload)
 	}
 }
+
+// TestWorkflowStepsExposeDependenciesForDAGRendering verifies dependency fields
+// survive DTO conversion for the workflow graph UI.
 func TestWorkflowStepsExposeDependenciesForDAGRendering(t *testing.T) {
 	conn := &fakeClientConn{
 		dashboard: &logservepb.DashboardSnapshot{
@@ -667,6 +714,8 @@ func TestWorkflowStepsExposeDependenciesForDAGRendering(t *testing.T) {
 	}
 }
 
+// TestLogExplorerListsStreamsAndReadsRecords covers stream listing, stats, and
+// payload representation in log explorer responses.
 func TestLogExplorerListsStreamsAndReadsRecords(t *testing.T) {
 	conn := &fakeClientConn{
 		streams: &logservepb.ListStreamsResponse{StreamIds: []string{"system:functions"}},
@@ -730,6 +779,8 @@ func TestLogExplorerListsStreamsAndReadsRecords(t *testing.T) {
 	}
 }
 
+// TestLogExplorerReturnsPaginationMetadata verifies next_seq and has_more are
+// computed from log records plus stream stats.
 func TestLogExplorerReturnsPaginationMetadata(t *testing.T) {
 	conn := &fakeClientConn{
 		readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{
@@ -764,6 +815,8 @@ func TestLogExplorerReturnsPaginationMetadata(t *testing.T) {
 		t.Fatalf("log page = %+v", payload)
 	}
 }
+
+// TestLogExplorerRejectsHugeLimit checks the log explorer limit guard.
 func TestLogExplorerRejectsHugeLimit(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newTestServer(conn, "secret-token", false)
@@ -781,6 +834,8 @@ func TestLogExplorerRejectsHugeLimit(t *testing.T) {
 	}
 }
 
+// TestLogExplorerDoesNotDoubleDecodeStreamID prevents path values containing
+// percent escapes from being decoded twice.
 func TestLogExplorerDoesNotDoubleDecodeStreamID(t *testing.T) {
 	streamID := "system:%2Fraw"
 	conn := &fakeClientConn{
@@ -810,6 +865,8 @@ func TestLogExplorerDoesNotDoubleDecodeStreamID(t *testing.T) {
 	}
 }
 
+// TestListFunctionsFromRegistryStream verifies function registry entries are read
+// from the system:functions log stream.
 func TestListFunctionsFromRegistryStream(t *testing.T) {
 	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{
 		{
@@ -871,6 +928,8 @@ func TestListFunctionsFromRegistryStream(t *testing.T) {
 	}
 }
 
+// TestFunctionRegistryCachesAndTailsRecords verifies incremental tailing from the
+// cached next sequence instead of rereading the whole registry stream.
 func TestFunctionRegistryCachesAndTailsRecords(t *testing.T) {
 	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
 		StreamId:    "system:functions",
@@ -927,6 +986,8 @@ func TestFunctionRegistryCachesAndTailsRecords(t *testing.T) {
 	}
 }
 
+// TestListFunctionsSkipsMalformedRegistryRecord verifies malformed registry events
+// are counted and skipped rather than failing the whole listing.
 func TestListFunctionsSkipsMalformedRegistryRecord(t *testing.T) {
 	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
 		StreamId:  "system:functions",
@@ -964,6 +1025,8 @@ func TestListFunctionsSkipsMalformedRegistryRecord(t *testing.T) {
 		t.Fatalf("functions = %+v, want valid record only", payload.Functions)
 	}
 }
+
+// TestGetFunctionByHash verifies lookup of one function registry entry.
 func TestGetFunctionByHash(t *testing.T) {
 	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
 		StreamId:    "system:functions",
@@ -991,6 +1054,8 @@ func TestGetFunctionByHash(t *testing.T) {
 	}
 }
 
+// TestGetFunctionReturnsNotFound verifies unknown function hashes use the API error
+// path.
 func TestGetFunctionReturnsNotFound(t *testing.T) {
 	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
 		StreamId:  "system:functions",
@@ -1010,6 +1075,8 @@ func TestGetFunctionReturnsNotFound(t *testing.T) {
 	}
 }
 
+// TestListFunctionsRequiresToken verifies function registry endpoints are not
+// publicly accessible.
 func TestListFunctionsRequiresToken(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newTestServer(conn, "secret-token", false)
@@ -1024,6 +1091,8 @@ func TestListFunctionsRequiresToken(t *testing.T) {
 		t.Fatalf("unauthorized request reached backend: %v", conn.calls)
 	}
 }
+
+// TestEventsRequiresToken verifies SSE endpoints are protected by authentication.
 func TestEventsRequiresToken(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newTestServer(conn, "secret-token", false)
@@ -1039,6 +1108,8 @@ func TestEventsRequiresToken(t *testing.T) {
 	}
 }
 
+// TestDashboardEventsStreamInitialSnapshot verifies dashboard SSE sends an initial
+// snapshot event.
 func TestDashboardEventsStreamInitialSnapshot(t *testing.T) {
 	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{
 		QueueDepth:          3,
@@ -1076,6 +1147,8 @@ func TestDashboardEventsStreamInitialSnapshot(t *testing.T) {
 	}
 }
 
+// TestTaskEventsStreamByTaskID verifies task-specific SSE subscriptions emit task
+// payloads.
 func TestTaskEventsStreamByTaskID(t *testing.T) {
 	conn := &fakeClientConn{
 		taskStatus: &logservepb.GetTaskStatusResponse{
@@ -1112,6 +1185,8 @@ func TestTaskEventsStreamByTaskID(t *testing.T) {
 	}
 }
 
+// TestWorkflowEventsStreamFromWorkflowStream verifies wf: stream shortcuts emit
+// workflow summary events by default.
 func TestWorkflowEventsStreamFromWorkflowStream(t *testing.T) {
 	conn := &fakeClientConn{workflowStatus: &logservepb.GetWorkflowStatusResponse{
 		WorkflowId:   "wf-1",
@@ -1145,6 +1220,8 @@ func TestWorkflowEventsStreamFromWorkflowStream(t *testing.T) {
 	}
 }
 
+// TestLogEventsStreamAppendsRecordsFromStream verifies raw log-record SSE advances
+// its sequence cursor after each batch.
 func TestLogEventsStreamAppendsRecordsFromStream(t *testing.T) {
 	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
 		StreamId:  "system:functions",
@@ -1180,6 +1257,8 @@ func TestLogEventsStreamAppendsRecordsFromStream(t *testing.T) {
 	}
 }
 
+// TestWorkflowStreamEventsCanAppendLogRecords verifies records=true forces wf:
+// streams into raw log-record SSE mode.
 func TestWorkflowStreamEventsCanAppendLogRecords(t *testing.T) {
 	conn := &fakeClientConn{readLog: &logservepb.ReadLogResponse{Records: []*logservepb.LogRecord{{
 		StreamId:  "wf:wf-1",
@@ -1208,6 +1287,9 @@ func TestWorkflowStreamEventsCanAppendLogRecords(t *testing.T) {
 		t.Fatalf("workflow log event payload = %+v", payload)
 	}
 }
+
+// openSSE starts an httptest server and opens one authenticated SSE response for
+// event-stream assertions.
 func openSSE(t *testing.T, srv *Server, target string) *http.Response {
 	t.Helper()
 	httpSrv := httptest.NewServer(srv.Handler())
@@ -1226,6 +1308,7 @@ func openSSE(t *testing.T, srv *Server, target string) *http.Response {
 	return resp
 }
 
+// readSSEEvent reads one SSE frame and returns its event name and data payload.
 func readSSEEvent(t *testing.T, resp *http.Response) (string, string) {
 	t.Helper()
 	reader := bufio.NewReader(resp.Body)
@@ -1248,6 +1331,9 @@ func readSSEEvent(t *testing.T, resp *http.Response) (string, string) {
 		}
 	}
 }
+
+// TestAdminConfigExposesBackpressureFields verifies admin config exposes
+// scheduler, backpressure, log, and materializer fields.
 func TestAdminConfigExposesBackpressureFields(t *testing.T) {
 	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{
 		SchedulingPolicy:      logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE,
@@ -1288,6 +1374,8 @@ func TestAdminConfigExposesBackpressureFields(t *testing.T) {
 	}
 }
 
+// TestSetBackpressureRequiresToken verifies the admin backpressure endpoint stays
+// authenticated.
 func TestSetBackpressureRequiresToken(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newTestServer(conn, "secret-token", false)
@@ -1303,6 +1391,8 @@ func TestSetBackpressureRequiresToken(t *testing.T) {
 	}
 }
 
+// TestSetBackpressureRejectsInvalidValues covers validation for zero or negative
+// threshold inputs.
 func TestSetBackpressureRejectsInvalidValues(t *testing.T) {
 	cases := []string{
 		`{"queue_high_watermark":0,"redelivery_timeout_ms":30000,"log_append_slow_ms":100}`,
@@ -1328,6 +1418,8 @@ func TestSetBackpressureRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+// TestSetBackpressureUpdatesAdminConfigImmediately verifies the control-plane
+// response reflects updated backpressure settings.
 func TestSetBackpressureUpdatesAdminConfigImmediately(t *testing.T) {
 	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{
 		SchedulingPolicy:    logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY,
@@ -1364,6 +1456,9 @@ func TestSetBackpressureUpdatesAdminConfigImmediately(t *testing.T) {
 		}
 	}
 }
+
+// TestDashboardReflectsBackpressureAfterPost verifies dashboard snapshots observe
+// backpressure updates after the admin POST.
 func TestDashboardReflectsBackpressureAfterPost(t *testing.T) {
 	conn := &fakeClientConn{dashboard: &logservepb.DashboardSnapshot{
 		SchedulingPolicy: logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE,
@@ -1392,6 +1487,9 @@ func TestDashboardReflectsBackpressureAfterPost(t *testing.T) {
 		}
 	}
 }
+
+// TestStaticFallbackServesIndexForDeepLinks verifies SPA deep links fall back to
+// index.html instead of 404.
 func TestStaticFallbackServesIndexForDeepLinks(t *testing.T) {
 	dir := t.TempDir()
 	index := []byte(`<!doctype html><title>LogServe Console</title><div id="root"></div>`)
@@ -1412,6 +1510,8 @@ func TestStaticFallbackServesIndexForDeepLinks(t *testing.T) {
 	}
 }
 
+// newRoleTestServer constructs a Server with explicit viewer/operator/admin role
+// tokens for RBAC tests.
 func newRoleTestServer(conn *fakeClientConn, tokens map[role]string) *Server {
 	if conn == nil {
 		conn = &fakeClientConn{}
@@ -1433,6 +1533,8 @@ func newRoleTestServer(conn *fakeClientConn, tokens map[role]string) *Server {
 	return s
 }
 
+// decodeAuditRecord decodes an audit AppendLog request into the auditEvent test
+// shape.
 func decodeAuditRecord(t *testing.T, req *logservepb.AppendLogRequest) auditEvent {
 	t.Helper()
 	if req.GetStreamId() != auditStreamID {
@@ -1445,6 +1547,8 @@ func decodeAuditRecord(t *testing.T, req *logservepb.AppendLogRequest) auditEven
 	return event
 }
 
+// TestRoleTokenConfigRequiresBackendToken verifies role-token-only config does not
+// satisfy backend gRPC authentication requirements.
 func TestRoleTokenConfigRequiresBackendToken(t *testing.T) {
 	viewerOnly := Config{RoleTokens: map[role]string{roleViewer: "viewer-token"}}
 	normalizeAuthConfig(&viewerOnly)
@@ -1459,6 +1563,8 @@ func TestRoleTokenConfigRequiresBackendToken(t *testing.T) {
 	}
 }
 
+// TestRoleTokenConfigRejectsDuplicateRoleTokens verifies ambiguous role token
+// configuration is rejected.
 func TestRoleTokenConfigRejectsDuplicateRoleTokens(t *testing.T) {
 	cfg := Config{APIToken: "admin-token", RoleTokens: map[role]string{roleViewer: "same-token", roleOperator: "same-token"}}
 	normalizeAuthConfig(&cfg)
@@ -1466,6 +1572,9 @@ func TestRoleTokenConfigRejectsDuplicateRoleTokens(t *testing.T) {
 		t.Fatalf("duplicate role tokens error = %v", err)
 	}
 }
+
+// TestRoleTokensGateOperatorAndAdminOperations verifies viewer/operator/admin
+// tokens enforce route permissions and produce audit records.
 func TestRoleTokensGateOperatorAndAdminOperations(t *testing.T) {
 	tokens := map[role]string{roleViewer: "viewer-token", roleOperator: "operator-token", roleAdmin: "admin-token"}
 	viewerConn := &fakeClientConn{}
@@ -1517,6 +1626,8 @@ func TestRoleTokensGateOperatorAndAdminOperations(t *testing.T) {
 	}
 }
 
+// TestSessionReportsRoleAndPermissions verifies the session endpoint exposes the
+// authenticated role and frontend permission flags.
 func TestSessionReportsRoleAndPermissions(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newRoleTestServer(conn, map[role]string{roleViewer: "viewer-token"})
@@ -1540,6 +1651,8 @@ func TestSessionReportsRoleAndPermissions(t *testing.T) {
 	}
 }
 
+// TestOperatorCannotRunAdminOnlyTemplate verifies template-level RBAC can be
+// stricter than the route-level operator gate.
 func TestOperatorCannotRunAdminOnlyTemplate(t *testing.T) {
 	conn := &fakeClientConn{}
 	srv := newRoleTestServer(conn, map[role]string{roleOperator: "operator-token", roleAdmin: "admin-token"})
@@ -1562,6 +1675,9 @@ func TestOperatorCannotRunAdminOnlyTemplate(t *testing.T) {
 		t.Fatalf("admin-only template audit = %+v", audit)
 	}
 }
+
+// TestTemplatesListAndRunAddTask verifies template listing and successful task
+// template execution.
 func TestTemplatesListAndRunAddTask(t *testing.T) {
 	conn := &fakeClientConn{submitTask: &logservepb.SubmitTaskResponse{TaskId: "task-add", Status: logservepb.TaskStatus_TASK_STATUS_QUEUED}}
 	srv := newRoleTestServer(conn, map[role]string{roleOperator: "operator-token"})

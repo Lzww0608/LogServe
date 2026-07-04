@@ -1,5 +1,8 @@
 package webapi
 
+// This file implements dashboard and admin configuration endpoints, including
+// backpressure threshold updates.
+
 import (
 	"fmt"
 	"net/http"
@@ -7,12 +10,15 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// backpressureRequest carries admin-tunable scheduler/log thresholds from the
+// console.
 type backpressureRequest struct {
 	QueueHighWatermark  uint32 `json:"queue_high_watermark"`
 	RedeliveryTimeoutMs int64  `json:"redelivery_timeout_ms"`
 	LogAppendSlowMs     int64  `json:"log_append_slow_ms"`
 }
 
+// handleDashboard returns the current aggregated dashboard snapshot.
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	dto, err := s.dashboard(r)
 	if err != nil {
@@ -22,6 +28,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, dto)
 }
 
+// handleAdminConfig returns the subset of dashboard state exposed as mutable or
+// diagnostic admin configuration.
 func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	dto, err := s.dashboard(r)
 	if err != nil {
@@ -39,6 +47,8 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSetBackpressure validates admin threshold input and forwards it to the
+// control plane.
 func (s *Server) handleSetBackpressure(w http.ResponseWriter, r *http.Request) {
 	var input backpressureRequest
 	if err := decodeJSON(w, r, &input); err != nil {
@@ -67,6 +77,8 @@ func (s *Server) handleSetBackpressure(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// validateBackpressureRequest rejects zero or negative thresholds that would make
+// backpressure and redelivery behavior nonsensical.
 func validateBackpressureRequest(input backpressureRequest) error {
 	if input.QueueHighWatermark == 0 {
 		return fmt.Errorf("%w: queue_high_watermark must be greater than 0", errInvalidInput)

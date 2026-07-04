@@ -1,5 +1,7 @@
 package objectstore
 
+// This file implements the local filesystem object store. Objects are
+// content-addressed by SHA-256 and published with rename after a temp-file write.
 import (
 	"context"
 	"crypto/rand"
@@ -15,6 +17,8 @@ import (
 	"time"
 )
 
+// copyBufferPool amortizes allocations for context-aware copy loops used by both
+// local and S3 stores.
 var copyBufferPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, 32*1024)
@@ -22,10 +26,12 @@ var copyBufferPool = sync.Pool{
 	},
 }
 
+// LocalStore stores immutable objects under a single absolute root directory.
 type LocalStore struct {
 	dir string
 }
 
+// OpenLocal resolves and creates the local object-store root directory.
 func OpenLocal(dir string) (*LocalStore, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -37,6 +43,8 @@ func OpenLocal(dir string) (*LocalStore, error) {
 	return &LocalStore{dir: abs}, nil
 }
 
+// Put writes an object into a cleaned namespace, verifies the optional size, and
+// returns a local:// content-addressed ref.
 func (s *LocalStore) Put(ctx context.Context, namespace string, r io.Reader, size int64) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -47,6 +55,9 @@ func (s *LocalStore) Put(ctx context.Context, namespace string, r io.Reader, siz
 		return "", err
 	}
 	tmpPath := filepath.Join(dir, fmt.Sprintf("object.tmp.%d.%s", os.Getpid(), randomHex(16)))
+
+	// Use O_EXCL with a randomized temp name so concurrent writers never share a
+	// partially written temp object.
 	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return "", err
@@ -77,6 +88,8 @@ func (s *LocalStore) Put(ctx context.Context, namespace string, r io.Reader, siz
 	finalPath := filepath.Join(s.dir, rel)
 	ref := "local://" + filepath.ToSlash(rel)
 
+	// The final path is content-addressed, so an existing matching object makes Put
+	// idempotent and avoids rewriting durable data.
 	matches, err := fileSHA256Matches(ctx, finalPath, sumHex)
 	if err == nil {
 		if matches {
@@ -88,6 +101,8 @@ func (s *LocalStore) Put(ctx context.Context, namespace string, r io.Reader, siz
 		return "", err
 	}
 
+	// Another concurrent writer may win the rename race; re-read the final object
+	// before treating the rename failure as fatal.
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		matches, matchErr := fileSHA256Matches(ctx, finalPath, sumHex)
 		if matchErr == nil && matches {
@@ -102,6 +117,7 @@ func (s *LocalStore) Put(ctx context.Context, namespace string, r io.Reader, siz
 	return ref, nil
 }
 
+// Get opens a local:// ref after validating that it stays under the store root.
 func (s *LocalStore) Get(ctx context.Context, ref string) (io.ReadCloser, ObjectInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, ObjectInfo{}, err
@@ -127,6 +143,8 @@ func (s *LocalStore) Get(ctx context.Context, ref string) (io.ReadCloser, Object
 	return file, info, nil
 }
 
+// pathForRef resolves a local:// ref to an absolute path and rejects absolute,
+// empty, or parent-escaping paths.
 func (s *LocalStore) pathForRef(ref string) (string, string, error) {
 	const prefix = "local://"
 	if !strings.HasPrefix(ref, prefix) {
@@ -152,6 +170,8 @@ func (s *LocalStore) pathForRef(ref string) (string, string, error) {
 	return cleanPath, rel, nil
 }
 
+// cleanNamespace converts user-supplied namespaces into safe relative path
+// components, dropping empty and traversal elements.
 func cleanNamespace(namespace string) string {
 	namespace = strings.ReplaceAll(namespace, "\\", "/")
 	parts := strings.Split(namespace, "/")
@@ -169,6 +189,8 @@ func cleanNamespace(namespace string) string {
 	return filepath.Join(cleaned...)
 }
 
+// copyWithContext copies with a pooled buffer and checks ctx before each read so
+// large object transfers can be canceled.
 func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
 	ptr := copyBufferPool.Get().(*[]byte)
 	buf := *ptr
@@ -198,6 +220,9 @@ func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, 
 		}
 	}
 }
+
+// fileSHA256Matches verifies that an existing content-addressed file still
+// matches the hash encoded in its ref.
 func fileSHA256Matches(ctx context.Context, path, wantHex string) (bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -211,6 +236,8 @@ func fileSHA256Matches(ctx context.Context, path, wantHex string) (bool, error) 
 	return hex.EncodeToString(h.Sum(nil)) == wantHex, nil
 }
 
+// randomHex returns a random hex suffix for temp filenames, falling back to time
+// if the OS random source is unavailable.
 func randomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -219,16 +246,22 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// hashFromObjectName extracts the content hash from a stored object filename.
 func hashFromObjectName(name string) string {
 	return strings.TrimSuffix(name, filepath.Ext(name))
 }
 
+// syncDir opens the containing directory so a successful rename can be flushed on
+// filesystems that support directory fsync.
 func syncDir(dir string) error {
 	file, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+
+	// Directory fsync is best effort because some Windows/filesystem combinations do
+	// not support it even after the object file itself was synced.
 	_ = file.Sync()
 	return nil
 }

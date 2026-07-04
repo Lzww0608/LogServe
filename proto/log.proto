@@ -4,6 +4,13 @@ package logserve.v1;
 
 option go_package = "github.com/logserve/logserve/gen/logservepb;logservepb";
 
+// log.proto defines the append-only log service used as LogServe's shared
+// persistence and replay boundary.
+
+// LogRecord is the canonical wire shape of one persisted event.
+//
+// The log service assigns seq, timestamp_ms, and crc32 on append. Callers treat
+// payload as opaque bytes and interpret it according to event_type and stream_id.
 message LogRecord {
   string stream_id = 1;
   uint64 seq = 2;
@@ -14,6 +21,11 @@ message LogRecord {
   uint32 crc32 = 7;
 }
 
+// AppendLogRequest appends one event to a stream.
+//
+// stream_id partitions independent sequence spaces. idempotency_key is optional;
+// when present, the store can return the original append result instead of
+// creating a second record for the same logical event.
 message AppendLogRequest {
   string stream_id = 1;
   string event_type = 2;
@@ -21,6 +33,10 @@ message AppendLogRequest {
   bytes payload = 4;
 }
 
+// AppendLogResponse returns the server-assigned append metadata.
+//
+// duplicate tells callers that the returned seq/timestamp/crc describe an
+// existing record produced by idempotency handling rather than a fresh append.
 message AppendLogResponse {
   uint64 seq = 1;
   int64 timestamp_ms = 2;
@@ -28,29 +44,41 @@ message AppendLogResponse {
   bool duplicate = 4;
 }
 
+// ReadLogRequest reads a bounded slice of one stream.
+//
+// from_seq is inclusive. limit is advisory to the service implementation and is
+// used by unary reads and streaming reads to cap each request.
 message ReadLogRequest {
   string stream_id = 1;
   uint64 from_seq = 2;
   uint32 limit = 3;
 }
 
+// ReadLogResponse returns the records selected by ReadLogRequest.
 message ReadLogResponse {
   repeated LogRecord records = 1;
 }
 
+// ListStreamsRequest lists known stream ids, optionally filtered by prefix.
 message ListStreamsRequest {
   string prefix = 1;
 }
 
+// ListStreamsResponse contains stream ids visible to the log service.
 message ListStreamsResponse {
   repeated string stream_ids = 1;
 }
 
+// TrimStreamRequest advances a stream's logical retention watermark.
+//
+// Records before before_seq become compactable; the request does not require
+// immediate physical deletion.
 message TrimStreamRequest {
   string stream_id = 1;
   uint64 before_seq = 2;
 }
 
+// TrimStreamResponse reports the new retention watermark and compactable volume.
 message TrimStreamResponse {
   string stream_id = 1;
   uint64 trimmed_before_seq = 2;
@@ -58,6 +86,7 @@ message TrimStreamResponse {
   uint64 compactable_bytes = 4;
 }
 
+// StreamStats summarizes sequence and compaction state for one stream.
 message StreamStats {
   string stream_id = 1;
   uint64 first_seq = 2;
@@ -67,20 +96,39 @@ message StreamStats {
   uint64 compactable_bytes = 6;
 }
 
+// GetStreamStatsRequest asks for stats for a single stream or a prefix group.
+//
+// stream_id selects one stream when set. prefix selects a group when stream_id
+// is empty; callers should not rely on both filters being combined.
 message GetStreamStatsRequest {
   string stream_id = 1;
   string prefix = 2;
 }
 
+// GetStreamStatsResponse contains zero or more stream summaries.
 message GetStreamStatsResponse {
   repeated StreamStats streams = 1;
 }
 
+// LogService exposes the append-only event log used by control-plane replay,
+// worker state changes, audit streams, and maintenance tooling.
 service LogService {
+  // AppendLog persists one event and returns its assigned sequence metadata.
   rpc AppendLog(AppendLogRequest) returns (AppendLogResponse);
+
+  // ReadLog returns a finite batch of records from one stream.
   rpc ReadLog(ReadLogRequest) returns (ReadLogResponse);
+
+  // ReadLogStream streams records from one stream using the same selection
+  // fields as ReadLogRequest.
   rpc ReadLogStream(ReadLogRequest) returns (stream LogRecord);
+
+  // ListStreams lists stream ids so clients can discover log partitions.
   rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
+
+  // TrimStream marks old stream records as eligible for compaction.
   rpc TrimStream(TrimStreamRequest) returns (TrimStreamResponse);
+
+  // GetStreamStats returns sequence and compaction metrics for streams.
   rpc GetStreamStats(GetStreamStatsRequest) returns (GetStreamStatsResponse);
 }

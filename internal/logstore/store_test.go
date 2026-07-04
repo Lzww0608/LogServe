@@ -19,6 +19,8 @@ import (
 	"google.golang.org/grpc"
 )
 
+// TestAppendReadAndIdempotency verifies basic append/read behavior and duplicate
+// suppression for stream-scoped idempotency keys.
 func TestAppendReadAndIdempotency(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {
@@ -67,6 +69,8 @@ func TestAppendReadAndIdempotency(t *testing.T) {
 	}
 }
 
+// TestReadLogStreamReadsAllWhenLimitUnset ensures the streaming RPC path treats
+// an unset limit as unbounded instead of the unary default batch size.
 func TestReadLogStreamReadsAllWhenLimitUnset(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {
@@ -106,12 +110,16 @@ func TestReadLogStreamReadsAllWhenLimitUnset(t *testing.T) {
 	}
 }
 
+// captureReadLogStream is a minimal gRPC stream test double that records sent
+// log records in memory.
 type captureReadLogStream struct {
 	grpc.ServerStream
 	ctx     context.Context
 	records []*logservepb.LogRecord
 }
 
+// Context returns a background context for stream tests that do not exercise
+// cancellation.
 func (s *captureReadLogStream) Context() context.Context {
 	if s.ctx == nil {
 		return context.Background()
@@ -119,10 +127,14 @@ func (s *captureReadLogStream) Context() context.Context {
 	return s.ctx
 }
 
+// Send captures one streamed protobuf record for later assertions.
 func (s *captureReadLogStream) Send(rec *logservepb.LogRecord) error {
 	s.records = append(s.records, rec)
 	return nil
 }
+
+// TestRecoveryTruncatesPartialTail verifies that recovery discards bytes after
+// the last complete valid record.
 func TestRecoveryTruncatesPartialTail(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -167,6 +179,8 @@ func TestRecoveryTruncatesPartialTail(t *testing.T) {
 	}
 }
 
+// TestSegmentRollingRecoverAndReadAcrossSegments covers segment rollover, reopen,
+// and indexed reads spanning multiple segment files.
 func TestSegmentRollingRecoverAndReadAcrossSegments(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -220,6 +234,8 @@ func TestSegmentRollingRecoverAndReadAcrossSegments(t *testing.T) {
 	}
 }
 
+// TestSegmentReaderCacheReusesEvictsAndCloses verifies reader cache reuse, LRU
+// eviction, and cleanup on Store.Close.
 func TestSegmentReaderCacheReusesEvictsAndCloses(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -267,6 +283,9 @@ func TestSegmentReaderCacheReusesEvictsAndCloses(t *testing.T) {
 		t.Fatalf("cached segment readers after close = %d, want 0", got)
 	}
 }
+
+// TestIndexRebuiltFromSegments removes index files and verifies recovery rebuilds
+// them from authoritative segment logs.
 func TestIndexRebuiltFromSegments(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -316,6 +335,8 @@ func TestIndexRebuiltFromSegments(t *testing.T) {
 	}
 }
 
+// TestLogicalTrimFiltersReadsAndReportsCompactableBytes verifies trim watermarks
+// filter reads and surface compactable records without deleting bytes.
 func TestLogicalTrimFiltersReadsAndReportsCompactableBytes(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -385,6 +406,8 @@ func TestLogicalTrimFiltersReadsAndReportsCompactableBytes(t *testing.T) {
 	}
 }
 
+// TestFsyncPoliciesAppendAndRecover exercises all fsync policies across append,
+// close, reopen, and read.
 func TestFsyncPoliciesAppendAndRecover(t *testing.T) {
 	for _, policy := range []FsyncPolicy{FsyncBatch, FsyncInterval} {
 		t.Run(string(policy), func(t *testing.T) {
@@ -424,6 +447,8 @@ func TestFsyncPoliciesAppendAndRecover(t *testing.T) {
 	}
 }
 
+// TestOpenRejectsInvalidFsyncPolicy verifies option validation rejects unknown
+// durability policies before files are opened.
 func TestOpenRejectsInvalidFsyncPolicy(t *testing.T) {
 	opts := DefaultOptions()
 	opts.FsyncPolicy = "sometimes"
@@ -432,6 +457,8 @@ func TestOpenRejectsInvalidFsyncPolicy(t *testing.T) {
 	}
 }
 
+// TestBinaryIndexReaderAndIdempotencyRecovery covers current binary index loading
+// and duplicate suppression after reopen.
 func TestBinaryIndexReaderAndIdempotencyRecovery(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -487,6 +514,8 @@ func TestBinaryIndexReaderAndIdempotencyRecovery(t *testing.T) {
 	}
 }
 
+// TestSegmentDictionaryIndexUsesFixedEntries checks the current dictionary index
+// header and fixed-entry counts.
 func TestSegmentDictionaryIndexUsesFixedEntries(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -523,6 +552,8 @@ func TestSegmentDictionaryIndexUsesFixedEntries(t *testing.T) {
 	}
 }
 
+// TestLegacyBinaryIndexRecoveredAndRewrittenAsDictionary verifies v1 index files
+// are accepted once and then rewritten in the current format.
 func TestLegacyBinaryIndexRecoveredAndRewrittenAsDictionary(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -558,6 +589,8 @@ func TestLegacyBinaryIndexRecoveredAndRewrittenAsDictionary(t *testing.T) {
 	assertSegmentIndexHeader(t, segmentPath(dir, 1, ".index"), 1, 3)
 }
 
+// TestLegacyJSONIndexRecoveredAndRewrittenAsBinary verifies the oldest JSON index
+// format still upgrades through recovery.
 func TestLegacyJSONIndexRecoveredAndRewrittenAsBinary(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -593,6 +626,8 @@ func TestLegacyJSONIndexRecoveredAndRewrittenAsBinary(t *testing.T) {
 	assertSegmentIndexHeader(t, segmentPath(dir, 1, ".index"), 1, 3)
 }
 
+// TestCorruptBinaryIndexFallsBackToLogAndRebuilds ensures corrupt indexes do not
+// prevent recovery when log bytes are still valid.
 func TestCorruptBinaryIndexFallsBackToLogAndRebuilds(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -639,6 +674,8 @@ func TestCorruptBinaryIndexFallsBackToLogAndRebuilds(t *testing.T) {
 	assertSegmentIndexHeader(t, indexPath, 1, 4)
 }
 
+// TestCompactabilityStatsReportsSegmentLiveBytes verifies segment and stream live
+// byte accounting after logical trim.
 func TestCompactabilityStatsReportsSegmentLiveBytes(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -676,6 +713,8 @@ func TestCompactabilityStatsReportsSegmentLiveBytes(t *testing.T) {
 	}
 }
 
+// TestSegmentLevelCompactionDeletesFullyTrimmedSegment verifies compaction can
+// remove sealed segments whose records are all trimmed.
 func TestSegmentLevelCompactionDeletesFullyTrimmedSegment(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -717,6 +756,8 @@ func TestSegmentLevelCompactionDeletesFullyTrimmedSegment(t *testing.T) {
 	assertReadSeqs(t, recovered, "actor:compact-delete", []uint64{4, 5, 6})
 }
 
+// TestCompactionDeleteWithoutManifestRecoversTrimmedNextSeq verifies recovery can
+// preserve trim watermarks when a compacted-away segment is absent.
 func TestCompactionDeleteWithoutManifestRecoversTrimmedNextSeq(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -752,6 +793,8 @@ func TestCompactionDeleteWithoutManifestRecoversTrimmedNextSeq(t *testing.T) {
 	assertReadSeqs(t, recovered, "actor:delete-without-manifest", []uint64{4})
 }
 
+// TestCompactionManifestBeforeDeleteCrashCompletesDelete simulates a crash after
+// manifest write and before file deletion, then verifies recovery finishes it.
 func TestCompactionManifestBeforeDeleteCrashCompletesDelete(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -787,6 +830,8 @@ func TestCompactionManifestBeforeDeleteCrashCompletesDelete(t *testing.T) {
 	assertReadSeqs(t, recovered, "actor:manifest-before-delete", []uint64{4, 5, 6})
 }
 
+// TestCompactionManifestAfterDeleteCrashRecovers simulates a crash after segment
+// deletion and verifies manifest reconciliation leaves a readable store.
 func TestCompactionManifestAfterDeleteCrashRecovers(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -822,6 +867,8 @@ func TestCompactionManifestAfterDeleteCrashRecovers(t *testing.T) {
 	assertReadSeqs(t, recovered, "actor:manifest-after-delete", []uint64{4, 5, 6})
 }
 
+// TestCopyCompactionRewritesPartialLiveSegment verifies copy-compaction rewrites
+// sparse sealed segments while preserving live record order.
 func TestCopyCompactionRewritesPartialLiveSegment(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -867,6 +914,8 @@ func TestCopyCompactionRewritesPartialLiveSegment(t *testing.T) {
 	assertReadSeqs(t, recovered, "actor:copy-compact", []uint64{3, 4, 5, 6})
 }
 
+// TestBackgroundCompactorDeletesFullyTrimmedSegment verifies the periodic
+// compactor can reclaim a fully trimmed sealed segment.
 func TestBackgroundCompactorDeletesFullyTrimmedSegment(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
@@ -895,6 +944,8 @@ func TestBackgroundCompactorDeletesFullyTrimmedSegment(t *testing.T) {
 	t.Fatal("background compactor did not delete fully trimmed segment")
 }
 
+// appendCompactionRecords appends a deterministic sequence of records for
+// compaction tests.
 func appendCompactionRecords(t *testing.T, store *Store, streamID string, count int) {
 	t.Helper()
 	for i := 0; i < count; i++ {
@@ -904,6 +955,7 @@ func appendCompactionRecords(t *testing.T, store *Store, streamID string, count 
 	}
 }
 
+// findCompactionStats returns the stats entry for one segment or fails the test.
 func findCompactionStats(t *testing.T, stats []SegmentCompactionStats, segmentID uint64) SegmentCompactionStats {
 	t.Helper()
 	for _, item := range stats {
@@ -915,6 +967,8 @@ func findCompactionStats(t *testing.T, stats []SegmentCompactionStats, segmentID
 	return SegmentCompactionStats{}
 }
 
+// assertReadSeqs reads a stream and compares only sequence numbers for concise
+// compaction assertions.
 func assertReadSeqs(t *testing.T, store *Store, streamID string, want []uint64) {
 	t.Helper()
 	records, err := store.Read(streamID, 1, 100)
@@ -931,6 +985,8 @@ func assertReadSeqs(t *testing.T, store *Store, streamID string, want []uint64) 
 	}
 }
 
+// writeCompactionManifestForTest writes a manifest directly to simulate crash
+// windows around compaction.
 func writeCompactionManifestForTest(t *testing.T, dir string, manifest compactionManifest) {
 	t.Helper()
 	data, err := json.MarshalIndent(manifest, "", "  ")
@@ -941,6 +997,9 @@ func writeCompactionManifestForTest(t *testing.T, dir string, manifest compactio
 		t.Fatal(err)
 	}
 }
+
+// rewriteLegacyJSONIndex rewrites a current index as the legacy JSON format for
+// compatibility tests.
 func rewriteLegacyJSONIndex(t *testing.T, dir string, segmentID uint64) {
 	t.Helper()
 	logFile, err := os.Open(segmentPath(dir, segmentID, ".log"))
@@ -984,6 +1043,8 @@ func rewriteLegacyJSONIndex(t *testing.T, dir string, segmentID uint64) {
 	}
 }
 
+// writeLegacyBinaryIndex rewrites a current index as the legacy per-entry binary
+// format for upgrade tests.
 func writeLegacyBinaryIndex(t *testing.T, dir string, segmentID uint64) {
 	t.Helper()
 	logFile, err := os.Open(segmentPath(dir, segmentID, ".log"))
@@ -1021,6 +1082,8 @@ func writeLegacyBinaryIndex(t *testing.T, dir string, segmentID uint64) {
 	}
 }
 
+// writeLegacyIndexEntry serializes one v1 binary index entry with its per-entry
+// CRC.
 func writeLegacyIndexEntry(t *testing.T, w io.Writer, streamID string, entry streamIndexEntry) {
 	t.Helper()
 	streamBytes := []byte(streamID)
@@ -1040,6 +1103,8 @@ func writeLegacyIndexEntry(t *testing.T, w io.Writer, streamID string, entry str
 	}
 }
 
+// segmentIndexHeaderForTest captures the current dictionary index header fields
+// asserted by format tests.
 type segmentIndexHeaderForTest struct {
 	version         uint16
 	streamCount     uint32
@@ -1048,6 +1113,8 @@ type segmentIndexHeaderForTest struct {
 	size            int64
 }
 
+// assertSegmentIndexHeader reads and validates the fixed header of a current
+// segment index file.
 func assertSegmentIndexHeader(t *testing.T, path string, wantStreams uint32, wantEntries uint64) segmentIndexHeaderForTest {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -1082,6 +1149,8 @@ func assertSegmentIndexHeader(t *testing.T, path string, wantStreams uint32, wan
 	return header
 }
 
+// globSegments returns sorted segment paths for tests that assert file-level
+// compaction effects.
 func globSegments(t *testing.T, dir, ext string) []string {
 	t.Helper()
 	paths, err := filepath.Glob(filepath.Join(dir, "segment-*"+ext))
@@ -1091,6 +1160,8 @@ func globSegments(t *testing.T, dir, ext string) []string {
 	return paths
 }
 
+// TestRecordChecksumTypesRoundTrip verifies every supported record checksum type
+// survives encode, append, close, reopen, and read.
 func TestRecordChecksumTypesRoundTrip(t *testing.T) {
 	cases := []ChecksumType{ChecksumTypeCRC32C, ChecksumTypeIEEE, ChecksumTypeXXH3, ChecksumTypeNone}
 	for _, typ := range cases {
@@ -1154,6 +1225,8 @@ func TestRecordChecksumTypesRoundTrip(t *testing.T) {
 	}
 }
 
+// TestReadLegacyIEEERecord verifies v1 records without checksum-type metadata
+// continue to decode as IEEE CRC32.
 func TestReadLegacyIEEERecord(t *testing.T) {
 	dir := t.TempDir()
 	legacy := Record{
@@ -1192,6 +1265,8 @@ func TestReadLegacyIEEERecord(t *testing.T) {
 	}
 }
 
+// TestRecordCorruptionRecovery verifies checksum/header corruption is either
+// rejected on direct read or truncated during recovery at the corrupt tail.
 func TestRecordCorruptionRecovery(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -1285,6 +1360,8 @@ func TestRecordCorruptionRecovery(t *testing.T) {
 	}
 }
 
+// TestLargePayloadChunkedChecksumRoundTrip exercises the chunked verification
+// path with a payload larger than checksumChunkSize.
 func TestLargePayloadChunkedChecksumRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -1320,6 +1397,8 @@ func TestLargePayloadChunkedChecksumRoundTrip(t *testing.T) {
 	}
 }
 
+// encodeLegacyRecordForTest serializes the v1 record layout used by backward
+// compatibility tests.
 func encodeLegacyRecordForTest(rec Record) ([]byte, error) {
 	stream := []byte(rec.StreamID)
 	eventType := []byte(rec.EventType)
@@ -1343,6 +1422,8 @@ func encodeLegacyRecordForTest(rec Record) ([]byte, error) {
 	return buf, nil
 }
 
+// mutateFileByte flips one byte in a segment file to create controlled
+// corruption scenarios.
 func mutateFileByte(t *testing.T, path string, offset int64, xor byte) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
@@ -1360,6 +1441,8 @@ func mutateFileByte(t *testing.T, path string, offset int64, xor byte) {
 	}
 }
 
+// TestReadRawEachReturnsRawPayload verifies raw iteration exposes payloads and
+// metadata without the safe Record cloning path.
 func TestReadRawEachReturnsRawPayload(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {
@@ -1386,6 +1469,8 @@ func TestReadRawEachReturnsRawPayload(t *testing.T) {
 	}
 }
 
+// TestReadRawEachBatchesSnapshot verifies raw iteration observes a stable prefix
+// even when the callback appends more records.
 func TestReadRawEachBatchesSnapshot(t *testing.T) {
 	opts := DefaultOptions()
 	opts.FsyncPolicy = FsyncBatch

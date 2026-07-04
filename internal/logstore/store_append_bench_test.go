@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+// BenchmarkStoreAppendSingleStream measures append throughput across payload
+// sizes and fsync policies for one stream.
 func BenchmarkStoreAppendSingleStream(b *testing.B) {
 	for _, payloadSize := range []int{128, 1024, 64 << 10} {
 		for _, policy := range []FsyncPolicy{FsyncAlways, FsyncBatch, FsyncInterval} {
@@ -36,6 +38,8 @@ func BenchmarkStoreAppendSingleStream(b *testing.B) {
 	}
 }
 
+// BenchmarkStoreAppendMultiStream measures append overhead when sequences and
+// indexes are spread across multiple streams.
 func BenchmarkStoreAppendMultiStream(b *testing.B) {
 	for _, streams := range []int{1, 8, 64} {
 		b.Run(fmt.Sprintf("streams=%d", streams), func(b *testing.B) {
@@ -63,6 +67,8 @@ func BenchmarkStoreAppendMultiStream(b *testing.B) {
 	}
 }
 
+// BenchmarkStoreRecoverLargeSegments measures reopening a prebuilt store with
+// many segment/index entries.
 func BenchmarkStoreRecoverLargeSegments(b *testing.B) {
 	for _, entries := range []int{10_000, 100_000} {
 		b.Run(fmt.Sprintf("entries=%d", entries), func(b *testing.B) {

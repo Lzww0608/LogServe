@@ -13,15 +13,19 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// replayableLogClient is an in-memory append/read/list log implementation used for
+// restart and checkpoint replay tests.
 type replayableLogClient struct {
 	mu      sync.Mutex
 	records map[string][]*logservepb.LogRecord
 }
 
+// newReplayableLogClient constructs an empty replayable log client.
 func newReplayableLogClient() *replayableLogClient {
 	return &replayableLogClient{records: make(map[string][]*logservepb.LogRecord)}
 }
 
+// AppendLog stores an immutable log record with the next sequence for the stream.
 func (c *replayableLogClient) AppendLog(_ context.Context, req *logservepb.AppendLogRequest, _ ...grpc.CallOption) (*logservepb.AppendLogResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -44,6 +48,7 @@ func (c *replayableLogClient) AppendLog(_ context.Context, req *logservepb.Appen
 	return &logservepb.AppendLogResponse{Seq: seq, TimestampMs: timestamp}, nil
 }
 
+// ReadLog returns cloned records from the requested sequence and optional limit.
 func (c *replayableLogClient) ReadLog(_ context.Context, req *logservepb.ReadLogRequest, _ ...grpc.CallOption) (*logservepb.ReadLogResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -61,6 +66,7 @@ func (c *replayableLogClient) ReadLog(_ context.Context, req *logservepb.ReadLog
 	return &logservepb.ReadLogResponse{Records: out}, nil
 }
 
+// ListStreams returns sorted stream IDs matching an optional prefix.
 func (c *replayableLogClient) ListStreams(_ context.Context, req *logservepb.ListStreamsRequest, _ ...grpc.CallOption) (*logservepb.ListStreamsResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -74,6 +80,7 @@ func (c *replayableLogClient) ListStreams(_ context.Context, req *logservepb.Lis
 	return &logservepb.ListStreamsResponse{StreamIds: streams}, nil
 }
 
+// TrimStream drops records before the requested sequence and reports compactable count.
 func (c *replayableLogClient) TrimStream(_ context.Context, req *logservepb.TrimStreamRequest, _ ...grpc.CallOption) (*logservepb.TrimStreamResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -95,6 +102,7 @@ func (c *replayableLogClient) TrimStream(_ context.Context, req *logservepb.Trim
 	}, nil
 }
 
+// GetStreamStats reports first and next sequence for matching in-memory streams.
 func (c *replayableLogClient) GetStreamStats(_ context.Context, req *logservepb.GetStreamStatsRequest, _ ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -118,6 +126,8 @@ func (c *replayableLogClient) GetStreamStats(_ context.Context, req *logservepb.
 	return &logservepb.GetStreamStatsResponse{Streams: out}, nil
 }
 
+// TestControlRestartBootstrapsTaskAfterMetadataWriteLoss proves task submission is
+// recoverable from the log even if metadata is lost after append.
 func TestControlRestartBootstrapsTaskAfterMetadataWriteLoss(t *testing.T) {
 	logClient := newReplayableLogClient()
 	first := NewServiceWithResultStore(metadata.NewMemoryStore(), logClient, nil, 0)

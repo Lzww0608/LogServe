@@ -1,3 +1,5 @@
+// Generic table primitive for typed rows and optional API pagination controls.
+
 import type { ReactNode } from "react";
 
 export type Column<T> = {
@@ -17,6 +19,7 @@ export type TablePagination = {
   onPageSizeChange: (pageSize: number) => void;
 };
 
+// Render rows through caller-provided column renderers, including the empty state.
 export function Table<T>({ rows, columns, empty, pagination }: { rows: T[]; columns: Column<T>[]; empty: ReactNode; pagination?: TablePagination }) {
   return (
     <div className="table-shell">
@@ -41,6 +44,7 @@ export function Table<T>({ rows, columns, empty, pagination }: { rows: T[]; colu
   );
 }
 
+// Render page-size and previous/next controls for token or offset pagination.
 function PaginationFooter({ pagination }: { pagination: TablePagination }) {
   const options = pagination.pageSizeOptions ?? [25, 50, 100];
   return (

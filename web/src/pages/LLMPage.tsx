@@ -1,3 +1,5 @@
+// LLM route for model registration, request submission, scheduler policy, and replay traces.
+
 import { useMemo, useState } from "react";
 import { api } from "../api/client";
 import { FieldError, InlineError } from "../components/ErrorPanel";
@@ -13,6 +15,7 @@ import { firstValidationError, validateLLMForm } from "../utils/formValidation";
 import { roleAtLeast } from "../utils/roles";
 import { errorMessage } from "../utils/status";
 
+// Render model registry, LLM submit form, scheduling policy, and replay trace tools.
 export function LLMPage({ session }: { session?: ConsoleSession | null }) {
   const modelsState = usePolling(() => api.models(), 1000);
   const [modelName, setModelName] = useState("model-A");
@@ -30,6 +33,7 @@ export function LLMPage({ session }: { session?: ConsoleSession | null }) {
 
   const validation = useMemo(() => validateLLMForm(modelName, prompt), [modelName, prompt]);
 
+  // Register a model descriptor through the admin-only backend path.
   const register = async () => {
     setMessage("");
     if (!canAdmin) {
@@ -47,6 +51,7 @@ export function LLMPage({ session }: { session?: ConsoleSession | null }) {
     }
   };
 
+  // Submit an LLM prompt and keep the returned task metadata visible for replay.
   const submit = async () => {
     setMessage("");
     if (!canOperate) {
@@ -74,6 +79,7 @@ export function LLMPage({ session }: { session?: ConsoleSession | null }) {
     }
   };
 
+  // Replay an LLM task and render its event timeline alongside raw metadata.
   const replay = async () => {
     if (!taskID.trim()) return;
     setMessage("");
@@ -90,6 +96,7 @@ export function LLMPage({ session }: { session?: ConsoleSession | null }) {
     }
   };
 
+  // Submit the selected scheduling policy through the operator control path.
   const setSchedulingPolicy = async () => {
     setMessage("");
     if (!canOperate) {
@@ -144,6 +151,7 @@ export function LLMPage({ session }: { session?: ConsoleSession | null }) {
   );
 }
 
+// Render replay output with trace cards and a raw JSON fallback.
 function LLMTracePanel({ trace, submitted }: { trace: LLMTrace | null; submitted: LLMTrace | null }) {
   if (!trace) {
     return (
@@ -181,10 +189,12 @@ function LLMTracePanel({ trace, submitted }: { trace: LLMTrace | null; submitted
   );
 }
 
+// Render one grouped replay trace section with stable summary fields.
 function TraceCard({ label, value }: { label: string; value: string }) {
   return <div className="trace-card"><span>{label}</span><strong>{value}</strong></div>;
 }
 
+// Render one replay event with a compact label plus raw event payload.
 function TimelineItem({ event }: { event: Record<string, unknown> }) {
   return (
     <div className="timeline-item">
@@ -193,6 +203,7 @@ function TimelineItem({ event }: { event: Record<string, unknown> }) {
   );
 }
 
+// Choose the most descriptive event-name field from a flexible replay event object.
 function eventLabel(event: Record<string, unknown>): string {
   for (const key of ["event_type", "type", "name", "event"]) {
     const value = event[key];
@@ -201,6 +212,7 @@ function eventLabel(event: Record<string, unknown>): string {
   return "Trace event";
 }
 
+// Summarize stable trace fields before falling back to raw JSON.
 function eventDetail(event: Record<string, unknown>): string {
   const parts = ["worker_id", "model_name", "timestamp_ms", "latency_ms"]
     .map((key) => event[key] === undefined ? "" : `${key}: ${String(event[key])}`)
@@ -208,6 +220,7 @@ function eventDetail(event: Record<string, unknown>): string {
   return parts.join(" | ") || JSON.stringify(event);
 }
 
+// Extract display text from either string results or {text} JSON results.
 function traceResultText(trace: LLMTrace): string {
   const result = trace.result_json;
   if (typeof result === "string") return result;
@@ -218,9 +231,11 @@ function traceResultText(trace: LLMTrace): string {
   return "";
 }
 
+// Format an optional duration in milliseconds for trace summary cards.
 function ms(value?: number): string {
   return value === undefined ? "-" : `${value} ms`;
 }
+// Distinguish a completed replay trace from a submit acknowledgement.
 function hasTimingTrace(trace: LLMTrace): boolean {
   return Boolean(trace.events?.length) || trace.cache_hit !== undefined || trace.model_load_ms !== undefined || trace.checkpoint_fetch_ms !== undefined || trace.first_token_ms !== undefined || trace.total_latency_ms !== undefined;
 }

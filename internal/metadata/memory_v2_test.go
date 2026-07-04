@@ -1,5 +1,8 @@
 package metadata
 
+// This file exercises the sharded MemoryStoreV2 indexes, deadline heap,
+// defensive cloning, and concurrent hot paths.
+
 import (
 	"strings"
 	"sync"
@@ -10,6 +13,8 @@ import (
 	"github.com/logserve/logserve/internal/workflow"
 )
 
+// TestMemoryStoreV2TaskIndexesFollowStatusTransitions verifies secondary indexes
+// are updated as tasks move queued -> running -> terminal.
 func TestMemoryStoreV2TaskIndexesFollowStatusTransitions(t *testing.T) {
 	store := NewMemoryStore()
 	created, duplicate := store.CreateTask(Task{
@@ -58,6 +63,8 @@ func TestMemoryStoreV2TaskIndexesFollowStatusTransitions(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreV2DeadlineHeapRequeuesOnlyExpiredRunningTasks checks that the
+// deadline heap requeues expired running leases without touching fresh leases.
 func TestMemoryStoreV2DeadlineHeapRequeuesOnlyExpiredRunningTasks(t *testing.T) {
 	store := NewMemoryStore()
 	oldTask, _ := store.CreateTask(Task{TaskID: "old-running", TaskName: "old", Status: logservepb.TaskStatus_TASK_STATUS_QUEUED}, "")
@@ -86,6 +93,8 @@ func TestMemoryStoreV2DeadlineHeapRequeuesOnlyExpiredRunningTasks(t *testing.T) 
 	}
 }
 
+// TestMemoryStoreV2RejectsStaleCompletionAfterTargetedRequeue protects the
+// targeted recovery path against stale worker completions.
 func TestMemoryStoreV2RejectsStaleCompletionAfterTargetedRequeue(t *testing.T) {
 	store := NewMemoryStore()
 	created, _ := store.CreateTask(Task{TaskID: "targeted-requeue", TaskName: "targeted", Status: logservepb.TaskStatus_TASK_STATUS_QUEUED}, "")
@@ -103,6 +112,8 @@ func TestMemoryStoreV2RejectsStaleCompletionAfterTargetedRequeue(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreV2SnapshotsAreImmutable verifies returned task, worker, and
+// workflow values cannot mutate store-owned state.
 func TestMemoryStoreV2SnapshotsAreImmutable(t *testing.T) {
 	store := NewMemoryStore()
 	store.CreateTask(Task{TaskID: "task-snapshot", TaskName: "snapshot", Status: logservepb.TaskStatus_TASK_STATUS_QUEUED, ResultJSON: []byte(`{"value":1}`)}, "")
@@ -141,6 +152,8 @@ func TestMemoryStoreV2SnapshotsAreImmutable(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreV2WorkflowRecordUsesSliceIndex verifies workflow records retain
+// ordered step storage and the companion step index.
 func TestMemoryStoreV2WorkflowRecordUsesSliceIndex(t *testing.T) {
 	store := NewMemoryStore()
 	state := benchmarkWorkflowState("workflow-index", 3)
@@ -163,6 +176,8 @@ func TestMemoryStoreV2WorkflowRecordUsesSliceIndex(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreV2ConcurrentHeartbeatLeaseComplete stresses worker heartbeat and
+// task lease/complete paths concurrently.
 func TestMemoryStoreV2ConcurrentHeartbeatLeaseComplete(t *testing.T) {
 	store := NewMemoryStore()
 	for i := 0; i < 256; i++ {
@@ -203,6 +218,8 @@ func TestMemoryStoreV2ConcurrentHeartbeatLeaseComplete(t *testing.T) {
 	}
 }
 
+// expireLeaseForTest rewrites a task lease timestamp under the shard lock and
+// refreshes the deadline heap for deterministic expiry tests.
 func expireLeaseForTest(t *testing.T, store *MemoryStoreV2, taskID string, leaseEpoch uint64, age time.Duration) {
 	t.Helper()
 	shard := store.tasks.shard(taskID)
@@ -221,6 +238,9 @@ func expireLeaseForTest(t *testing.T, store *MemoryStoreV2, taskID string, lease
 	shard.mu.Unlock()
 	store.tasks.trackRunning(expired)
 }
+
+// benchmarkTaskID returns deterministic task IDs that still spread across worker
+// IDs for concurrency tests.
 func benchmarkTaskID(i int) string {
 	return "concurrent-task-" + string(rune('a'+(i%26))) + "-" + benchmarkWorkerIDs(256)[i]
 }

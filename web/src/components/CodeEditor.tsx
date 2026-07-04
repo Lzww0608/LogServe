@@ -1,6 +1,9 @@
+// Controlled code editor with line numbers, copy, formatting, and highlight overlay.
+
 import { useId, useMemo, useState, type UIEvent } from "react";
 import { copyToClipboard } from "../utils/clipboard";
 
+// Render a textarea-backed editor while keeping highlighted text visually aligned.
 export function CodeEditor({
   label,
   value,
@@ -25,10 +28,12 @@ export function CodeEditor({
   const [scroll, setScroll] = useState({ top: 0, left: 0 });
   const lineNumbers = useMemo(() => lineNumberText(value), [value]);
   const highlighted = useMemo(() => highlightCode(value, language), [value, language]);
+  // Normalize or custom-format the editor contents without touching disabled fields.
   const format = () => {
     if (disabled) return;
     onChange(onFormat ? onFormat(value) : normalizeCode(value));
   };
+  // Mirror textarea scroll offsets into the line-number and highlight overlays.
   const handleScroll = (event: UIEvent<HTMLTextAreaElement>) => {
     setScroll({ top: event.currentTarget.scrollTop, left: event.currentTarget.scrollLeft });
   };
@@ -49,6 +54,7 @@ export function CodeEditor({
             className="syntax-highlight"
             aria-hidden="true"
             style={{ transform: `translate(${-scroll.left}px, ${-scroll.top}px)` }}
+            // highlightCode escapes source first, so the overlay can use HTML spans without exposing raw code.
             dangerouslySetInnerHTML={{ __html: highlighted }}
           />
           <textarea
@@ -70,15 +76,18 @@ export function CodeEditor({
   );
 }
 
+// Generate one-based line labels that stay aligned with the textarea content.
 function lineNumberText(value: string): string {
   const count = Math.max(1, value.split("\n").length);
   return Array.from({ length: count }, (_, index) => String(index + 1)).join("\n");
 }
 
+// Trim trailing whitespace and keep a final newline for submitted code.
 function normalizeCode(value: string): string {
   return `${value.split("\n").map((line) => line.trimEnd()).join("\n").trimEnd()}\n`;
 }
 
+// Apply lightweight HTML highlighting after escaping user-controlled source text.
 function highlightCode(value: string, language: "python" | "json" | "text"): string {
   const escaped = escapeHTML(value || " ");
   if (language === "json") {
@@ -99,6 +108,7 @@ function highlightCode(value: string, language: "python" | "json" | "text"): str
   return escaped;
 }
 
+// Escape code before injecting highlighted markup into the overlay pre element.
 function escapeHTML(value: string): string {
   return value
     .replace(/&/g, "&amp;")

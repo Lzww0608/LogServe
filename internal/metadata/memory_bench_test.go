@@ -1,5 +1,8 @@
 package metadata
 
+// This file benchmarks the legacy and V2 memory stores on task, worker, and
+// workflow hot paths.
+
 import (
 	"fmt"
 	"runtime"
@@ -12,11 +15,15 @@ import (
 	"github.com/logserve/logserve/internal/workflow"
 )
 
+// init enables mutex and block profiling so benchmark runs can expose lock
+// contention differences between store implementations.
 func init() {
 	runtime.SetMutexProfileFraction(1)
 	runtime.SetBlockProfileRate(10000)
 }
 
+// BenchmarkMemoryStoreConcurrentGetTask measures concurrent read throughput for
+// task snapshots.
 func BenchmarkMemoryStoreConcurrentGetTask(b *testing.B) {
 	for _, factory := range memoryStoreBenchmarkFactories() {
 		b.Run(factory.name, func(b *testing.B) {
@@ -37,6 +44,8 @@ func BenchmarkMemoryStoreConcurrentGetTask(b *testing.B) {
 	}
 }
 
+// BenchmarkMemoryStoreConcurrentLeaseComplete measures the lease and completion
+// path under parallel workers.
 func BenchmarkMemoryStoreConcurrentLeaseComplete(b *testing.B) {
 	workers := benchmarkWorkerIDs(128)
 	for _, factory := range memoryStoreBenchmarkFactories() {
@@ -65,6 +74,8 @@ func BenchmarkMemoryStoreConcurrentLeaseComplete(b *testing.B) {
 	}
 }
 
+// BenchmarkMemoryStoreConcurrentHeartbeat measures worker heartbeat throughput
+// with changing cached-model sets.
 func BenchmarkMemoryStoreConcurrentHeartbeat(b *testing.B) {
 	workers := benchmarkWorkerIDs(256)
 	cacheSets := []map[string]bool{
@@ -88,6 +99,8 @@ func BenchmarkMemoryStoreConcurrentHeartbeat(b *testing.B) {
 	}
 }
 
+// BenchmarkMemoryStoreHeartbeatUnderCompleteP99 samples heartbeat latency while
+// other goroutines lease and complete tasks.
 func BenchmarkMemoryStoreHeartbeatUnderCompleteP99(b *testing.B) {
 	const batchOps = 8
 	workers := benchmarkWorkerIDs(128)
@@ -134,6 +147,9 @@ func BenchmarkMemoryStoreHeartbeatUnderCompleteP99(b *testing.B) {
 			if used > len(samples) {
 				used = len(samples)
 			}
+
+			// Report a custom p99 metric over sampled heartbeat batches instead of relying
+			// only on aggregate ns/op, which hides contention spikes.
 			if used > 0 {
 				observed := samples[:used]
 				sort.Slice(observed, func(i, j int) bool { return observed[i] < observed[j] })
@@ -143,6 +159,9 @@ func BenchmarkMemoryStoreHeartbeatUnderCompleteP99(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMemoryStoreActiveWorkers measures scheduler scans over many registered
+// workers.
 func BenchmarkMemoryStoreActiveWorkers(b *testing.B) {
 	for _, factory := range memoryStoreBenchmarkFactories() {
 		b.Run(factory.name, func(b *testing.B) {
@@ -166,6 +185,8 @@ func BenchmarkMemoryStoreActiveWorkers(b *testing.B) {
 	}
 }
 
+// BenchmarkMemoryStoreUpdateWorkflow measures concurrent workflow state mutation
+// and cloning costs.
 func BenchmarkMemoryStoreUpdateWorkflow(b *testing.B) {
 	for _, factory := range memoryStoreBenchmarkFactories() {
 		b.Run(factory.name, func(b *testing.B) {
@@ -195,11 +216,14 @@ func BenchmarkMemoryStoreUpdateWorkflow(b *testing.B) {
 	}
 }
 
+// memoryStoreBenchmarkFactory lets every benchmark compare legacy and V2 stores
+// with identical setup.
 type memoryStoreBenchmarkFactory struct {
 	name     string
 	newStore func() Store
 }
 
+// memoryStoreBenchmarkFactories returns the store implementations under benchmark.
 func memoryStoreBenchmarkFactories() []memoryStoreBenchmarkFactory {
 	return []memoryStoreBenchmarkFactory{
 		{name: "legacy", newStore: func() Store { return NewLegacyMemoryStore() }},
@@ -207,6 +231,7 @@ func memoryStoreBenchmarkFactories() []memoryStoreBenchmarkFactory {
 	}
 }
 
+// seedBenchmarkTasks creates queued tasks before benchmark timers start.
 func seedBenchmarkTasks(b *testing.B, store Store, n int) []string {
 	b.Helper()
 	ids := make([]string, n)
@@ -223,6 +248,7 @@ func seedBenchmarkTasks(b *testing.B, store Store, n int) []string {
 	return ids
 }
 
+// benchmarkWorkerIDs returns deterministic worker IDs for tests and benchmarks.
 func benchmarkWorkerIDs(n int) []string {
 	ids := make([]string, n)
 	for i := range ids {
@@ -231,6 +257,8 @@ func benchmarkWorkerIDs(n int) []string {
 	return ids
 }
 
+// benchmarkWorkflowState builds a deterministic workflow state with the requested
+// number of steps.
 func benchmarkWorkflowState(workflowID string, steps int) workflow.State {
 	defs := make([]workflow.StepDefinition, steps)
 	for i := range defs {

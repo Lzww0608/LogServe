@@ -1,3 +1,5 @@
+// Visual workflow builder route for editing DAG steps and generating definitions.
+
 import { useMemo, useRef, useState, type FormEvent, type PointerEvent } from "react";
 import { api } from "../api/client";
 import { FieldError, InlineError } from "../components/ErrorPanel";
@@ -61,6 +63,7 @@ type BuiltWorkflowDefinition = {
 
 let nextStepUID = 0;
 
+// Render the visual workflow DAG editor and generated definition preview.
 export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | null }) {
   const initialSteps = useMemo(() => stepsFromDefinition(workflowTemplate), []);
   const [workflowName, setWorkflowName] = useState(stringValue(workflowTemplate.workflow_name) || "simple_add");
@@ -97,6 +100,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
   const canConnect = Boolean(effectiveConnectFrom && effectiveConnectTo && effectiveConnectFrom !== effectiveConnectTo && !stepByID(steps, effectiveConnectTo)?.dependsOn.includes(effectiveConnectFrom));
   const edges = workflowEdges(steps);
 
+  // Ask the backend validator to normalize the generated workflow definition.
   const validate = async () => {
     setMessage("");
     if (!canSubmit) {
@@ -114,6 +118,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     }
   };
 
+  // Submit the generated workflow definition after local validation succeeds.
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setMessage("");
@@ -136,6 +141,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     }
   };
 
+  // Replace the draft workflow with a built-in template and reset editor selections.
   const applyTemplate = (definition: unknown) => {
     const templateSteps = stepsFromDefinition(definition);
     const record = objectValue(definition);
@@ -151,17 +157,20 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     setMessage("");
   };
 
+  // Patch a draft step and rewrite dependent references when its step id changes.
   const updateStep = (uid: string, patch: Partial<WorkflowStepDraft>) => {
     setSteps((current) => {
       const target = current.find((step) => step.uid === uid);
       const oldStepID = target?.stepId ?? "";
       const next = current.map((step) => step.uid === uid ? { ...step, ...patch } : step);
+      // Step ids are user-editable, so dependent draft edges must follow renames.
       if (patch.stepId === undefined || !oldStepID || oldStepID === patch.stepId) return next;
       return next.map((step) => step.uid === uid ? step : { ...step, dependsOn: step.dependsOn.map((dep) => dep === oldStepID ? patch.stepId ?? dep : dep) });
     });
     setValidationResult(null);
   };
 
+  // Rename the selected step and keep result/connector selections aligned.
   const updateSelectedStepID = (value: string) => {
     if (!currentStep) return;
     const oldStepID = currentStep.stepId;
@@ -171,6 +180,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     setConnectTo((current) => current === oldStepID ? value : current);
   };
 
+  // Append a new draft step and select it for immediate editing.
   const addStep = () => {
     const step = newStepDraft(steps.length);
     setSteps((current) => [...current, step]);
@@ -180,6 +190,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     setValidationResult(null);
   };
 
+  // Remove the selected draft step and drop dependencies that pointed to it.
   const removeCurrentStep = () => {
     if (!currentStep || steps.length <= 1) return;
     const removedID = currentStep.stepId;
@@ -192,6 +203,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     setValidationResult(null);
   };
 
+  // Connect two draft steps when the edge is valid and not already present.
   const addDependency = () => {
     if (!canConnect) return;
     const target = stepByID(steps, effectiveConnectTo);
@@ -199,12 +211,14 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     updateStep(target.uid, { dependsOn: [...target.dependsOn, effectiveConnectFrom] });
   };
 
+  // Remove one dependency edge from the target draft step.
   const removeDependency = (targetStepID: string, dependency: string) => {
     const target = stepByID(steps, targetStepID);
     if (!target) return;
     updateStep(target.uid, { dependsOn: target.dependsOn.filter((dep) => dep !== dependency) });
   };
 
+  // Start node dragging with a pointer offset relative to the DAG canvas.
   const beginDrag = (event: PointerEvent<HTMLButtonElement>, step: WorkflowStepDraft) => {
     const rect = dagCanvasRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -213,6 +227,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
+  // Move the dragged workflow node while clamping it inside the canvas.
   const dragNode = (event: PointerEvent<HTMLButtonElement>) => {
     if (!dragging) return;
     const rect = dagCanvasRef.current?.getBoundingClientRect();
@@ -344,6 +359,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
   );
 }
 
+// Create a blank draft step with stable defaults and canvas position.
 function newStepDraft(index: number): WorkflowStepDraft {
   const stepID = `step_${index + 1}`;
   return {
@@ -367,6 +383,7 @@ function newStepDraft(index: number): WorkflowStepDraft {
   };
 }
 
+// Hydrate editable step drafts from an existing workflow definition.
 function stepsFromDefinition(definition: unknown): WorkflowStepDraft[] {
   const record = objectValue(definition);
   const rawSteps = Array.isArray(record.steps) ? record.steps : [];
@@ -396,6 +413,7 @@ function stepsFromDefinition(definition: unknown): WorkflowStepDraft[] {
   return steps.length ? steps : [newStepDraft(0)];
 }
 
+// Compile draft UI state into the backend workflow definition plus field errors.
 function buildWorkflowDefinition(workflowName: string, steps: WorkflowStepDraft[], resultStepId: string, maxAttemptsText: string, timeoutMsText: string) {
   const errors: BuilderErrors = {};
   const maxAttempts = positiveInt(maxAttemptsText);
@@ -415,7 +433,9 @@ function buildWorkflowDefinition(workflowName: string, steps: WorkflowStepDraft[
   return { definition, errors, valid: Object.values(errors).every((error) => !error) };
 }
 
+// Convert one visual step draft into the API step payload while collecting per-field errors.
 function stepDefinitionFromDraft(step: WorkflowStepDraft, errors: BuilderErrors, inheritedAttempts: number, inheritedTimeout: number): Record<string, unknown> {
+  // Build the per-step validation key used to map errors back to form fields.
   const key = (field: string) => `${step.uid}.${field}`;
   const stepID = step.stepId.trim();
   const taskName = step.taskName.trim();
@@ -461,6 +481,7 @@ function stepDefinitionFromDraft(step: WorkflowStepDraft, errors: BuilderErrors,
   return payload;
 }
 
+// Project the flat builder error map into the selected step field errors.
 function stepErrorsFor(errors: BuilderErrors, uid: string): StepDraftErrors {
   return {
     stepId: errors[`${uid}.stepId`],
@@ -476,35 +497,43 @@ function stepErrorsFor(errors: BuilderErrors, uid: string): StepDraftErrors {
   };
 }
 
+// Derive visual DAG edges from each step dependency list.
 function workflowEdges(steps: WorkflowStepDraft[]) {
   return steps.flatMap((step) => step.dependsOn.map((dependency) => ({ from: dependency, to: step.stepId })));
 }
 
+// Find a draft step by its user-visible step id.
 function stepByID(steps: WorkflowStepDraft[], stepID: string): WorkflowStepDraft | undefined {
   return steps.find((step) => step.stepId === stepID);
 }
 
+// Read selected dependency ids from the multi-select control.
 function selectedValues(select: HTMLSelectElement): string[] {
   return Array.from(select.selectedOptions, (option) => option.value);
 }
 
+// Treat only non-array objects as workflow-definition records.
 function objectValue(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+// Recover a string field from an unknown workflow-definition value.
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+// Convert finite numeric fields back into editable input text.
 function numberText(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
 }
 
+// Parse a positive integer form field or report it as absent.
 function positiveInt(value: string): number | undefined {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+// Place new draft steps on a compact grid in the visual editor.
 function defaultPosition(index: number): StepPosition {
   return {
     x: 18 + (index % 3) * 190,
@@ -512,6 +541,7 @@ function defaultPosition(index: number): StepPosition {
   };
 }
 
+// Generate a process-local React key that survives step id edits.
 function stepUID(): string {
   nextStepUID += 1;
   return `wf-step-${nextStepUID}`;

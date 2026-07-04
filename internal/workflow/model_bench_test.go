@@ -8,6 +8,7 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// buildLinearDAGState creates a chain-shaped workflow state for scheduler benchmarks.
 func buildLinearDAGState(steps int) State {
 	defSteps := make([]StepDefinition, 0, steps)
 	for i := 0; i < steps; i++ {
@@ -37,6 +38,7 @@ func buildLinearDAGState(steps int) State {
 	return NewState("wf-bench", def, 0)
 }
 
+// buildFanOutDAGState creates one root plus many dependent leaves for ready-queue benchmark coverage.
 func buildFanOutDAGState(width int) State {
 	defSteps := make([]StepDefinition, 0, width+1)
 	defSteps = append(defSteps, StepDefinition{
@@ -68,6 +70,7 @@ func buildFanOutDAGState(width int) State {
 	return NewState("wf-fanout", def, 0)
 }
 
+// runReadyQueueSchedule schedules all available steps using RuntimeDAG.PopReadyStep.
 func runReadyQueueSchedule(state *State) int {
 	scheduled := 0
 	for {
@@ -83,6 +86,7 @@ func runReadyQueueSchedule(state *State) int {
 	return scheduled
 }
 
+// runNaiveScanSchedule schedules by scanning every step each round, providing the benchmark baseline.
 func runNaiveScanSchedule(state *State) int {
 	scheduled := 0
 	for scheduled < len(state.Definition.Steps) {
@@ -97,6 +101,8 @@ func runNaiveScanSchedule(state *State) int {
 			if step.Status != logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED || step.TaskID != "" {
 				continue
 			}
+
+			// The naive baseline recomputes dependency readiness on every scan to show the cost avoided by RuntimeDAG.
 			if !DependenciesSucceeded(stepDef, *state) {
 				continue
 			}
@@ -117,6 +123,7 @@ func runNaiveScanSchedule(state *State) int {
 	return scheduled
 }
 
+// BenchmarkScheduleLinearDAGReadyQueue measures ready-queue scheduling over dependency chains.
 func BenchmarkScheduleLinearDAGReadyQueue(b *testing.B) {
 	for _, steps := range []int{32, 128, 512, 1024} {
 		b.Run(fmt.Sprintf("steps=%d", steps), func(b *testing.B) {
@@ -133,6 +140,7 @@ func BenchmarkScheduleLinearDAGReadyQueue(b *testing.B) {
 	}
 }
 
+// BenchmarkScheduleLinearDAGNaiveScan measures the full-scan baseline over dependency chains.
 func BenchmarkScheduleLinearDAGNaiveScan(b *testing.B) {
 	for _, steps := range []int{32, 128, 512, 1024} {
 		b.Run(fmt.Sprintf("steps=%d", steps), func(b *testing.B) {
@@ -149,6 +157,7 @@ func BenchmarkScheduleLinearDAGNaiveScan(b *testing.B) {
 	}
 }
 
+// BenchmarkScheduleFanOutDAGReadyQueue measures ready-queue scheduling after one root unlocks many leaves.
 func BenchmarkScheduleFanOutDAGReadyQueue(b *testing.B) {
 	for _, width := range []int{32, 128, 512} {
 		b.Run(fmt.Sprintf("leaves=%d", width), func(b *testing.B) {
@@ -165,6 +174,7 @@ func BenchmarkScheduleFanOutDAGReadyQueue(b *testing.B) {
 	}
 }
 
+// BenchmarkScheduleFanOutDAGNaiveScan measures the full-scan baseline for fan-out workflows.
 func BenchmarkScheduleFanOutDAGNaiveScan(b *testing.B) {
 	for _, width := range []int{32, 128, 512} {
 		b.Run(fmt.Sprintf("leaves=%d", width), func(b *testing.B) {

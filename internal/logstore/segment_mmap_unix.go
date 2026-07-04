@@ -8,14 +8,20 @@ import (
 	"syscall"
 )
 
+// maxMmapSegmentBytes keeps accidental huge mappings out of this lightweight
+// local store; larger segments still work through the ReadAt fallback.
 const maxMmapSegmentBytes = 1 << 30
 
+// mmapMapping owns a syscall.Mmap byte slice until Close unmaps it.
 type mmapMapping struct {
 	data []byte
 }
 
+// mmapSupported reports that this build target has mmap read support.
 func mmapSupported() bool { return true }
 
+// mmapFile maps the full file for read-only random access. Empty files produce
+// an empty mapping so callers can still fall back to ReadAt semantics.
 func mmapFile(file *os.File) (*mmapMapping, error) {
 	info, err := file.Stat()
 	if err != nil {
@@ -35,6 +41,8 @@ func mmapFile(file *os.File) (*mmapMapping, error) {
 	return &mmapMapping{data: data}, nil
 }
 
+// Close releases the mapped address range and clears the slice to prevent reuse
+// after unmap.
 func (m *mmapMapping) Close() error {
 	if m == nil || len(m.data) == 0 {
 		return nil

@@ -6,8 +6,12 @@ import (
 	"github.com/logserve/logserve/internal/eventcodec"
 )
 
+// This file encodes task lifecycle payloads in compact eventcodec form while still
+// accepting older JSON payloads during replay.
 const taskLifecycleEventKind = eventcodec.Kind(4)
 
+// marshalTaskLifecyclePayload omits empty fields and writes compact eventcodec data
+// unless every field is empty, where JSON preserves the zero-value shape.
 func marshalTaskLifecyclePayload(payload taskLifecyclePayload) ([]byte, error) {
 	fields := map[string]any{}
 	if payload.TaskLeaseEpoch > 0 {
@@ -31,6 +35,8 @@ func marshalTaskLifecyclePayload(payload taskLifecyclePayload) ([]byte, error) {
 	return eventcodec.Marshal(taskLifecycleEventKind, fields)
 }
 
+// decodeTaskLifecyclePayload accepts compact eventcodec records and falls back to
+// legacy JSON without failing replay on malformed empty payloads.
 func decodeTaskLifecyclePayload(data []byte) taskLifecyclePayload {
 	if len(data) == 0 {
 		return taskLifecyclePayload{}

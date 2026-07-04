@@ -1,11 +1,16 @@
 package webapi
 
+// This file constructs backend gRPC clients for the control plane and log
+// service using the process-level API token.
+
 import (
 	"github.com/logserve/logserve/gen/logservepb"
 	"github.com/logserve/logserve/internal/rpcauth"
 	"google.golang.org/grpc"
 )
 
+// Clients groups the control and log gRPC connections used by HTTP handlers.
+// Only APIToken is passed to these clients; role tokens are not backend auth.
 type Clients struct {
 	controlConn *grpc.ClientConn
 	logConn     *grpc.ClientConn
@@ -13,6 +18,8 @@ type Clients struct {
 	Log         logservepb.LogServiceClient
 }
 
+// DialClients opens control-plane and log-service gRPC clients with the backend
+// API token configured for this webapi process.
 func DialClients(cfg Config) (*Clients, error) {
 	controlConn, err := grpc.NewClient(cfg.ControlAddr, rpcauth.InsecureDialOptions(cfg.APIToken)...)
 	if err != nil {
@@ -31,6 +38,7 @@ func DialClients(cfg Config) (*Clients, error) {
 	}, nil
 }
 
+// Close releases both gRPC connections and tolerates a nil Clients receiver.
 func (c *Clients) Close() error {
 	if c == nil {
 		return nil

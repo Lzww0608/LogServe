@@ -11,6 +11,8 @@ import (
 	"github.com/logserve/logserve/internal/metadata"
 )
 
+// TestPollTaskBatchLegacyLeasesUpToMaxTasks verifies legacy polling leases up to the
+// requested batch size and updates worker load.
 func TestPollTaskBatchLegacyLeasesUpToMaxTasks(t *testing.T) {
 	t.Setenv("LOGSERVE_SCHEDULER_V2", "0")
 	meta := metadata.NewMemoryStore()
@@ -43,6 +45,8 @@ func TestPollTaskBatchLegacyLeasesUpToMaxTasks(t *testing.T) {
 	}
 }
 
+// TestPollTaskBatchIndexedAndCompleteTasks verifies scheduler v2 batch leasing and
+// batch completion release worker load.
 func TestPollTaskBatchIndexedAndCompleteTasks(t *testing.T) {
 	t.Setenv("LOGSERVE_SCHEDULER_V2", "1")
 	meta := metadata.NewMemoryStore()
@@ -89,6 +93,8 @@ func TestPollTaskBatchIndexedAndCompleteTasks(t *testing.T) {
 	}
 }
 
+// TestPollTaskBatchDoesNotDispatchFutureActorCommand verifies batch polling still
+// honors actor command sequence ordering.
 func TestPollTaskBatchDoesNotDispatchFutureActorCommand(t *testing.T) {
 	t.Setenv("LOGSERVE_SCHEDULER_V2", "0")
 	meta := metadata.NewMemoryStore()
@@ -140,6 +146,8 @@ func TestPollTaskBatchDoesNotDispatchFutureActorCommand(t *testing.T) {
 	}
 }
 
+// TestPollTaskLongPollReturnsWhenTaskArrives verifies long-poll waiters wake when a
+// task is enqueued.
 func TestPollTaskLongPollReturnsWhenTaskArrives(t *testing.T) {
 	t.Setenv("LOGSERVE_SCHEDULER_V2", "0")
 	meta := metadata.NewMemoryStore()
@@ -175,6 +183,8 @@ func TestPollTaskLongPollReturnsWhenTaskArrives(t *testing.T) {
 	}
 }
 
+// TestPollTaskLongPollTimeoutReturnsEmpty verifies idle long-poll requests return an
+// empty response after the bounded timeout.
 func TestPollTaskLongPollTimeoutReturnsEmpty(t *testing.T) {
 	meta := metadata.NewMemoryStore()
 	meta.UpsertWorker(metadata.Worker{WorkerID: "worker-1", Capacity: 1, LastHeartbeat: time.Now().UnixMilli()})
@@ -193,6 +203,7 @@ func TestPollTaskLongPollTimeoutReturnsEmpty(t *testing.T) {
 	}
 }
 
+// enqueueBatchTestTasks creates a sequence of queued task records for polling tests.
 func enqueueBatchTestTasks(t *testing.T, service *Service, count int) []metadata.Task {
 	t.Helper()
 	tasks := make([]metadata.Task, 0, count)
@@ -202,6 +213,7 @@ func enqueueBatchTestTasks(t *testing.T, service *Service, count int) []metadata
 	return tasks
 }
 
+// enqueueBatchTestTask submits one deterministic task through the normal enqueue path.
 func enqueueBatchTestTask(t *testing.T, service *Service, taskID string) metadata.Task {
 	t.Helper()
 	task, _, err := service.enqueueTask(context.Background(), &logservepb.TaskSpec{

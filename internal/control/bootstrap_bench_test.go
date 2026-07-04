@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
+// seedBootstrapTaskStreams creates synthetic task streams for bootstrap benchmarks.
 func seedBootstrapTaskStreams(b *testing.B, logClient *countingReplayableLogClient, streams, recordsPerStream int) {
 	b.Helper()
 	spec := &logservepb.TaskSpec{
@@ -37,6 +38,8 @@ func seedBootstrapTaskStreams(b *testing.B, logClient *countingReplayableLogClie
 	}
 }
 
+// BenchmarkBootstrapFromLog measures full control-plane bootstrap over synthetic
+// task stream counts and records-per-stream depths.
 func BenchmarkBootstrapFromLog(b *testing.B) {
 	for _, streams := range []int{10, 100} {
 		for _, records := range []int{1, 4} {

@@ -1,4 +1,9 @@
+// Package worker implements the LogServe worker process runtime.
+// It polls the control plane, executes Python, actor, and LLM tasks, and reports completions while maintaining local function and model caches.
 package worker
+
+// This file contains the worker runtime loop, executor pool, Python subprocess
+// protocol, LLM adapters, and model checkpoint cache implementation.
 
 import (
 	"bufio"
@@ -20,15 +25,17 @@ import (
 	"time"
 
 	"github.com/logserve/logserve/gen/logservepb"
+	"github.com/logserve/logserve/internal/actorlock"
 	"github.com/logserve/logserve/internal/eventcodec"
 	"github.com/logserve/logserve/internal/objectstore"
-	"github.com/logserve/logserve/internal/actorlock"
 	"github.com/logserve/logserve/internal/observability"
 	"github.com/logserve/logserve/internal/rpcauth"
 	"github.com/vmihailenco/msgpack/v5"
 	"google.golang.org/grpc"
 )
 
+// Config carries runtime settings for Run.
+// Zero values select worker defaults for identifiers, executor paths, polling, capacity, and mock LLM timings.
 type Config struct {
 	WorkerID                 string
 	ControlAddr              string
@@ -52,6 +59,7 @@ type Config struct {
 	ModelCacheCapacityBytes  int64
 }
 
+// executorRequest is the request envelope sent to the Python executor for stateless function calls.
 type executorRequest struct {
 	FunctionSource string          `json:"function_source,omitempty"`
 	FunctionRef    string          `json:"function_ref,omitempty"`
@@ -60,6 +68,7 @@ type executorRequest struct {
 	ArgsJSON       json.RawMessage `json:"args_json"`
 }
 
+// executorResponse is the executor reply shape shared by JSON and msgpack protocols.
 type executorResponse struct {
 	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
@@ -67,6 +76,8 @@ type executorResponse struct {
 	Error  string          `json:"error,omitempty"`
 }
 
+// actorExecutorRequest is the Python executor envelope for actor method calls.
+// It carries both the input state and the init arguments needed when the actor is first materialized.
 type actorExecutorRequest struct {
 	Mode         string          `json:"mode"`
 	ClassSource  string          `json:"class_source"`
@@ -77,11 +88,13 @@ type actorExecutorRequest struct {
 	InitArgsJSON json.RawMessage `json:"init_args_json"`
 }
 
+// llmArgsPayload mirrors the JSON args envelope used by control-plane task submission for LLM prompts.
 type llmArgsPayload struct {
 	Args   []json.RawMessage          `json:"args"`
 	Kwargs map[string]json.RawMessage `json:"kwargs"`
 }
 
+// llmEventPayload is appended to the per-task LLM log stream to make cache and latency behavior replayable.
 type llmEventPayload struct {
 	TaskID             string `json:"task_id,omitempty"`
 	ModelName          string `json:"model_name,omitempty"`
@@ -98,6 +111,7 @@ type llmEventPayload struct {
 	TimestampMs        int64  `json:"timestamp_ms,omitempty"`
 }
 
+// Executor protocol constants bound the local Python subprocess wire format and frame sizes.
 const (
 	executorProtocolJSON    = "json"
 	executorProtocolMsgpack = "msgpack"
@@ -105,6 +119,7 @@ const (
 	maxPooledExecutorFrame  = 4 << 20
 )
 
+// executorFrameBufferPool reuses medium-sized msgpack frames without retaining very large allocations forever.
 var executorFrameBufferPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, 0, 64*1024)
@@ -112,6 +127,8 @@ var executorFrameBufferPool = sync.Pool{
 	},
 }
 
+// pythonRunner owns one long-lived Python executor subprocess.
+// Calls are serialized through mu because the executor protocol is request-response over a single stdin/stdout pair.
 type pythonRunner struct {
 	cmd            *exec.Cmd
 	stdin          io.WriteCloser
@@ -122,29 +139,35 @@ type pythonRunner struct {
 	knownFunctions map[string]struct{}
 }
 
+// lockedBuffer captures subprocess stderr while allowing readResponseLocked to read it from another goroutine safely.
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
 
+// Write appends stderr bytes under a mutex so executor failure diagnostics are not raced.
 func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.Write(p)
 }
 
+// Len returns the buffered stderr size under the same lock used by Write.
 func (b *lockedBuffer) Len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.Len()
 }
 
+// String returns the current stderr text for error reporting.
 func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
 
+// modelCache tracks warmed LLM models and optional on-disk checkpoint files.
+// The disk-backed path uses an LRU list plus a map for O(1) promotion and eviction.
 type modelCache struct {
 	mu            sync.Mutex
 	models        map[string]bool
@@ -157,6 +180,7 @@ type modelCache struct {
 	usedBytes     int64
 }
 
+// cacheEntry records one checkpoint file in the worker-local model cache.
 type cacheEntry struct {
 	key        string
 	path       string
@@ -164,12 +188,14 @@ type cacheEntry struct {
 	lastAccess int64
 }
 
+// loadCall coordinates concurrent cold loads for the same model checkpoint.
 type loadCall struct {
 	done   chan struct{}
 	result checkpointLoadResult
 	err    error
 }
 
+// modelCacheManifest persists enough metadata to rebuild the checkpoint LRU after a worker restart.
 type modelCacheManifest struct {
 	Name           string `json:"name"`
 	Version        string `json:"version"`
@@ -178,6 +204,7 @@ type modelCacheManifest struct {
 	LastAccessMs   int64  `json:"last_access_ms"`
 }
 
+// checkpointLoadResult reports whether a model load hit cache and how much local cache work it performed.
 type checkpointLoadResult struct {
 	CacheHit           bool
 	CheckpointFetchMs  int64
@@ -186,17 +213,22 @@ type checkpointLoadResult struct {
 	CacheCapacityBytes int64
 	EvictionCount      int64
 }
+
+// workerJob is the internal queue item handed from the polling loop to an executor pool.
 type workerJob struct {
 	task       *logservepb.TaskSpec
 	enqueuedAt time.Time
 }
 
+// workerJobResult carries an executor completion back to the main Run loop for batched acknowledgement.
 type workerJobResult struct {
 	task       *logservepb.TaskSpec
 	completion *logservepb.CompleteTaskRequest
 	err        error
 }
 
+// localExecutorPool separates regular Python tasks, actor tasks, and LLM tasks into dedicated queues.
+// Actor tasks share an actor lock table so calls for the same actor are serialized even with multiple actor runners.
 type localExecutorPool struct {
 	cfg           Config
 	cache         *modelCache
@@ -212,7 +244,11 @@ type localExecutorPool struct {
 	wg            sync.WaitGroup
 }
 
+// Run starts the worker process loop.
+// It registers with the control plane, heartbeats cached model state, polls for tasks up to local capacity, and batches task completions back to the control plane.
 func Run(ctx context.Context, cfg Config) error {
+	// Normalize process defaults in one place so command entrypoints can pass a
+	// sparse Config while tests can override only the dimensions they need.
 	if cfg.WorkerID == "" {
 		cfg.WorkerID = "worker-1"
 	}
@@ -267,6 +303,8 @@ func Run(ctx context.Context, cfg Config) error {
 	controlClient := logservepb.NewControlServiceClient(controlConn)
 	logClient := logservepb.NewLogServiceClient(logConn)
 	cache := newModelCache(cfg)
+	// Function source may be sent inline, cached locally, or fetched lazily from
+	// the object store when the control plane sends only a function_ref.
 	functionStore, err := objectstore.OpenFromEnv(ctx)
 	if err != nil {
 		return err
@@ -289,6 +327,8 @@ func Run(ctx context.Context, cfg Config) error {
 
 	heartbeatTicker := time.NewTicker(cfg.HeartbeatInterval)
 	defer heartbeatTicker.Stop()
+
+	// The zero-delay timer triggers an immediate first poll; resetTimer handles the stopped-timer drain edge case after that.
 	pollTimer := time.NewTimer(0)
 	defer pollTimer.Stop()
 
@@ -307,6 +347,8 @@ func Run(ctx context.Context, cfg Config) error {
 			return ctx.Err()
 		case result := <-pool.results:
 			collectWorkerResult(cfg, result, &inFlight, &completedTasks, &pendingCompletions)
+
+			// Drain already-finished jobs so one wakeup can produce a single CompleteTasks batch.
 			drainWorkerResults(cfg, pool.results, &inFlight, &completedTasks, &pendingCompletions)
 			flushCompletions(ctx, cfg.WorkerID, controlClient, pendingCompletions)
 			pendingCompletions = pendingCompletions[:0]
@@ -339,6 +381,8 @@ func Run(ctx context.Context, cfg Config) error {
 				resetTimer(pollTimer, cfg.PollInterval)
 				continue
 			}
+
+			// Long-poll only when this worker is otherwise idle; active local work should keep the loop responsive.
 			waitMs := int64(0)
 			if inFlight == 0 {
 				waitMs = cfg.PollInterval.Milliseconds()
@@ -382,6 +426,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+// resetTimer safely reuses a time.Timer by draining a pending tick before Reset.
 func resetTimer(timer *time.Timer, delay time.Duration) {
 	if !timer.Stop() {
 		select {
@@ -392,6 +437,7 @@ func resetTimer(timer *time.Timer, delay time.Duration) {
 	timer.Reset(delay)
 }
 
+// pollTasks normalizes both batch PollTask responses and the older single-task response fields.
 func pollTasks(resp *logservepb.PollTaskResponse) []*logservepb.TaskSpec {
 	if resp == nil {
 		return nil
@@ -405,6 +451,7 @@ func pollTasks(resp *logservepb.PollTaskResponse) []*logservepb.TaskSpec {
 	return nil
 }
 
+// collectWorkerResult updates main-loop counters and buffers an accepted completion for batch submission.
 func collectWorkerResult(cfg Config, result workerJobResult, inFlight *int, completedTasks *int, pendingCompletions *[]*logservepb.CompleteTaskRequest) {
 	if *inFlight > 0 {
 		*inFlight = *inFlight - 1
@@ -421,6 +468,7 @@ func collectWorkerResult(cfg Config, result workerJobResult, inFlight *int, comp
 	}
 }
 
+// drainWorkerResults opportunistically consumes all currently-ready executor results without blocking.
 func drainWorkerResults(cfg Config, results <-chan workerJobResult, inFlight *int, completedTasks *int, pendingCompletions *[]*logservepb.CompleteTaskRequest) {
 	for {
 		select {
@@ -432,6 +480,7 @@ func drainWorkerResults(cfg Config, results <-chan workerJobResult, inFlight *in
 	}
 }
 
+// flushCompletions sends a batch acknowledgement to the control plane and logs per-task rejections.
 func flushCompletions(ctx context.Context, workerID string, controlClient logservepb.ControlServiceClient, completions []*logservepb.CompleteTaskRequest) {
 	if len(completions) == 0 {
 		return
@@ -453,6 +502,8 @@ func flushCompletions(ctx context.Context, workerID string, controlClient logser
 	}
 }
 
+// startLocalExecutorPool creates dedicated executor workers for Python functions, actors, and LLM requests.
+// If any Python subprocess fails to start, already-started subprocesses are closed before returning the error.
 func startLocalExecutorPool(ctx context.Context, cfg Config, cache *modelCache, functionCache *FunctionCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient) (*localExecutorPool, error) {
 	queueSize := positiveInt(int(cfg.Capacity), 1)
 	taskPoolSize := positiveInt(cfg.TaskPoolSize, 1)
@@ -515,11 +566,14 @@ func startLocalExecutorPool(ctx context.Context, cfg Config, cache *modelCache, 
 	return pool, nil
 }
 
+// Dispatch routes a task to the queue implied by its spec and waits until it is enqueued or the context is cancelled.
 func (p *localExecutorPool) Dispatch(ctx context.Context, task *logservepb.TaskSpec) error {
 	if task == nil {
 		return errors.New("task is nil")
 	}
 	job := workerJob{task: task, enqueuedAt: time.Now()}
+
+	// LLM and actor tasks use separate pools so slow model loads or actor ordering do not block regular Python calls.
 	queue := p.taskQueue
 	if task.GetLlmModelName() != "" {
 		queue = p.llmQueue
@@ -535,6 +589,7 @@ func (p *localExecutorPool) Dispatch(ctx context.Context, task *logservepb.TaskS
 	}
 }
 
+// Close stops accepting new work and waits for all executor goroutines to exit.
 func (p *localExecutorPool) Close() {
 	p.closeOnce.Do(func() {
 		close(p.taskQueue)
@@ -544,6 +599,8 @@ func (p *localExecutorPool) Close() {
 	})
 }
 
+// runPythonWorker executes regular Python or actor jobs with one subprocess runner.
+// When actorOrdered is true, it holds the actor-specific lock across execution so state updates remain serial.
 func (p *localExecutorPool) runPythonWorker(ctx context.Context, runner *pythonRunner, queue <-chan workerJob, actorOrdered bool) {
 	defer p.wg.Done()
 	defer runner.Close()
@@ -556,6 +613,8 @@ func (p *localExecutorPool) runPythonWorker(ctx context.Context, runner *pythonR
 				return
 			}
 			var unlock func()
+
+			// The lock is per actor ID rather than global, allowing different actors to run concurrently.
 			if actorOrdered {
 				unlock = p.lockActor(job.task.GetActorId())
 			}
@@ -568,6 +627,7 @@ func (p *localExecutorPool) runPythonWorker(ctx context.Context, runner *pythonR
 	}
 }
 
+// runLLMWorker executes LLM tasks without a Python subprocess because mock and vLLM adapters are handled in Go.
 func (p *localExecutorPool) runLLMWorker(ctx context.Context, queue <-chan workerJob) {
 	defer p.wg.Done()
 	for {
@@ -584,6 +644,7 @@ func (p *localExecutorPool) runLLMWorker(ctx context.Context, queue <-chan worke
 	}
 }
 
+// finish publishes a worker result unless the parent context has already been cancelled.
 func (p *localExecutorPool) finish(ctx context.Context, task *logservepb.TaskSpec, completion *logservepb.CompleteTaskRequest, err error) {
 	select {
 	case p.results <- workerJobResult{task: task, completion: completion, err: err}:
@@ -591,6 +652,7 @@ func (p *localExecutorPool) finish(ctx context.Context, task *logservepb.TaskSpe
 	}
 }
 
+// lockActor returns an unlock callback for the actor ID, or nil when the pool is not fully initialized.
 func (p *localExecutorPool) lockActor(actorID string) func() {
 	if p == nil || p.actorLocks == nil {
 		return nil
@@ -598,12 +660,14 @@ func (p *localExecutorPool) lockActor(actorID string) func() {
 	return p.actorLocks.Lock(actorID)
 }
 
+// closeRunners best-effort closes subprocesses during partial pool startup failure.
 func closeRunners(runners []*pythonRunner) {
 	for _, runner := range runners {
 		_ = runner.Close()
 	}
 }
 
+// positiveInt applies a fallback when a configured pool or queue size is not positive.
 func positiveInt(value, fallback int) int {
 	if value > 0 {
 		return value
@@ -611,12 +675,16 @@ func positiveInt(value, fallback int) int {
 	return fallback
 }
 
+// executeTask claims a task lease, runs the appropriate executor with the task timeout, and builds the completion request.
+// On Python timeouts it restarts the subprocess because the request-response stream can no longer be trusted.
 func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *modelCache, functionCache *FunctionCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient, task *logservepb.TaskSpec, enqueuedAt time.Time) (*logservepb.CompleteTaskRequest, error) {
 	if task == nil {
 		return nil, errors.New("task is nil")
 	}
 	_ = enqueuedAt
 
+	// StartTask claims the current lease epoch before local execution, preventing
+	// stale or already-reassigned work from being completed by this process.
 	if _, err := controlClient.StartTask(ctx, &logservepb.StartTaskRequest{
 		TaskId:         task.GetTaskId(),
 		WorkerId:       cfg.WorkerID,
@@ -632,6 +700,8 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 	}
 	result, actorState, execErr := runExecutor(execCtx, cfg, runner, cache, functionCache, controlClient, logClient, task)
 	cancelExec()
+
+	// A timed-out Python call may leave bytes unread on stdout, so the runner is replaced before reuse.
 	if errors.Is(execErr, context.DeadlineExceeded) && task.GetLlmModelName() == "" && runner != nil {
 		if err := runner.Restart(ctx, cfg); err != nil {
 			observability.Error("python_executor_restart_failed", err, map[string]any{"worker_id": cfg.WorkerID})
@@ -658,6 +728,8 @@ func executeTask(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 		TaskLeaseEpoch: task.GetTaskLeaseEpoch(),
 	}, execErr
 }
+
+// runExecutor dispatches a TaskSpec to the LLM, actor, or regular Python execution path and returns result plus optional actor state.
 func runExecutor(ctx context.Context, cfg Config, runner *pythonRunner, cache *modelCache, functionCache *FunctionCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient, task *logservepb.TaskSpec) ([]byte, []byte, error) {
 	if task.GetLlmModelName() != "" {
 		result, err := runLLMExecutor(ctx, cfg, cache, controlClient, logClient, task)
@@ -671,6 +743,8 @@ func runExecutor(ctx context.Context, cfg Config, runner *pythonRunner, cache *m
 	return result, nil, err
 }
 
+// runLLMExecutor simulates or forwards an LLM request and records model-load lifecycle events to the log.
+// It treats missing versions and adapters as v1/mock so older task submissions remain executable.
 func runLLMExecutor(ctx context.Context, cfg Config, cache *modelCache, controlClient logservepb.ControlServiceClient, logClient logservepb.LogServiceClient, task *logservepb.TaskSpec) ([]byte, error) {
 	modelName := task.GetLlmModelName()
 	version := task.GetLlmModelVersion()
@@ -700,6 +774,8 @@ func runLLMExecutor(ctx context.Context, cfg Config, cache *modelCache, controlC
 		CacheUsedBytes:     cache.used(),
 		CacheCapacityBytes: cache.capacity(),
 	}
+
+	// A configured checkpoint store takes precedence over in-memory warm markers so cache-hit metrics reflect disk state.
 	if cache.usesCheckpointStore() {
 		checkpoint, err = cache.ensureCheckpoint(ctx, modelName, version)
 		if err != nil {
@@ -722,6 +798,8 @@ func runLLMExecutor(ctx context.Context, cfg Config, cache *modelCache, controlC
 		if !cache.usesCheckpointStore() {
 			cache.add(modelName, version)
 		}
+		// Refresh the control plane promptly after a cold load so future scheduling
+		// can account for the model before the next periodic heartbeat.
 		_, _ = controlClient.Heartbeat(ctx, &logservepb.HeartbeatRequest{
 			WorkerId:     cfg.WorkerID,
 			CachedModels: cache.snapshotEntries(),
@@ -774,6 +852,7 @@ func runLLMExecutor(ctx context.Context, cfg Config, cache *modelCache, controlC
 	return json.Marshal(text)
 }
 
+// runPythonExecutor resolves function source by hash when needed, invokes the Python runner, and returns raw JSON result bytes.
 func runPythonExecutor(ctx context.Context, runner *pythonRunner, functionCache *FunctionCache, task *logservepb.TaskSpec) ([]byte, error) {
 	if runner == nil {
 		return nil, errors.New("python runner is required for task execution")
@@ -783,6 +862,8 @@ func runPythonExecutor(ctx context.Context, runner *pythonRunner, functionCache 
 	}
 	hash := task.GetFunctionHash()
 	source := task.GetFunctionSource()
+
+	// Once a runner has loaded a function hash, later tasks can send the hash without resending source.
 	if hash != "" && !runner.knowsFunction(hash) {
 		loaded, err := functionCache.SourceForTask(ctx, task)
 		if err != nil {
@@ -813,6 +894,7 @@ func runPythonExecutor(ctx context.Context, runner *pythonRunner, functionCache 
 	return append([]byte(nil), resp.Result...), nil
 }
 
+// runActorExecutor invokes the Python actor adapter with current actor state and returns result plus updated state.
 func runActorExecutor(ctx context.Context, runner *pythonRunner, task *logservepb.TaskSpec) ([]byte, []byte, error) {
 	if runner == nil {
 		return nil, nil, errors.New("python runner is required for actor execution")
@@ -837,13 +919,17 @@ func runActorExecutor(ctx context.Context, runner *pythonRunner, task *logservep
 	if len(result) == 0 {
 		result = []byte("null")
 	}
+
+	// Empty state means a newly initialized actor with no persisted fields, not an executor failure.
 	if len(resp.State) == 0 {
 		resp.State = []byte("{}")
 	}
 	return append([]byte(nil), result...), append([]byte(nil), resp.State...), nil
 }
 
+// startPythonRunner launches the Python executor subprocess in msgpack mode by default, with JSON as an env-selected fallback.
 func startPythonRunner(ctx context.Context, cfg Config) (*pythonRunner, error) {
+	// The protocol is process-wide because one runner speaks one framing format for its lifetime.
 	protocol := strings.ToLower(strings.TrimSpace(os.Getenv("LOGSERVE_EXECUTOR_PROTOCOL")))
 	if protocol == "" {
 		protocol = executorProtocolMsgpack
@@ -878,6 +964,8 @@ func startPythonRunner(ctx context.Context, cfg Config) (*pythonRunner, error) {
 		knownFunctions: make(map[string]struct{}),
 	}, nil
 }
+
+// knowsFunction reports whether this subprocess has already received source for the function hash.
 func (r *pythonRunner) knowsFunction(hash string) bool {
 	if r == nil || hash == "" {
 		return false
@@ -888,6 +976,7 @@ func (r *pythonRunner) knowsFunction(hash string) bool {
 	return ok
 }
 
+// markFunction records that this subprocess can execute future calls by function hash alone.
 func (r *pythonRunner) markFunction(hash string) {
 	if r == nil || hash == "" {
 		return
@@ -899,6 +988,9 @@ func (r *pythonRunner) markFunction(hash string) {
 	}
 	r.knownFunctions[hash] = struct{}{}
 }
+
+// Execute sends one request to the subprocess and waits for one response.
+// The runner mutex protects the ordered stdin/stdout protocol from concurrent callers.
 func (r *pythonRunner) Execute(ctx context.Context, req any) (executorResponse, error) {
 	select {
 	case <-ctx.Done():
@@ -915,6 +1007,8 @@ func (r *pythonRunner) Execute(ctx context.Context, req any) (executorResponse, 
 	return r.executeMsgpackLocked(ctx, req)
 }
 
+// executeJSONLocked writes a newline-delimited JSON request and reads a JSON response.
+// The caller must hold r.mu.
 func (r *pythonRunner) executeJSONLocked(ctx context.Context, req any) (executorResponse, error) {
 	data, err := json.Marshal(req)
 	if err != nil {
@@ -937,6 +1031,8 @@ func (r *pythonRunner) executeJSONLocked(ctx context.Context, req any) (executor
 	})
 }
 
+// executeMsgpackLocked writes a length-prefixed msgpack request and reads a msgpack response.
+// The caller must hold r.mu.
 func (r *pythonRunner) executeMsgpackLocked(ctx context.Context, req any) (executorResponse, error) {
 	data, err := marshalExecutorRequestMsgpack(req)
 	if err != nil {
@@ -957,6 +1053,7 @@ func (r *pythonRunner) executeMsgpackLocked(ctx context.Context, req any) (execu
 	})
 }
 
+// readResponseLocked runs the blocking stdout read in a goroutine so context cancellation can kill the subprocess.
 func (r *pythonRunner) readResponseLocked(ctx context.Context, read func() (executorResponse, error)) (executorResponse, error) {
 	type scanResult struct {
 		resp executorResponse
@@ -973,6 +1070,7 @@ func (r *pythonRunner) readResponseLocked(ctx context.Context, read func() (exec
 	case result := <-done:
 		return result.resp, result.err
 	case <-ctx.Done():
+		// Killing the process is the only reliable way to unblock a stuck pipe read on all supported platforms.
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
@@ -984,9 +1082,12 @@ func (r *pythonRunner) readResponseLocked(ctx context.Context, read func() (exec
 	}
 }
 
+// marshalExecutorRequestMsgpack converts typed executor requests into the Python msgpack map format.
+// JSON payload fields stay as raw bytes so Python receives the exact submitted JSON envelope.
 func marshalExecutorRequestMsgpack(req any) ([]byte, error) {
 	fields := map[string]any{}
 	switch typed := req.(type) {
+	// Keep JSON as bytes instead of decoded msgpack objects to avoid changing Python-side parsing semantics.
 	case executorRequest:
 		if typed.FunctionSource != "" {
 			fields["function_source"] = typed.FunctionSource
@@ -1013,6 +1114,8 @@ func marshalExecutorRequestMsgpack(req any) ([]byte, error) {
 	return msgpack.Marshal(fields)
 }
 
+// unmarshalExecutorResponseMsgpack decodes the Python reply and normalizes result/state into raw JSON bytes.
+// It accepts both *_json byte fields and legacy decoded result/state fields.
 func unmarshalExecutorResponseMsgpack(data []byte) (executorResponse, error) {
 	var fields map[string]any
 	if err := msgpack.Unmarshal(data, &fields); err != nil {
@@ -1022,6 +1125,8 @@ func unmarshalExecutorResponseMsgpack(data []byte) (executorResponse, error) {
 		OK:    boolValue(fields["ok"]),
 		Error: eventcodec.StringValue(fields["error"]),
 	}
+
+	// Prefer explicit raw JSON bytes; fallback fields are marshaled back to JSON for compatibility.
 	if result := eventcodec.BytesValue(fields["result_json"]); len(result) > 0 {
 		resp.Result = append([]byte(nil), result...)
 	} else if value, ok := fields["result"]; ok {
@@ -1043,6 +1148,7 @@ func unmarshalExecutorResponseMsgpack(data []byte) (executorResponse, error) {
 	return resp, nil
 }
 
+// writeExecutorFrame writes a big-endian length prefix followed by the msgpack payload.
 func writeExecutorFrame(w io.Writer, data []byte) error {
 	if len(data) > maxExecutorFrameBytes {
 		return fmt.Errorf("executor frame %d exceeds max %d", len(data), maxExecutorFrameBytes)
@@ -1056,6 +1162,7 @@ func writeExecutorFrame(w io.Writer, data []byte) error {
 	return err
 }
 
+// readExecutorFrame reads a bounded length-prefixed executor frame and returns a buffer the caller may return to the pool.
 func readExecutorFrame(r io.Reader) ([]byte, error) {
 	var header [4]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
@@ -1073,6 +1180,7 @@ func readExecutorFrame(r io.Reader) ([]byte, error) {
 	return data, nil
 }
 
+// getExecutorFrameBuffer returns a reusable buffer for medium frames and allocates directly for oversized frames.
 func getExecutorFrameBuffer(size int) []byte {
 	if size > maxPooledExecutorFrame {
 		return make([]byte, size)
@@ -1085,6 +1193,7 @@ func getExecutorFrameBuffer(size int) []byte {
 	return buf[:size]
 }
 
+// putExecutorFrameBuffer returns only bounded-capacity frame buffers to the pool to avoid retaining large spikes.
 func putExecutorFrameBuffer(buf []byte) {
 	if cap(buf) == 0 || cap(buf) > maxPooledExecutorFrame {
 		return
@@ -1093,6 +1202,7 @@ func putExecutorFrameBuffer(buf []byte) {
 	executorFrameBufferPool.Put(&buf)
 }
 
+// executorReadError prefers captured stderr over a generic pipe error when the subprocess exits.
 func executorReadError(err error, stderr *lockedBuffer) error {
 	if stderr != nil && stderr.Len() > 0 {
 		return errors.New(stderr.String())
@@ -1103,10 +1213,13 @@ func executorReadError(err error, stderr *lockedBuffer) error {
 	return err
 }
 
+// boolValue reads a loosely typed msgpack map boolean without panicking on malformed replies.
 func boolValue(value any) bool {
 	v, _ := value.(bool)
 	return v
 }
+
+// Restart replaces the subprocess after a timeout or stream failure and clears runner-local function knowledge.
 func (r *pythonRunner) Restart(ctx context.Context, cfg Config) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1131,15 +1244,18 @@ func (r *pythonRunner) Restart(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+// Close closes stdin and waits for the subprocess to exit.
 func (r *pythonRunner) Close() error {
 	_ = r.stdin.Close()
 	return r.cmd.Wait()
 }
 
+// taskStream returns the per-task log stream name used for task-scoped events.
 func taskStream(taskID string) string {
 	return "task:" + taskID
 }
 
+// newModelCache initializes in-memory warm-model state and restores disk checkpoint manifests when configured.
 func newModelCache(cfg Config) *modelCache {
 	cache := &modelCache{
 		models:        map[string]bool{},
@@ -1164,6 +1280,7 @@ func newModelCache(cfg Config) *modelCache {
 	return cache
 }
 
+// has reports whether a model is warm, checking disk-backed checkpoint state before the in-memory marker set.
 func (c *modelCache) has(name, version string) bool {
 	key := modelKey(name, version)
 	if c.cacheDir != "" {
@@ -1176,16 +1293,21 @@ func (c *modelCache) has(name, version string) bool {
 	return c.models[key]
 }
 
+// add marks a model as warm in the lightweight in-memory cache used when no checkpoint store is configured.
 func (c *modelCache) add(name, version string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.models[modelKey(name, version)] = true
 }
 
+// snapshotEntries returns the worker-advertised model cache state for registration and heartbeats.
+// Disk-backed entries are reported in LRU order before preconfigured warm markers.
 func (c *modelCache) snapshotEntries() []*logservepb.ModelCacheEntry {
 	c.mu.Lock()
 	keys := make([]string, 0, len(c.models))
 	seen := make(map[string]struct{}, len(c.models))
+
+	// Capture keys under the lock, then build protobuf messages after unlocking to keep cache lock hold time short.
 	for element := c.lru.Front(); element != nil; element = element.Next() {
 		entry := element.Value.(*cacheEntry)
 		if !c.models[entry.key] {
@@ -1210,6 +1332,8 @@ func (c *modelCache) snapshotEntries() []*logservepb.ModelCacheEntry {
 	return entries
 }
 
+// loadCheckpointManifests rebuilds the disk-backed cache index from manifest files on startup.
+// Invalid manifests or missing checkpoint files are ignored so a partial cache directory cannot prevent worker startup.
 func (c *modelCache) loadCheckpointManifests() {
 	manifestPaths, err := filepath.Glob(filepath.Join(c.cacheDir, "*.manifest.json"))
 	if err != nil {
@@ -1249,6 +1373,8 @@ func (c *modelCache) loadCheckpointManifests() {
 			lastAccess: lastAccess,
 		})
 	}
+
+	// Load oldest first because putEntryLocked pushes to the front, leaving the newest access at the LRU front.
 	sort.Slice(loaded, func(i, j int) bool {
 		return loaded[i].lastAccess < loaded[j].lastAccess
 	})
@@ -1259,28 +1385,34 @@ func (c *modelCache) loadCheckpointManifests() {
 	}
 }
 
+// usesCheckpointStore reports whether both source and destination directories are configured for checkpoint caching.
 func (c *modelCache) usesCheckpointStore() bool {
 	return c.sourceDir != "" && c.cacheDir != ""
 }
 
+// capacity returns the configured checkpoint cache byte limit under lock.
 func (c *modelCache) capacity() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.capacityBytes
 }
 
+// used returns current checkpoint cache usage under lock.
 func (c *modelCache) used() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.usedBytes
 }
 
+// ensureCheckpoint makes a model checkpoint available locally and returns load/cache metrics.
+// Concurrent cold loads for the same model share one loadCall, while different models can load in parallel.
 func (c *modelCache) ensureCheckpoint(ctx context.Context, name, version string) (checkpointLoadResult, error) {
 	if !c.usesCheckpointStore() {
 		return checkpointLoadResult{}, errors.New("checkpoint cache is not configured")
 	}
 	key := modelKey(name, version)
 	for {
+		// Re-check cache state before joining or creating a cold load; another goroutine may have just finished.
 		if entry, ok := c.cachedCheckpoint(name, version, time.Now()); ok {
 			loadMs, err := readCheckpointFunc(ctx, entry.path)
 			if err != nil {
@@ -1302,6 +1434,8 @@ func (c *modelCache) ensureCheckpoint(ctx context.Context, name, version string)
 				if call.err != nil {
 					return checkpointLoadResult{}, call.err
 				}
+				// Waiters re-check the cache instead of returning the producer's
+				// result so their metrics describe a hit on the now-local file.
 				continue
 			case <-ctx.Done():
 				return checkpointLoadResult{}, ctx.Err()
@@ -1314,6 +1448,8 @@ func (c *modelCache) ensureCheckpoint(ctx context.Context, name, version string)
 	}
 }
 
+// cachedCheckpoint returns a valid checkpoint entry, refreshing LRU and manifest access metadata.
+// It removes stale in-memory entries whose files disappeared and can discover an existing file by path.
 func (c *modelCache) cachedCheckpoint(name, version string, at time.Time) (cacheEntry, bool) {
 	key := modelKey(name, version)
 	lastAccess := at.UnixMilli()
@@ -1327,6 +1463,8 @@ func (c *modelCache) cachedCheckpoint(name, version string, at time.Time) (cache
 			c.lru.MoveToFront(element)
 			snapshot := *entry
 			c.mu.Unlock()
+
+			// Manifest I/O is intentionally outside the cache lock so heartbeats and other loads are not blocked by disk writes.
 			_ = writeCheckpointManifest(snapshot.path, name, version, snapshot.size, at)
 			return snapshot, true
 		}
@@ -1347,6 +1485,7 @@ func (c *modelCache) cachedCheckpoint(name, version string, at time.Time) (cache
 	return entry, true
 }
 
+// loadCallForKey implements per-model singleflight for checkpoint cold loads.
 func (c *modelCache) loadCallForKey(key string) (*loadCall, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1358,6 +1497,7 @@ func (c *modelCache) loadCallForKey(key string) (*loadCall, bool) {
 	return call, false
 }
 
+// finishLoadCall publishes the cold-load result and releases waiters if this call is still current for the key.
 func (c *modelCache) finishLoadCall(key string, call *loadCall, result checkpointLoadResult, err error) {
 	c.mu.Lock()
 	if current := c.inflight[key]; current == call {
@@ -1369,6 +1509,7 @@ func (c *modelCache) finishLoadCall(key string, call *loadCall, result checkpoin
 	c.mu.Unlock()
 }
 
+// loadCheckpoint copies a source checkpoint into the local cache, simulates model load by reading it, then inserts it into the LRU.
 func (c *modelCache) loadCheckpoint(ctx context.Context, key, name, version string) (checkpointLoadResult, error) {
 	sourcePath, err := c.sourcePath(name, version)
 	if err != nil {
@@ -1379,6 +1520,8 @@ func (c *modelCache) loadCheckpoint(ctx context.Context, key, name, version stri
 		return checkpointLoadResult{}, err
 	}
 	size := info.Size()
+
+	// Reject oversize checkpoints before copying because eviction can never make enough room for them.
 	if c.capacityBytes > 0 && size > c.capacityBytes {
 		return checkpointLoadResult{}, fmt.Errorf("checkpoint %s:%s size %d exceeds cache capacity %d", name, version, size, c.capacityBytes)
 	}
@@ -1418,6 +1561,8 @@ func (c *modelCache) loadCheckpoint(ctx context.Context, key, name, version stri
 	}, nil
 }
 
+// evictForLocked removes least-recently-used checkpoint files until the incoming entry fits.
+// The caller must hold c.mu.
 func (c *modelCache) evictForLocked(incomingBytes int64) (int64, error) {
 	if c.capacityBytes <= 0 {
 		return 0, nil
@@ -1438,6 +1583,8 @@ func (c *modelCache) evictForLocked(incomingBytes int64) (int64, error) {
 	return evictions, nil
 }
 
+// putEntryLocked inserts or updates a cache entry, preserving O(1) lookup and LRU promotion.
+// The caller must hold c.mu.
 func (c *modelCache) putEntryLocked(entry cacheEntry) {
 	if element, ok := c.entries[entry.key]; ok {
 		current := element.Value.(*cacheEntry)
@@ -1455,6 +1602,8 @@ func (c *modelCache) putEntryLocked(entry cacheEntry) {
 	c.models[entry.key] = true
 }
 
+// removeElementLocked deletes one LRU element and adjusts the accounting.
+// The caller must hold c.mu.
 func (c *modelCache) removeElementLocked(element *list.Element) {
 	entry := element.Value.(*cacheEntry)
 	delete(c.entries, entry.key)
@@ -1466,20 +1615,25 @@ func (c *modelCache) removeElementLocked(element *list.Element) {
 	}
 }
 
+// cacheUsage returns used and capacity bytes as a consistent pair.
 func (c *modelCache) cacheUsage() (int64, int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.usedBytes, c.capacityBytes
 }
 
+// checkpointPath returns the worker-local checkpoint path for a model/version pair.
 func (c *modelCache) checkpointPath(name, version string) string {
 	return filepath.Join(c.cacheDir, safeModelFileName(name, version)+".checkpoint")
 }
 
+// checkpointManifestPath returns the metadata sidecar path for a cached checkpoint file.
 func checkpointManifestPath(checkpointPath string) string {
 	return checkpointPath + ".manifest.json"
 }
 
+// writeCheckpointManifest rewrites checkpoint metadata through a temp file before replacing the manifest.
+// The replace step preserves a whole-file manifest across crashes and works around Windows rename semantics.
 func writeCheckpointManifest(checkpointPath, name, version string, size int64, lastAccess time.Time) error {
 	manifest := modelCacheManifest{
 		Name:           name,
@@ -1493,6 +1647,8 @@ func writeCheckpointManifest(checkpointPath, name, version string, size int64, l
 		return err
 	}
 	manifestPath := checkpointManifestPath(checkpointPath)
+
+	// The temp file keeps readers from observing a partially written JSON manifest.
 	tmpPath := manifestPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return err
@@ -1503,8 +1659,12 @@ func writeCheckpointManifest(checkpointPath, name, version string, size int64, l
 	}
 	return nil
 }
+
+// sourcePath resolves supported source checkpoint layouts for a model/version pair.
 func (c *modelCache) sourcePath(name, version string) (string, error) {
 	version = firstNonEmpty(version, "v1")
+
+	// Support both directory-based and flat-file layouts so tests and local demos can use simple fixtures.
 	candidates := []string{
 		filepath.Join(c.sourceDir, name+"-"+version, "checkpoint.bin"),
 		filepath.Join(c.sourceDir, name, version, "checkpoint.bin"),
@@ -1520,22 +1680,28 @@ func (c *modelCache) sourcePath(name, version string) (string, error) {
 	return "", fmt.Errorf("checkpoint source for %s:%s not found under %s", name, version, c.sourceDir)
 }
 
+// safeModelFileName converts a model/version pair into a filesystem-safe basename.
 func safeModelFileName(name, version string) string {
 	version = firstNonEmpty(version, "v1")
 	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", " ", "_")
 	return replacer.Replace(name) + "-" + replacer.Replace(version)
 }
 
+// copyCheckpointFunc and readCheckpointFunc are indirections used by tests to control checkpoint I/O timing.
 var (
 	copyCheckpointFunc = copyCheckpoint
 	readCheckpointFunc = readCheckpoint
 )
 
+// copyCheckpoint copies a checkpoint through a temporary file and returns elapsed fetch time in milliseconds.
+// It checks context cancellation between reads so shutdown or task timeout can abandon the copy cleanly.
 func copyCheckpoint(ctx context.Context, sourcePath, targetPath string) (int64, error) {
 	start := time.Now()
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 		return 0, err
 	}
+
+	// Copy into a sibling temp file so a failed or cancelled fetch never replaces a valid checkpoint.
 	tmpPath := targetPath + ".tmp"
 	source, err := os.Open(sourcePath)
 	if err != nil {
@@ -1583,6 +1749,7 @@ func copyCheckpoint(ctx context.Context, sourcePath, targetPath string) (int64, 
 	return positiveElapsedMs(start), nil
 }
 
+// readCheckpoint reads the entire checkpoint file to model the cost of loading it into memory.
 func readCheckpoint(ctx context.Context, path string) (int64, error) {
 	start := time.Now()
 	file, err := os.Open(path)
@@ -1607,6 +1774,7 @@ func readCheckpoint(ctx context.Context, path string) (int64, error) {
 	}
 }
 
+// positiveElapsedMs rounds sub-millisecond timings up to one millisecond for user-visible metrics.
 func positiveElapsedMs(start time.Time) int64 {
 	elapsed := time.Since(start).Milliseconds()
 	if elapsed == 0 {
@@ -1615,6 +1783,7 @@ func positiveElapsedMs(start time.Time) int64 {
 	return elapsed
 }
 
+// modelKey returns the stable cache key for a model/version pair, defaulting an empty version to v1.
 func modelKey(name, version string) string {
 	if version == "" {
 		version = "v1"
@@ -1622,6 +1791,7 @@ func modelKey(name, version string) string {
 	return name + ":" + version
 }
 
+// splitModelKey parses cache keys and legacy configured model strings, defaulting the version to v1.
 func splitModelKey(value string) (string, string) {
 	parts := strings.SplitN(strings.TrimSpace(value), ":", 2)
 	if len(parts) == 0 || parts[0] == "" {
@@ -1633,6 +1803,7 @@ func splitModelKey(value string) (string, string) {
 	return parts[0], parts[1]
 }
 
+// firstNonEmpty returns the first non-empty value in order, or an empty string when all values are empty.
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {
@@ -1642,6 +1813,8 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// promptFromArgs extracts an LLM prompt from the submitted args envelope.
+// It accepts either args[0] or kwargs.prompt and preserves non-string JSON as raw text when needed.
 func promptFromArgs(data []byte) (string, error) {
 	var payload llmArgsPayload
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -1664,6 +1837,8 @@ func promptFromArgs(data []byte) (string, error) {
 	return "", errors.New("llm prompt is required")
 }
 
+// appendLLMEvent writes one model lifecycle event to the task-scoped LLM log stream.
+// The idempotency key is deterministic per task and event type so retries do not duplicate lifecycle events.
 func appendLLMEvent(ctx context.Context, logClient logservepb.LogServiceClient, task *logservepb.TaskSpec, workerID, eventType string, payload llmEventPayload) error {
 	now := time.Now().UnixMilli()
 	payload.TaskID = task.GetTaskId()
@@ -1684,6 +1859,7 @@ func appendLLMEvent(ctx context.Context, logClient logservepb.LogServiceClient, 
 	return err
 }
 
+// sleepContext waits for the mock latency duration while still honoring task cancellation.
 func sleepContext(ctx context.Context, duration time.Duration) error {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
@@ -1695,11 +1871,14 @@ func sleepContext(ctx context.Context, duration time.Duration) error {
 	}
 }
 
+// callVLLM sends an OpenAI-compatible chat completion request to the configured vLLM endpoint.
 func callVLLM(ctx context.Context, cfg Config, modelName, version, prompt string, maxTokens uint32) (string, error) {
 	if cfg.VLLMBaseURL == "" {
 		return "", errors.New("LOGSERVE_VLLM_BASE_URL is required for vllm adapter")
 	}
 	model := modelName
+
+	// Non-default versions are encoded into the model name because the vLLM API accepts a single model field.
 	if version != "" && version != "v1" {
 		model = modelName + ":" + version
 	}
@@ -1739,6 +1918,8 @@ func callVLLM(ctx context.Context, cfg Config, modelName, version, prompt string
 	if len(decoded.Choices) == 0 {
 		return "", errors.New("vllm response has no choices")
 	}
+	// Prefer chat-completions content, but accept text for OpenAI-compatible
+	// servers that still return completion-style choices.
 	if decoded.Choices[0].Message.Content != "" {
 		return decoded.Choices[0].Message.Content, nil
 	}

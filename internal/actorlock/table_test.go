@@ -1,5 +1,6 @@
 package actorlock
 
+// This file tests actor lock table eviction and actor-ID-level serialization.
 import (
 	"fmt"
 	"runtime"
@@ -8,6 +9,8 @@ import (
 	"testing"
 )
 
+// TestTableEvictsIdleActorLock verifies a lock entry is removed after its only
+// holder unlocks.
 func TestTableEvictsIdleActorLock(t *testing.T) {
 	table := NewTable()
 	unlock := table.Lock("actor-1")
@@ -20,6 +23,8 @@ func TestTableEvictsIdleActorLock(t *testing.T) {
 	}
 }
 
+// TestTableRetainsLockWhileHeld verifies Len reports a tracked actor while the
+// actor lock is still held.
 func TestTableRetainsLockWhileHeld(t *testing.T) {
 	table := NewTable()
 	unlock := table.Lock("actor-1")
@@ -29,6 +34,8 @@ func TestTableRetainsLockWhileHeld(t *testing.T) {
 	}
 }
 
+// TestTableConcurrentActorsIndependent verifies different actor IDs can acquire
+// and release locks independently without leaking entries.
 func TestTableConcurrentActorsIndependent(t *testing.T) {
 	table := NewTable()
 	var wg sync.WaitGroup
@@ -47,6 +54,8 @@ func TestTableConcurrentActorsIndependent(t *testing.T) {
 	}
 }
 
+// TestTableSerializesConcurrentSameActor stresses contention on one actor ID and
+// verifies only one goroutine enters that critical section at a time.
 func TestTableSerializesConcurrentSameActor(t *testing.T) {
 	table := NewTable()
 	const goroutines = 64
@@ -67,6 +76,9 @@ func TestTableSerializesConcurrentSameActor(t *testing.T) {
 				if entered := inCritical.Add(1); entered != 1 {
 					violations.Add(1)
 				}
+
+				// Yield inside the critical section to make accidental concurrent entry more
+				// likely to surface during the stress loop.
 				runtime.Gosched()
 				inCritical.Add(-1)
 				unlock()

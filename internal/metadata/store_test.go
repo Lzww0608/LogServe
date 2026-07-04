@@ -1,5 +1,8 @@
 package metadata
 
+// This file contains interface and compatibility tests that keep metadata Store
+// implementations aligned on core behavior.
+
 import (
 	"strings"
 	"testing"
@@ -8,6 +11,8 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// TestMemoryStoreImplementsStore verifies the default store satisfies Store and
+// preserves task idempotency semantics.
 func TestMemoryStoreImplementsStore(t *testing.T) {
 	var store Store = NewMemoryStore()
 
@@ -28,10 +33,14 @@ func TestMemoryStoreImplementsStore(t *testing.T) {
 	}
 }
 
+// TestPostgresStoreImplementsStore keeps the durable wrapper bound to the Store
+// interface at compile time.
 func TestPostgresStoreImplementsStore(t *testing.T) {
 	var _ Store = (*PostgresStore)(nil)
 }
 
+// TestUpsertWorkerPreservesExplicitHeartbeat protects the bootstrap path where
+// restored worker timestamps must not be overwritten by insertion time.
 func TestUpsertWorkerPreservesExplicitHeartbeat(t *testing.T) {
 	store := NewMemoryStore()
 	oldHeartbeat := time.Now().Add(-10 * time.Minute).UnixMilli()
@@ -55,6 +64,8 @@ func TestUpsertWorkerPreservesExplicitHeartbeat(t *testing.T) {
 	}
 }
 
+// TestCompleteTaskRejectsQueuedExpiredLease verifies a worker cannot complete a
+// task after lease recovery moved it back to QUEUED.
 func TestCompleteTaskRejectsQueuedExpiredLease(t *testing.T) {
 	store := NewMemoryStore()
 	created, duplicate := store.CreateTask(Task{

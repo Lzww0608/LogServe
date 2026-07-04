@@ -15,6 +15,8 @@ import (
 	"google.golang.org/grpc"
 )
 
+// countingReplayableLogClient wraps replayableLogClient and records read volume for
+// checkpoint tail-replay assertions.
 type countingReplayableLogClient struct {
 	*replayableLogClient
 	mu          sync.Mutex
@@ -22,6 +24,7 @@ type countingReplayableLogClient struct {
 	recordsRead int
 }
 
+// newCountingReplayableLogClient constructs a replayable log with read counters.
 func newCountingReplayableLogClient() *countingReplayableLogClient {
 	return &countingReplayableLogClient{
 		replayableLogClient: newReplayableLogClient(),
@@ -29,6 +32,7 @@ func newCountingReplayableLogClient() *countingReplayableLogClient {
 	}
 }
 
+// ReadLog delegates to replayableLogClient while counting calls and returned records.
 func (c *countingReplayableLogClient) ReadLog(ctx context.Context, req *logservepb.ReadLogRequest, opts ...grpc.CallOption) (*logservepb.ReadLogResponse, error) {
 	c.mu.Lock()
 	c.readCalls[fmt.Sprintf("%s:%d", req.GetStreamId(), req.GetFromSeq())]++
@@ -42,12 +46,14 @@ func (c *countingReplayableLogClient) ReadLog(ctx context.Context, req *logserve
 	return resp, err
 }
 
+// readCount reports how often a stream was read from a specific sequence.
 func (c *countingReplayableLogClient) readCount(streamID string, fromSeq uint64) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.readCalls[fmt.Sprintf("%s:%d", streamID, fromSeq)]
 }
 
+// resetReadCounts clears read metrics between checkpoint setup and measured bootstrap.
 func (c *countingReplayableLogClient) resetReadCounts() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -55,6 +61,7 @@ func (c *countingReplayableLogClient) resetReadCounts() {
 	c.recordsRead = 0
 }
 
+// totalReadCalls sums all recorded read calls.
 func (c *countingReplayableLogClient) totalReadCalls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -65,12 +72,14 @@ func (c *countingReplayableLogClient) totalReadCalls() int {
 	return total
 }
 
+// totalRecordsRead returns the total number of records returned by ReadLog.
 func (c *countingReplayableLogClient) totalRecordsRead() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.recordsRead
 }
 
+// readCountForStreamsFromSeq totals read calls for checkpointed streams at one start sequence.
 func (c *countingReplayableLogClient) readCountForStreamsFromSeq(streams map[string]MetadataCheckpointStream, fromSeq uint64) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -81,6 +90,8 @@ func (c *countingReplayableLogClient) readCountForStreamsFromSeq(streams map[str
 	return total
 }
 
+// TestBootstrapLLMStatsUsesCheckpointAndOnlyReadsTail verifies LLM stats restore
+// from checkpoint plus tail without replaying the checkpointed prefix.
 func TestBootstrapLLMStatsUsesCheckpointAndOnlyReadsTail(t *testing.T) {
 	ctx := context.Background()
 	logClient := newCountingReplayableLogClient()
@@ -134,6 +145,8 @@ func TestBootstrapLLMStatsUsesCheckpointAndOnlyReadsTail(t *testing.T) {
 	}
 }
 
+// TestMetadataCheckpointConsistencyUsesCheckpointTailOrderForLLMStats ensures tail
+// replay preserves order-sensitive EWMA statistics.
 func TestMetadataCheckpointConsistencyUsesCheckpointTailOrderForLLMStats(t *testing.T) {
 	ctx := context.Background()
 	logClient := newCountingReplayableLogClient()
@@ -185,6 +198,8 @@ func TestMetadataCheckpointConsistencyUsesCheckpointTailOrderForLLMStats(t *test
 	}
 }
 
+// TestBootstrapFromMetadataCheckpointRestoresTaskTerminalTail verifies task
+// completion records written after a checkpoint are applied during fast bootstrap.
 func TestBootstrapFromMetadataCheckpointRestoresTaskTerminalTail(t *testing.T) {
 	ctx := context.Background()
 	logClient := newCountingReplayableLogClient()
@@ -239,6 +254,8 @@ func TestBootstrapFromMetadataCheckpointRestoresTaskTerminalTail(t *testing.T) {
 	}
 }
 
+// TestBootstrapFallsBackToFullReplayWhenCheckpointPayloadIsCorrupt protects the
+// correctness fallback when the latest checkpoint cannot be decoded.
 func TestBootstrapFallsBackToFullReplayWhenCheckpointPayloadIsCorrupt(t *testing.T) {
 	ctx := context.Background()
 	logClient := newCountingReplayableLogClient()
@@ -271,6 +288,9 @@ func TestBootstrapFallsBackToFullReplayWhenCheckpointPayloadIsCorrupt(t *testing
 		t.Fatal("task was not restored by full replay after corrupt checkpoint")
 	}
 }
+
+// TestMetadataCheckpointLoopCreatesRetainedCheckpoints verifies periodic checkpoints
+// are created and retention trimming keeps only the requested count.
 func TestMetadataCheckpointLoopCreatesRetainedCheckpoints(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -297,6 +317,9 @@ func TestMetadataCheckpointLoopCreatesRetainedCheckpoints(t *testing.T) {
 	}
 	t.Fatalf("checkpoint loop retained %d records, want 2", len(resp.GetRecords()))
 }
+
+// TestCreateMetadataCheckpointAppliesRetention verifies synchronous checkpoint
+// creation trims older checkpoint records.
 func TestCreateMetadataCheckpointAppliesRetention(t *testing.T) {
 	ctx := context.Background()
 	logClient := newCountingReplayableLogClient()
@@ -319,6 +342,8 @@ func TestCreateMetadataCheckpointAppliesRetention(t *testing.T) {
 	}
 }
 
+// TestMetadataCheckpointConsistencyComparesCheckpointTailWithFullReplay checks the
+// consistency verifier against a task completion written after checkpointing.
 func TestMetadataCheckpointConsistencyComparesCheckpointTailWithFullReplay(t *testing.T) {
 	ctx := context.Background()
 	logClient := newCountingReplayableLogClient()
@@ -363,6 +388,8 @@ func TestMetadataCheckpointConsistencyComparesCheckpointTailWithFullReplay(t *te
 		t.Fatalf("consistency check did not inspect checkpoint state: %+v", check)
 	}
 }
+
+// appendLLMCompleted appends one synthetic LLMCompleted event to an LLM stream.
 func appendLLMCompleted(t *testing.T, logClient *countingReplayableLogClient, taskID string, payload llmEventPayload) {
 	t.Helper()
 	data, err := json.Marshal(payload)
@@ -379,6 +406,8 @@ func appendLLMCompleted(t *testing.T, logClient *countingReplayableLogClient, ta
 	}
 }
 
+// TestBootstrapFromMetadataCheckpointRestoresWorkflowAndActorTail verifies workflow
+// and actor tail events are applied without rereading checkpointed prefixes.
 func TestBootstrapFromMetadataCheckpointRestoresWorkflowAndActorTail(t *testing.T) {
 	ctx := context.Background()
 	logClient := newCountingReplayableLogClient()
@@ -481,6 +510,7 @@ func TestBootstrapFromMetadataCheckpointRestoresWorkflowAndActorTail(t *testing.
 	}
 }
 
+// appendWorkflowEvent appends one synthetic workflow event for checkpoint tests.
 func appendWorkflowEvent(t *testing.T, logClient *countingReplayableLogClient, workflowID, eventType string, payload workflowpkg.EventPayload) {
 	t.Helper()
 	data, err := json.Marshal(payload)
@@ -497,6 +527,7 @@ func appendWorkflowEvent(t *testing.T, logClient *countingReplayableLogClient, w
 	}
 }
 
+// appendActorEvent appends one synthetic actor event for checkpoint tests.
 func appendActorEvent(t *testing.T, logClient *countingReplayableLogClient, actorID, eventType string, payload actorpkg.EventPayload) {
 	t.Helper()
 	data, err := json.Marshal(payload)

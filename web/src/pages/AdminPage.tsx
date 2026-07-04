@@ -1,3 +1,5 @@
+// Admin route for scheduler/backpressure config with guarded form sync.
+
 import { useEffect, useState, type FormEvent } from "react";
 import { api } from "../api/client";
 import { DetailGrid } from "../components/DetailGrid";
@@ -14,6 +16,7 @@ type BackpressureForm = {
   logAppendSlowMs: string;
 };
 
+// Render scheduler and backpressure admin controls with polling-backed state.
 export function AdminPage({ session }: { session?: ConsoleSession | null }) {
   const [config, setConfig] = useState<AdminConfig | null>(null);
   const [form, setForm] = useState<BackpressureForm>(emptyBackpressureForm());
@@ -25,12 +28,14 @@ export function AdminPage({ session }: { session?: ConsoleSession | null }) {
 
   useEffect(() => {
     let cancelled = false;
+    // Refresh admin config while avoiding form edits after the initial sync.
     const load = async (syncForm: boolean) => {
       try {
         const next = await api.adminConfig();
         if (cancelled) return;
         setConfig(next);
         setError("");
+        // Only the first load syncs inputs; later polling should not overwrite local edits.
         if (syncForm) setForm(backpressureFormFromConfig(next));
       } catch (loadError) {
         if (!cancelled) setError(errorMessage(loadError));
@@ -46,11 +51,13 @@ export function AdminPage({ session }: { session?: ConsoleSession | null }) {
     };
   }, []);
 
+  // Update one backpressure field and clear stale save feedback.
   const updateForm = (field: keyof BackpressureForm, value: string) => {
     setForm((current) => ({ ...current, [field]: value }));
     setMessage("");
   };
 
+  // Persist scheduler and backpressure changes without clobbering edited fields.
   const save = async (event: FormEvent) => {
     event.preventDefault();
     setMessage("");
@@ -132,10 +139,12 @@ export function AdminPage({ session }: { session?: ConsoleSession | null }) {
   );
 }
 
+// Create the blank admin form used before config is loaded.
 function emptyBackpressureForm(): BackpressureForm {
   return { queueHighWatermark: "", redeliveryTimeoutMs: "", logAppendSlowMs: "" };
 }
 
+// Convert backend numeric config into editable text inputs.
 function backpressureFormFromConfig(config: AdminConfig): BackpressureForm {
   return {
     queueHighWatermark: String(config.queue_high_watermark || ""),
@@ -144,6 +153,7 @@ function backpressureFormFromConfig(config: AdminConfig): BackpressureForm {
   };
 }
 
+// Parse admin numeric inputs while rejecting unsafe or non-positive values.
 function parsePositiveInteger(value: string) {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined;

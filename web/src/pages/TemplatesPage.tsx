@@ -1,3 +1,5 @@
+// Template library route for listing and running built-in scenarios.
+
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { ErrorPanel, InlineError, Loading } from "../components/ErrorPanel";
@@ -8,6 +10,7 @@ import { defaultID } from "../utils/format";
 import { roleAtLeast } from "../utils/roles";
 import { errorMessage } from "../utils/status";
 
+// Render built-in templates and enforce role-aware run actions.
 export function TemplatesPage({ session }: { session?: ConsoleSession | null }) {
   const [templates, setTemplates] = useState<TemplateInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -19,6 +22,7 @@ export function TemplatesPage({ session }: { session?: ConsoleSession | null }) 
 
   useEffect(() => {
     let cancelled = false;
+    // Load template metadata once per mount and ignore late responses after unmount.
     const load = async () => {
       try {
         const payload = await api.templates();
@@ -37,6 +41,7 @@ export function TemplatesPage({ session }: { session?: ConsoleSession | null }) 
     };
   }, []);
 
+  // Run the selected built-in template and report role-denial or execution errors.
   const run = async (template: TemplateInfo) => {
     if (!roleAtLeast(session, template.required_role)) {
       const required = template.required_role.charAt(0).toUpperCase() + template.required_role.slice(1);

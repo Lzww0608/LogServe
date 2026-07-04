@@ -1,3 +1,5 @@
+// Role-filtered navigation sidebar for the single-page console.
+
 import type { ReactNode } from "react";
 import type { ConsoleRole, ConsoleSession } from "../types/logserve";
 import { roleAtLeast } from "../utils/roles";
@@ -18,6 +20,7 @@ const navItems: Array<{ href: string; label: string; minRole?: ConsoleRole }> = 
   { href: "/settings", label: "Settings" }
 ];
 
+// Render only the navigation entries allowed by the current session role.
 export function Sidebar({ path, session }: { path: string; session?: ConsoleSession | null }) {
   return (
     <aside className="sidebar">
@@ -31,6 +34,7 @@ export function Sidebar({ path, session }: { path: string; session?: ConsoleSess
   );
 }
 
+// Mark a route link active while keeping /workflows/new distinct from workflow details.
 function NavLink({ path, current, children }: { path: string; current: string; children: ReactNode }) {
   const exact = path === "/" || path === "/workflows/new";
   const excludedChild = path === "/workflows" && current === "/workflows/new";

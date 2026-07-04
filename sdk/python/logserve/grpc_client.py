@@ -1,3 +1,4 @@
+# Direct Python gRPC transport for the LogServe control-plane API.
 import json
 import os
 import time
@@ -7,14 +8,18 @@ import grpc
 from ._generated import control_pb2 as pb
 
 
+# GrpcControlTransport adapts SDK transport commands onto ControlService RPCs.
 class GrpcControlTransport:
+    # Create or reuse a plaintext gRPC channel and optional bearer metadata.
     def __init__(self, address="127.0.0.1:50052", *, channel=None, poll_interval_s=0.1, api_token=None):
         self.address = address
+        # The Go servers use application-level bearer auth; transport TLS is not configured here.
         self.channel = channel or grpc.insecure_channel(address)
         self.poll_interval_s = poll_interval_s
         token = api_token if api_token is not None else os.environ.get("LOGSERVE_API_TOKEN", "")
         self._metadata = _auth_metadata(token)
         self._rpc = _ControlRpc(self.channel, self._metadata)
+    # Dispatch the same command names used by CLIControlTransport to RPC helpers.
     def run(self, command, payload=None, timeout=None):
         payload = payload or {}
         if command == "submit":
@@ -49,6 +54,7 @@ class GrpcControlTransport:
             return self._dashboard_snapshot(timeout=timeout)
         raise ValueError(f"unsupported control command {command!r}")
 
+    # Submit a task request and wait until the task reaches a terminal state.
     def _submit_task(self, payload, timeout=None):
         args_json = _json_bytes({"args": payload.get("args", []), "kwargs": payload.get("kwargs", {})})
         resp = self._rpc.SubmitTask(
@@ -65,10 +71,12 @@ class GrpcControlTransport:
         )
         return self._wait_task(resp.task_id, timeout=timeout)
 
+    # Fetch and normalize one task status response.
     def _task_status(self, task_id, timeout=None):
         resp = self._rpc.GetTaskStatus(pb.GetTaskStatusRequest(task_id=task_id), timeout=timeout)
         return _task_status_dict(resp)
 
+    # Submit a workflow definition and wait until the workflow reaches a terminal state.
     def _submit_workflow(self, payload, timeout=None):
         resp = self._rpc.SubmitWorkflow(
             pb.SubmitWorkflowRequest(
@@ -80,16 +88,19 @@ class GrpcControlTransport:
         )
         return self._wait_workflow(resp.workflow_id, timeout=timeout)
 
+    # Fetch and normalize one workflow status response.
     def _workflow_status(self, workflow_id, timeout=None):
         resp = self._rpc.GetWorkflowStatus(pb.GetWorkflowStatusRequest(workflow_id=workflow_id), timeout=timeout)
         return _workflow_status_dict(resp)
 
+    # Replay workflow state and include the metadata consistency flag.
     def _workflow_replay(self, workflow_id, timeout=None):
         resp = self._rpc.ReplayWorkflow(pb.ReplayWorkflowRequest(workflow_id=workflow_id), timeout=timeout)
         out = _workflow_status_dict(resp.replayed)
         out["consistent_with_metadata"] = resp.consistent_with_metadata
         return out
 
+    # Convert SDK model payloads into ModelInfo and return normalized metadata.
     def _register_model(self, payload, timeout=None):
         resp = self._rpc.RegisterModel(
             pb.RegisterModelRequest(
@@ -105,6 +116,7 @@ class GrpcControlTransport:
         )
         return _model_dict(resp.model)
 
+    # Parse a user policy string and return the accepted scheduling policy name.
     def _set_scheduling_policy(self, payload, timeout=None):
         resp = self._rpc.SetSchedulingPolicy(
             pb.SetSchedulingPolicyRequest(policy=_parse_scheduling_policy(payload.get("policy", ""))),
@@ -112,6 +124,7 @@ class GrpcControlTransport:
         )
         return {"policy": _scheduling_policy_name(resp.policy)}
 
+    # Submit an LLM request as a task and wait for terminal task status.
     def _submit_llm(self, payload, timeout=None):
         resp = self._rpc.SubmitLLM(
             pb.SubmitLLMRequest(
@@ -126,6 +139,7 @@ class GrpcControlTransport:
         )
         return self._wait_task(resp.task_id, timeout=timeout)
 
+    # Replay LLM execution and cache metrics for one task.
     def _llm_replay(self, task_id, timeout=None):
         resp = self._rpc.ReplayLLM(pb.ReplayLLMRequest(task_id=task_id), timeout=timeout)
         return {
@@ -144,6 +158,7 @@ class GrpcControlTransport:
             "events": [_llm_event_dict(event) for event in resp.events],
         }
 
+    # Create an actor and normalize ownership and epoch metadata.
     def _create_actor(self, payload, timeout=None):
         resp = self._rpc.CreateActor(
             pb.CreateActorRequest(
@@ -164,6 +179,7 @@ class GrpcControlTransport:
             "epoch": resp.epoch,
         }
 
+    # Submit an actor command and normalize the task-like response.
     def _call_actor(self, payload, timeout=None):
         resp = self._rpc.CallActor(
             pb.CallActorRequest(
@@ -184,10 +200,12 @@ class GrpcControlTransport:
             "epoch": resp.epoch,
         }
 
+    # Fetch and normalize one actor status response.
     def _actor_status(self, actor_id, timeout=None):
         resp = self._rpc.GetActorStatus(pb.GetActorStatusRequest(actor_id=actor_id), timeout=timeout)
         return _actor_status_dict(resp)
 
+    # Replay actor state and expose both full and snapshot replay counters.
     def _actor_replay(self, actor_id, timeout=None):
         resp = self._rpc.ReplayActor(pb.ReplayActorRequest(actor_id=actor_id), timeout=timeout)
         out = _actor_status_dict(resp.replayed)
@@ -196,6 +214,7 @@ class GrpcControlTransport:
         out["snapshot_replay_commands"] = resp.snapshot_replay_commands
         return out
 
+    # Update scheduling pressure thresholds through the control plane.
     def _set_backpressure(self, payload, timeout=None):
         resp = self._rpc.SetBackpressure(
             pb.SetBackpressureRequest(
@@ -211,6 +230,7 @@ class GrpcControlTransport:
             "log_append_slow_ms": resp.log_append_slow_ms,
         }
 
+    # Dashboard normalization intentionally exposes only fields consumed by SDK callers.
     def _dashboard_snapshot(self, timeout=None):
         resp = self._rpc.GetDashboardSnapshot(pb.GetDashboardSnapshotRequest(), timeout=timeout)
         return {
@@ -224,9 +244,11 @@ class GrpcControlTransport:
             "compactable_log_bytes": getattr(resp, "compactable_log_bytes", 0),
         }
 
+    # Poll task status until success, failure, or the caller-provided timeout.
     def _wait_task(self, task_id, timeout=None):
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
+            # Reuse the same RPC timeout value per poll; the outer deadline caps total wait time.
             status = self._task_status(task_id, timeout=timeout)
             if status["status"] in ("SUCCEEDED", "FAILED"):
                 return status
@@ -234,9 +256,11 @@ class GrpcControlTransport:
                 raise TimeoutError(f"task {task_id} did not finish before timeout")
             time.sleep(self.poll_interval_s)
 
+    # Poll workflow status until completion, failure, or the caller-provided timeout.
     def _wait_workflow(self, workflow_id, timeout=None):
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
+            # Reuse the same RPC timeout value per poll; the outer deadline caps total wait time.
             status = self._workflow_status(workflow_id, timeout=timeout)
             if status["status"] in ("COMPLETED", "FAILED"):
                 return status
@@ -245,7 +269,9 @@ class GrpcControlTransport:
             time.sleep(self.poll_interval_s)
 
 
+# _ControlRpc builds low-level unary callables without generated grpc stubs.
 class _ControlRpc:
+    # Bind each ControlService RPC path to a serializer/deserializer pair.
     def __init__(self, channel, metadata=None):
         self.SubmitTask = _unary(channel, metadata, "SubmitTask", pb.SubmitTaskRequest, pb.SubmitTaskResponse)
         self.GetTaskStatus = _unary(channel, metadata, "GetTaskStatus", pb.GetTaskStatusRequest, pb.GetTaskStatusResponse)
@@ -272,12 +298,14 @@ class _ControlRpc:
         self.ReplayActor = _unary(channel, metadata, "ReplayActor", pb.ReplayActorRequest, pb.ReplayActorResponse)
 
 
+# Build outgoing bearer-token metadata when LOGSERVE_API_TOKEN is configured.
 def _auth_metadata(api_token):
     if not api_token:
         return None
     return (("authorization", f"Bearer {api_token}"),)
 
 
+# Build one unary-unary callable for a ControlService method path.
 def _unary(channel, default_metadata, method, request_cls, response_cls):
     call = channel.unary_unary(
         f"/logserve.v1.ControlService/{method}",
@@ -285,6 +313,7 @@ def _unary(channel, default_metadata, method, request_cls, response_cls):
         response_deserializer=response_cls.FromString,
     )
 
+    # Merge default auth metadata with per-call metadata before invoking gRPC.
     def invoke(request, *, timeout=None, metadata=None):
         merged_metadata = default_metadata
         if metadata:
@@ -293,16 +322,19 @@ def _unary(channel, default_metadata, method, request_cls, response_cls):
 
     return invoke
 
+# Encode compact UTF-8 JSON bytes expected by protobuf request fields.
 def _json_bytes(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+# Decode optional protobuf JSON bytes into Python values.
 def _decode_json(data):
     if not data:
         return None
     return json.loads(data.decode("utf-8"))
 
 
+# Convert TaskStatus protobuf responses into stable SDK dictionaries.
 def _task_status_dict(resp):
     return {
         "task_id": resp.task_id,
@@ -315,6 +347,7 @@ def _task_status_dict(resp):
     }
 
 
+# Convert workflow status protobuf responses into stable SDK dictionaries.
 def _workflow_status_dict(resp):
     return {
         "workflow_id": resp.workflow_id,
@@ -331,6 +364,7 @@ def _workflow_status_dict(resp):
     }
 
 
+# Convert one workflow step protobuf message into an SDK dictionary.
 def _workflow_step_dict(step):
     return {
         "step_id": step.step_id,
@@ -347,6 +381,7 @@ def _workflow_step_dict(step):
     }
 
 
+# Convert actor status protobuf responses into stable SDK dictionaries.
 def _actor_status_dict(resp):
     return {
         "actor_id": resp.actor_id,
@@ -363,6 +398,7 @@ def _actor_status_dict(resp):
     }
 
 
+# Convert one LLM event protobuf message into an SDK dictionary.
 def _llm_event_dict(event):
     return {
         "event_type": event.event_type,
@@ -382,6 +418,7 @@ def _llm_event_dict(event):
     }
 
 
+# Convert ModelInfo protobuf messages into SDK dictionaries.
 def _model_dict(model):
     return {
         "name": model.name,
@@ -392,6 +429,7 @@ def _model_dict(model):
     }
 
 
+# Map task status enum values to stable CLI-compatible strings.
 def _task_status_name(status):
     return {
         pb.TASK_STATUS_QUEUED: "QUEUED",
@@ -401,6 +439,7 @@ def _task_status_name(status):
     }.get(status, "UNSPECIFIED")
 
 
+# Map workflow status enum values to stable CLI-compatible strings.
 def _workflow_status_name(status):
     return {
         pb.WORKFLOW_STATUS_RUNNING: "RUNNING",
@@ -409,6 +448,7 @@ def _workflow_status_name(status):
     }.get(status, "UNSPECIFIED")
 
 
+# Map workflow step status enum values to stable CLI-compatible strings.
 def _workflow_step_status_name(status):
     return {
         pb.WORKFLOW_STEP_STATUS_SCHEDULED: "SCHEDULED",
@@ -418,6 +458,7 @@ def _workflow_step_status_name(status):
     }.get(status, "UNSPECIFIED")
 
 
+# Map actor status enum values to stable CLI-compatible strings.
 def _actor_status_name(status):
     return {
         pb.ACTOR_STATUS_ACTIVE: "ACTIVE",
@@ -425,6 +466,7 @@ def _actor_status_name(status):
     }.get(status, "UNSPECIFIED")
 
 
+# Parse user-facing scheduling policy aliases into protobuf enum values.
 def _parse_scheduling_policy(value):
     normalized = (value or "").replace("-", "_").upper()
     if normalized in ("", "LOCALITY_AWARE"):
@@ -436,6 +478,7 @@ def _parse_scheduling_policy(value):
     raise ValueError(f"unknown scheduling policy {value!r}")
 
 
+# Map scheduling policy enum values to stable CLI-compatible strings.
 def _scheduling_policy_name(policy):
     return {
         pb.SCHEDULING_POLICY_RESOURCE_ONLY: "RESOURCE_ONLY",

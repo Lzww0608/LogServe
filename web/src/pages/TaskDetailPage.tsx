@@ -1,3 +1,5 @@
+// Task detail route for live status, result inspection, and standalone actions.
+
 import { useCallback, useEffect, useState } from "react";
 import { api, type TaskOperation } from "../api/client";
 import { parseEventData, type SSEMessage } from "../api/events";
@@ -15,6 +17,7 @@ import { errorMessage } from "../utils/status";
 import { taskActionState } from "../utils/taskActions";
 import { roleAtLeast } from "../utils/roles";
 
+// Render task details, live SSE updates, and standalone task operations.
 export function TaskDetailPage({ taskID, session }: { taskID: string; session?: ConsoleSession | null }) {
   const [task, setTask] = useState<Task>();
   const [error, setError] = useState("");
@@ -26,6 +29,7 @@ export function TaskDetailPage({ taskID, session }: { taskID: string; session?: 
     setActionError("");
     setBusyAction("");
   }, [taskID]);
+  // Apply task SSE deltas to the current task detail state.
   const handleMessage = useCallback((message: SSEMessage) => {
     if (message.event !== "task") return;
     const payload = parseEventData<{ task: Task }>(message);
@@ -34,6 +38,7 @@ export function TaskDetailPage({ taskID, session }: { taskID: string; session?: 
   }, []);
   useEventStream({ taskID, intervalMs: 1000 }, { onMessage: handleMessage, onError: setError }, [taskID]);
 
+  // Run a task operation after role and state checks, then merge the returned task.
   const runAction = async (action: TaskOperation) => {
     if (!task) return;
     const requiredRole = action === "cancel" ? "admin" : "operator";
@@ -91,6 +96,7 @@ export function TaskDetailPage({ taskID, session }: { taskID: string; session?: 
   );
 }
 
+// Render task status plus the available task operation buttons.
 function TaskActions({ task, busyAction, session, onRun }: { task: Task; busyAction: TaskOperation | ""; session?: ConsoleSession | null; onRun: (action: TaskOperation) => void }) {
   return (
     <div className="task-header-actions">
@@ -104,6 +110,7 @@ function TaskActions({ task, busyAction, session, onRun }: { task: Task; busyAct
   );
 }
 
+// Render one task operation button with role and state disabled reasons.
 function TaskActionButton({ task, action, busyAction, session, onRun }: { task: Task; action: TaskOperation; busyAction: TaskOperation | ""; session?: ConsoleSession | null; onRun: (action: TaskOperation) => void }) {
   const state = taskActionState(task, action);
   const busy = busyAction === action;
@@ -125,6 +132,7 @@ function TaskActionButton({ task, action, busyAction, session, onRun }: { task: 
   );
 }
 
+// Map task operation ids to button labels.
 function taskActionLabel(action: TaskOperation): string {
   switch (action) {
     case "retry":

@@ -1,3 +1,5 @@
+// Reusable presentational component for the LogServe console UI.
+
 import { useMemo, useState } from "react";
 import type { Workflow } from "../types/logserve";
 import { formatTime } from "../utils/format";
@@ -22,6 +24,7 @@ const xGap = 84;
 const yGap = 34;
 const margin = 36;
 
+// Render an inspectable workflow DAG with selectable nodes and a detail drawer.
 export function Dag({ steps }: { steps: NonNullable<Workflow["steps"]> }) {
   const [selectedID, setSelectedID] = useState(steps[0]?.step_id ?? "");
   const layout = useMemo(() => buildLayout(steps), [steps]);
@@ -82,6 +85,7 @@ export function Dag({ steps }: { steps: NonNullable<Workflow["steps"]> }) {
   );
 }
 
+// Render the selected DAG step heading with its status badge.
 function PanelHeading({ step }: { step: WorkflowStep }) {
   return (
     <div className="panel-title">
@@ -91,6 +95,7 @@ function PanelHeading({ step }: { step: WorkflowStep }) {
   );
 }
 
+// Lay out workflow steps by dependency depth and produce SVG edge coordinates.
 function buildLayout(steps: WorkflowStep[]): DagLayout {
   const byID = new Map(steps.map((step) => [step.step_id, step]));
   const depthCache = new Map<string, number>();

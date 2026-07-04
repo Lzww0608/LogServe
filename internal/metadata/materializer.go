@@ -1,5 +1,8 @@
 package metadata
 
+// This file implements the asynchronous Postgres materializer used by
+// PostgresStore when metadata writes should not block control-plane calls.
+
 import (
 	"context"
 	"database/sql"
@@ -10,16 +13,26 @@ import (
 	"time"
 )
 
+// DeltaKind identifies the logical metadata table affected by a queued write.
 type DeltaKind string
 
+// Delta kinds namespace materializer keys so records from different metadata
+// tables can share the same logical ID without coalescing into each other.
 const (
-	DeltaTask     DeltaKind = "task"
-	DeltaWorker   DeltaKind = "worker"
-	DeltaModel    DeltaKind = "model"
+	// DeltaTask persists one task_instances projection.
+	DeltaTask DeltaKind = "task"
+	// DeltaWorker persists one worker_instances projection.
+	DeltaWorker DeltaKind = "worker"
+	// DeltaModel persists one model_registry projection.
+	DeltaModel DeltaKind = "model"
+	// DeltaWorkflow persists one workflow_instances plus workflow_steps projection.
 	DeltaWorkflow DeltaKind = "workflow"
-	DeltaActor    DeltaKind = "actor"
+	// DeltaActor persists one actor_instances projection.
+	DeltaActor DeltaKind = "actor"
 )
 
+// metadataDelta is the unit of asynchronous persistence. version is monotonic per
+// PostgresStore and lets coalescing keep the newest write for each logical key.
 type metadataDelta struct {
 	kind    DeltaKind
 	key     string
@@ -27,6 +40,8 @@ type metadataDelta struct {
 	version int64
 }
 
+// MaterializerStats exposes queue, batch, and last-flush state for operators and
+// tests without exposing internal synchronization primitives.
 type MaterializerStats struct {
 	Mode                string
 	PendingDeltas       int
@@ -44,13 +59,18 @@ type MaterializerStats struct {
 	EventualLagEstimate time.Duration
 }
 
+// materializerFlush persists one coalesced batch of metadata deltas.
 type materializerFlush func(context.Context, []metadataDelta) error
 
+// materializerFlushRequest synchronizes a caller-visible Flush request with the
+// background materializer goroutine.
 type materializerFlushRequest struct {
 	ctx   context.Context
 	reply chan error
 }
 
+// Materializer coalesces high-frequency metadata updates and flushes them to the
+// durable backend on size, time, explicit Flush, or Close triggers.
 type Materializer struct {
 	queue         chan metadataDelta
 	batchMax      int
@@ -84,6 +104,8 @@ type Materializer struct {
 	closeErr          error
 }
 
+// NewMaterializer constructs an async writer with conservative defaults for
+// batch size, flush interval, and queue capacity.
 func NewMaterializer(db *sql.DB, batchMax int, flushInterval time.Duration, queueSize int, flush materializerFlush, onErr func(error)) *Materializer {
 	if batchMax <= 0 {
 		batchMax = 256
@@ -109,10 +131,13 @@ func NewMaterializer(db *sql.DB, batchMax int, flushInterval time.Duration, queu
 	}
 }
 
+// Start launches the single background goroutine that owns the pending delta map.
 func (m *Materializer) Start() {
 	go m.run()
 }
 
+// Enqueue records a metadata delta without blocking on durable I/O. When the
+// bounded queue is full, the delta is merged into overflow storage by logical key.
 func (m *Materializer) Enqueue(delta metadataDelta) error {
 	if m == nil {
 		return errors.New("metadata materializer is nil")
@@ -134,6 +159,8 @@ func (m *Materializer) Enqueue(delta metadataDelta) error {
 	}
 }
 
+// Flush waits until all currently visible queued, overflow, and pending deltas
+// have been persisted or ctx is canceled.
 func (m *Materializer) Flush(ctx context.Context) error {
 	if m == nil {
 		return nil
@@ -160,6 +187,8 @@ func (m *Materializer) Flush(ctx context.Context) error {
 	}
 }
 
+// Close stops accepting work and waits for the background goroutine to flush
+// remaining deltas before returning.
 func (m *Materializer) Close(ctx context.Context) error {
 	if m == nil {
 		return nil
@@ -178,6 +207,8 @@ func (m *Materializer) Close(ctx context.Context) error {
 	}
 }
 
+// Stats returns a point-in-time view of queue depth and last flush state. It is
+// safe to call on nil materializers so sync Postgres mode can share one path.
 func (m *Materializer) Stats(mode string) MaterializerStats {
 	if m == nil {
 		return MaterializerStats{Mode: mode}
@@ -211,6 +242,8 @@ func (m *Materializer) Stats(mode string) MaterializerStats {
 	return stats
 }
 
+// run owns the pending delta map and serializes queue drains, flush requests,
+// interval flushes, and shutdown flushes.
 func (m *Materializer) run() {
 	defer close(m.closed)
 	ticker := time.NewTicker(m.flushInterval)
@@ -235,6 +268,8 @@ func (m *Materializer) run() {
 				_ = m.flushPending(context.Background(), pending)
 			}
 		case req := <-m.flushRequests:
+			// Explicit Flush observes all work visible to the goroutine before it
+			// replies, including overflow entries that bypassed the bounded queue.
 			m.drainQueue(pending)
 			m.drainOverflow(pending)
 			m.updatePendingKeys(pending)
@@ -245,6 +280,8 @@ func (m *Materializer) run() {
 			m.updatePendingKeys(pending)
 			_ = m.flushAllPending(context.Background(), pending)
 		case <-m.done:
+			// Shutdown keeps final persistence inside the owner goroutine so no
+			// other caller needs direct access to the pending map.
 			m.drainQueue(pending)
 			m.drainOverflow(pending)
 			m.updatePendingKeys(pending)
@@ -254,6 +291,8 @@ func (m *Materializer) run() {
 	}
 }
 
+// drainQueue opportunistically consumes all immediately available queue items so
+// one wake-up can coalesce a burst into a single pending map.
 func (m *Materializer) drainQueue(pending map[string]metadataDelta) {
 	for {
 		select {
@@ -266,6 +305,8 @@ func (m *Materializer) drainQueue(pending map[string]metadataDelta) {
 	}
 }
 
+// markPending records the first observed pending timestamp used to estimate
+// eventual-consistency lag.
 func (m *Materializer) markPending(now time.Time) {
 	if now.IsZero() {
 		now = time.Now()
@@ -273,6 +314,8 @@ func (m *Materializer) markPending(now time.Time) {
 	m.firstPendingUnixNano.CompareAndSwap(0, now.UnixNano())
 }
 
+// updatePendingKeys refreshes observable pending counters and clears the lag
+// anchor once every queue is empty.
 func (m *Materializer) updatePendingKeys(pending map[string]metadataDelta) {
 	m.pendingKeys.Store(int64(len(pending)))
 	if len(pending) == 0 && len(m.queue) == 0 && m.overflowLen() == 0 {
@@ -280,11 +323,14 @@ func (m *Materializer) updatePendingKeys(pending map[string]metadataDelta) {
 	}
 }
 
+// overflowLen reports the number of coalesced overflow keys under its lock.
 func (m *Materializer) overflowLen() int {
 	m.overflowMu.Lock()
 	defer m.overflowMu.Unlock()
 	return len(m.overflow)
 }
+
+// drainOverflow moves overflow writes into the goroutine-owned pending map.
 func (m *Materializer) drainOverflow(pending map[string]metadataDelta) {
 	m.overflowMu.Lock()
 	for key, delta := range m.overflow {
@@ -294,12 +340,16 @@ func (m *Materializer) drainOverflow(pending map[string]metadataDelta) {
 	m.overflowMu.Unlock()
 }
 
+// mergeOverflow coalesces a dropped-queue delta by logical key while preserving
+// the newest version.
 func (m *Materializer) mergeOverflow(delta metadataDelta) {
 	m.overflowMu.Lock()
 	mergeDelta(m.overflow, delta)
 	m.overflowMu.Unlock()
 }
 
+// signalOverflow wakes the run loop at most once per burst; a buffered channel
+// intentionally collapses duplicate wake-ups.
 func (m *Materializer) signalOverflow() {
 	select {
 	case m.overflowSignal <- struct{}{}:
@@ -307,6 +357,8 @@ func (m *Materializer) signalOverflow() {
 	}
 }
 
+// flushPending persists a deterministic batch from the pending map and removes
+// only the keys that were successfully written.
 func (m *Materializer) flushPending(ctx context.Context, pending map[string]metadataDelta) error {
 	if len(pending) == 0 {
 		m.updatePendingKeys(pending)
@@ -319,6 +371,8 @@ func (m *Materializer) flushPending(ctx context.Context, pending map[string]meta
 	for key := range pending {
 		keys = append(keys, key)
 	}
+	// Stable ordering makes tests repeatable and prevents batch boundaries from
+	// depending on Go's randomized map iteration.
 	sort.Strings(keys)
 	if m.batchMax > 0 && len(keys) > m.batchMax {
 		keys = keys[:m.batchMax]
@@ -351,6 +405,8 @@ func (m *Materializer) flushPending(ctx context.Context, pending map[string]meta
 	return nil
 }
 
+// flushAllPending repeatedly calls flushPending until the pending map is empty
+// or the caller context stops the explicit flush.
 func (m *Materializer) flushAllPending(ctx context.Context, pending map[string]metadataDelta) error {
 	for len(pending) > 0 {
 		if ctx != nil {
@@ -369,6 +425,7 @@ func (m *Materializer) flushAllPending(ctx context.Context, pending map[string]m
 	return nil
 }
 
+// recordFlush updates operator-visible flush metrics and counts failures.
 func (m *Materializer) recordFlush(err error, started time.Time, elapsed time.Duration, count int) {
 	m.statsMu.Lock()
 	defer m.statsMu.Unlock()
@@ -385,6 +442,8 @@ func (m *Materializer) recordFlush(err error, started time.Time, elapsed time.Du
 	m.lastError = ""
 }
 
+// mergeDelta keeps the highest-version delta for a logical metadata key so older
+// async writes cannot overwrite newer state in the same batch window.
 func mergeDelta(pending map[string]metadataDelta, delta metadataDelta) {
 	key := deltaMapKey(delta)
 	if existing, ok := pending[key]; ok && existing.version > delta.version {
@@ -393,6 +452,8 @@ func mergeDelta(pending map[string]metadataDelta, delta metadataDelta) {
 	pending[key] = delta
 }
 
+// deltaMapKey namespaces keys by metadata kind because task IDs, worker IDs, and
+// model keys can otherwise share the same string value.
 func deltaMapKey(delta metadataDelta) string {
 	return string(delta.kind) + ":" + delta.key
 }

@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+// TestMmapReadSealedSegmentRoundTrip verifies that reopened sealed segments can
+// be read through mmap and still return valid records.
 func TestMmapReadSealedSegmentRoundTrip(t *testing.T) {
 	if !mmapSupported() {
 		t.Skip("mmap not supported on this platform")
@@ -52,6 +54,8 @@ func TestMmapReadSealedSegmentRoundTrip(t *testing.T) {
 	}
 }
 
+// TestMmapReadActiveSegmentUsesReadAt ensures active segments use ReadAt even
+// when mmap is enabled, because active files can still grow.
 func TestMmapReadActiveSegmentUsesReadAt(t *testing.T) {
 	if !mmapSupported() {
 		t.Skip("mmap not supported on this platform")
@@ -86,6 +90,7 @@ func TestMmapReadActiveSegmentUsesReadAt(t *testing.T) {
 	}
 }
 
+// TestMmapReadFromEnv verifies the LOGSERVE_LOG_MMAP_READ environment override.
 func TestMmapReadFromEnv(t *testing.T) {
 	t.Setenv("LOGSERVE_LOG_MMAP_READ", "1")
 	opts, err := DefaultOptions().normalize()
@@ -97,6 +102,8 @@ func TestMmapReadFromEnv(t *testing.T) {
 	}
 }
 
+// TestMmapReadWindowsDisabled documents the non-Unix fallback behavior where
+// mmap requests still open the store through ReadAt.
 func TestMmapReadWindowsDisabled(t *testing.T) {
 	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
 		t.Skip("platform supports mmap read experiment")
@@ -124,6 +131,8 @@ func TestMmapReadWindowsDisabled(t *testing.T) {
 	_ = store.Close()
 }
 
+// TestMmapReadCompactionReleasesMapping is an opt-in placeholder for the expensive
+// mmap/compaction lifecycle scenario guarded by an environment variable.
 func TestMmapReadCompactionReleasesMapping(t *testing.T) {
 	if !mmapSupported() {
 		t.Skip("mmap not supported on this platform")

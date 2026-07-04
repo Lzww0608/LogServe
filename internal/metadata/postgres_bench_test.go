@@ -1,5 +1,8 @@
 package metadata
 
+// This file benchmarks synchronous and asynchronous Postgres metadata write modes
+// using the recording SQL driver from postgres_async_test.go.
+
 import (
 	"context"
 	"fmt"
@@ -9,6 +12,8 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// BenchmarkPostgresStoreHeartbeatWriteModes compares heartbeat cost in sync and
+// async persistence modes and reports timed versus post-flush SQL counts.
 func BenchmarkPostgresStoreHeartbeatWriteModes(b *testing.B) {
 	for _, tc := range []struct {
 		name string
@@ -33,6 +38,8 @@ func BenchmarkPostgresStoreHeartbeatWriteModes(b *testing.B) {
 				store.Heartbeat("worker-bench", cache)
 			}
 			b.StopTimer()
+			// Count SQL calls before explicit Flush so async mode can separate foreground
+			// latency from eventual durable work.
 			timedExecs := recorder.countAll()
 			if err := store.Flush(context.Background()); err != nil {
 				b.Fatal(err)
@@ -43,6 +50,8 @@ func BenchmarkPostgresStoreHeartbeatWriteModes(b *testing.B) {
 	}
 }
 
+// BenchmarkPostgresStoreTaskLifecycleWriteModes compares create/lease/complete
+// task writes in sync and async persistence modes.
 func BenchmarkPostgresStoreTaskLifecycleWriteModes(b *testing.B) {
 	for _, tc := range []struct {
 		name string
@@ -81,6 +90,8 @@ func BenchmarkPostgresStoreTaskLifecycleWriteModes(b *testing.B) {
 				}
 			}
 			b.StopTimer()
+			// Count SQL calls before explicit Flush so async mode can separate foreground
+			// latency from eventual durable work.
 			timedExecs := recorder.countAll()
 			if err := store.Flush(context.Background()); err != nil {
 				b.Fatal(err)

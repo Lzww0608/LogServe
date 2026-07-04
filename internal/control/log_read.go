@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// logClient is the minimum logd client surface used by the control service.
 type logClient interface {
 	AppendLog(context.Context, *logservepb.AppendLogRequest, ...grpc.CallOption) (*logservepb.AppendLogResponse, error)
 	ReadLog(context.Context, *logservepb.ReadLogRequest, ...grpc.CallOption) (*logservepb.ReadLogResponse, error)
@@ -19,13 +20,18 @@ type logClient interface {
 	GetStreamStats(context.Context, *logservepb.GetStreamStatsRequest, ...grpc.CallOption) (*logservepb.GetStreamStatsResponse, error)
 }
 
+// rawLogClient is an optional fast path that avoids protobuf conversion during replay.
 type rawLogClient interface {
 	ReadLogRawEach(context.Context, string, uint64, int, func(logrecord.RawRecord) error) error
 }
+
+// streamingLogClient is an optional log read API used before falling back to unary pages.
 type streamingLogClient interface {
 	ReadLogStream(context.Context, *logservepb.ReadLogRequest, ...grpc.CallOption) (logservepb.LogService_ReadLogStreamClient, error)
 }
 
+// forEachLogRecord streams protobuf records when supported and falls back to paged
+// unary reads when the log service does not implement streaming.
 func (s *Service) forEachLogRecord(ctx context.Context, streamID string, emit func(*logservepb.LogRecord) error) error {
 	if emit == nil {
 		return nil
@@ -56,6 +62,8 @@ func (s *Service) forEachLogRecord(ctx context.Context, streamID string, emit fu
 	return s.forEachLogRecordUnary(ctx, streamID, emit)
 }
 
+// forEachLogRecordUnary pages protobuf records until a short page or empty page marks
+// the stream tail.
 func (s *Service) forEachLogRecordUnary(ctx context.Context, streamID string, emit func(*logservepb.LogRecord) error) error {
 	fromSeq := uint64(1)
 	for {
@@ -83,6 +91,8 @@ func (s *Service) forEachLogRecordUnary(ctx context.Context, streamID string, em
 	}
 }
 
+// forEachRawLogRecord prefers raw replay APIs, then streaming, then paged unary reads
+// so bootstrap can avoid avoidable protobuf work when possible.
 func (s *Service) forEachRawLogRecord(ctx context.Context, streamID string, fromSeq uint64, emit func(logrecord.RawRecord) error) error {
 	if emit == nil {
 		return nil
@@ -119,6 +129,7 @@ func (s *Service) forEachRawLogRecord(ctx context.Context, streamID string, from
 	return s.forEachRawLogRecordUnary(ctx, streamID, fromSeq, emit)
 }
 
+// forEachRawLogRecordUnary pages protobuf records and converts each to RawRecord.
 func (s *Service) forEachRawLogRecordUnary(ctx context.Context, streamID string, fromSeq uint64, emit func(logrecord.RawRecord) error) error {
 	for {
 		resp, err := s.log.ReadLog(ctx, &logservepb.ReadLogRequest{
@@ -144,6 +155,8 @@ func (s *Service) forEachRawLogRecordUnary(ctx context.Context, streamID string,
 		}
 	}
 }
+
+// readAllLog collects a complete stream for tests and compatibility helpers.
 func (s *Service) readAllLog(ctx context.Context, streamID string) ([]*logservepb.LogRecord, error) {
 	out := make([]*logservepb.LogRecord, 0)
 	if err := s.forEachLogRecord(ctx, streamID, func(rec *logservepb.LogRecord) error {

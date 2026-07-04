@@ -11,6 +11,7 @@ import (
 	"github.com/logserve/logserve/internal/logrecord"
 )
 
+// EventPayload is the workflow log event envelope used by control-plane replay and state recovery.
 type EventPayload struct {
 	WorkflowID             string          `json:"workflow_id,omitempty"`
 	WorkflowName           string          `json:"workflow_name,omitempty"`
@@ -29,13 +30,18 @@ type EventPayload struct {
 	LatencyMs              int64           `json:"latency_ms,omitempty"`
 }
 
+// RecordIterator streams protobuf log records into a replay callback.
 type RecordIterator func(func(*logservepb.LogRecord) error) error
+
+// RawRecordIterator streams normalized raw records and avoids repeated protobuf conversion on hot replay paths.
 type RawRecordIterator func(func(logrecord.RawRecord) error) error
 
+// MarshalEventPayload encodes a workflow event payload with the shared binary event codec.
 func MarshalEventPayload(payload EventPayload) ([]byte, error) {
 	return eventcodec.Marshal(eventcodec.KindWorkflowEvent, eventPayloadMap(payload))
 }
 
+// UnmarshalEventPayload decodes binary workflow events and falls back to legacy JSON payloads.
 func UnmarshalEventPayload(data []byte, payload *EventPayload) error {
 	if payload == nil {
 		return errors.New("workflow event payload is nil")
@@ -45,6 +51,8 @@ func UnmarshalEventPayload(data []byte, payload *EventPayload) error {
 	if err != nil {
 		return err
 	}
+
+	// eventcodec reports whether the binary format matched; otherwise older JSON records are decoded below.
 	if encoded {
 		*payload = eventPayloadFromMap(fields)
 		return nil
@@ -52,6 +60,7 @@ func UnmarshalEventPayload(data []byte, payload *EventPayload) error {
 	return json.Unmarshal(data, payload)
 }
 
+// Replay reconstructs workflow state from an in-memory slice of protobuf log records.
 func Replay(workflowID string, records []*logservepb.LogRecord) (State, error) {
 	return ReplayEach(workflowID, func(emit func(*logservepb.LogRecord) error) error {
 		for _, rec := range records {
@@ -63,6 +72,7 @@ func Replay(workflowID string, records []*logservepb.LogRecord) (State, error) {
 	})
 }
 
+// ReplayEach reconstructs workflow state from a caller-provided protobuf record iterator.
 func ReplayEach(workflowID string, iterate RecordIterator) (State, error) {
 	if iterate == nil {
 		return State{}, errors.New("record iterator is required")
@@ -74,6 +84,7 @@ func ReplayEach(workflowID string, iterate RecordIterator) (State, error) {
 	})
 }
 
+// ReplayRawEach reconstructs workflow state from raw records and requires a WorkflowStarted event.
 func ReplayRawEach(workflowID string, iterate RawRecordIterator) (State, error) {
 	var state State
 	if iterate == nil {
@@ -93,6 +104,7 @@ func ReplayRawEach(workflowID string, iterate RawRecordIterator) (State, error) 
 	return state, nil
 }
 
+// ReplayFromEach replays protobuf tail records on top of an existing checkpointed state.
 func ReplayFromEach(initial State, iterate RecordIterator) (State, error) {
 	if iterate == nil {
 		return CloneState(initial), nil
@@ -104,7 +116,10 @@ func ReplayFromEach(initial State, iterate RecordIterator) (State, error) {
 	})
 }
 
+// ReplayFromRawEach replays raw tail records on top of an existing checkpointed state.
 func ReplayFromRawEach(initial State, iterate RawRecordIterator) (State, error) {
+
+	// Clone the checkpoint first so failed tail replay cannot mutate the caller's state.
 	state := CloneState(initial)
 	if iterate != nil {
 		if err := iterate(func(rec logrecord.RawRecord) error {
@@ -122,6 +137,7 @@ func ReplayFromRawEach(initial State, iterate RawRecordIterator) (State, error) 
 	return state, nil
 }
 
+// applyWorkflowRecord folds one workflow log record into state and ignores unrelated event types.
 func applyWorkflowRecord(state State, fallbackWorkflowID string, rec logrecord.RawRecord, allowFallbackID bool) (State, error) {
 	var payload EventPayload
 	if len(rec.Payload) > 0 {
@@ -129,6 +145,8 @@ func applyWorkflowRecord(state State, fallbackWorkflowID string, rec logrecord.R
 			return state, err
 		}
 	}
+
+	// Some legacy records omitted payload timestamps; the log record timestamp is the recovery fallback.
 	if payload.TimestampMs == 0 {
 		payload.TimestampMs = rec.TimestampMs
 	}
@@ -140,6 +158,8 @@ func applyWorkflowRecord(state State, fallbackWorkflowID string, rec logrecord.R
 			return state, err
 		}
 		workflowID := fallbackWorkflowID
+
+		// Tail replay after a checkpoint trusts the event payload ID when present, preserving cross-stream restore behavior.
 		if allowFallbackID && payload.WorkflowID != "" {
 			workflowID = payload.WorkflowID
 		}
@@ -169,6 +189,7 @@ func applyWorkflowRecord(state State, fallbackWorkflowID string, rec logrecord.R
 	return state, nil
 }
 
+// eventPayloadMap converts EventPayload to the sparse map expected by eventcodec and keeps JSON blobs as raw bytes.
 func eventPayloadMap(payload EventPayload) map[string]any {
 	fields := make(map[string]any, 12)
 	if payload.WorkflowID != "" {
@@ -219,6 +240,7 @@ func eventPayloadMap(payload EventPayload) map[string]any {
 	return fields
 }
 
+// eventPayloadFromMap reconstructs EventPayload from a loosely typed eventcodec map.
 func eventPayloadFromMap(fields map[string]any) EventPayload {
 	return EventPayload{
 		WorkflowID:             eventcodec.StringValue(fields["workflow_id"]),
@@ -239,6 +261,7 @@ func eventPayloadFromMap(fields map[string]any) EventPayload {
 	}
 }
 
+// Consistent compares replayed workflow states on externally meaningful fields and ignores derived runtime metadata.
 func Consistent(a, b State) bool {
 	if a.WorkflowID != b.WorkflowID || a.Status != b.Status || a.Error != b.Error {
 		return false
@@ -262,6 +285,7 @@ func Consistent(a, b State) bool {
 	return true
 }
 
+// WorkflowLatencyMs returns end-to-end workflow latency once both start and completion timestamps are known.
 func WorkflowLatencyMs(state State) int64 {
 	if state.CompletedAtMs == 0 || state.CreatedAtMs == 0 {
 		return 0
@@ -269,6 +293,7 @@ func WorkflowLatencyMs(state State) int64 {
 	return state.CompletedAtMs - state.CreatedAtMs
 }
 
+// NowMs returns the current wall-clock time in milliseconds for workflow event timestamps.
 func NowMs() int64 {
 	return time.Now().UnixMilli()
 }

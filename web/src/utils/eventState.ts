@@ -1,3 +1,5 @@
+// State merge helpers for applying SSE deltas without dropping existing metadata.
+
 import type { LogRecord, LogStreamDetail, StreamStats, Task, Workflow, WorkflowStep } from "../types/logserve.js";
 
 export type LogRecordsEvent = {
@@ -7,11 +9,13 @@ export type LogRecordsEvent = {
   stats?: StreamStats | null;
 };
 
+// Merge a task SSE delta into the current row without losing existing metadata.
 export function applyTaskEvent(current: Task | undefined, incoming: Partial<Task> & Pick<Task, "task_id">): Task {
   const base: Task = current ?? { task_id: incoming.task_id, status: incoming.status ?? "UNSPECIFIED" };
   return mergeDefined(base, incoming);
 }
 
+// Merge a workflow SSE delta and reconcile step updates by step id.
 export function applyWorkflowEvent(current: Workflow | undefined, incoming: Partial<Workflow> & Pick<Workflow, "workflow_id">): Workflow {
   const base: Workflow = current ?? { workflow_id: incoming.workflow_id, status: incoming.status ?? "UNSPECIFIED" };
   const { steps, ...rest } = incoming;
@@ -21,6 +25,7 @@ export function applyWorkflowEvent(current: Workflow | undefined, incoming: Part
   return next;
 }
 
+// Append log-record SSE deltas by sequence while bounding retained rows.
 export function applyLogRecordsEvent(current: LogStreamDetail | undefined, incoming: LogRecordsEvent, maxRecords = 500): LogStreamDetail {
   const sameStream = current?.stream_id === incoming.stream_id;
   const recordsBySeq = new Map<number, LogRecord>();
@@ -40,6 +45,7 @@ export function applyLogRecordsEvent(current: LogStreamDetail | undefined, incom
   };
 }
 
+// Preserve existing workflow step order while applying incoming step deltas.
 function mergeSteps(current: WorkflowStep[], incoming: WorkflowStep[]): WorkflowStep[] {
   const byID = new Map<string, WorkflowStep>();
   const order: string[] = [];
@@ -55,6 +61,7 @@ function mergeSteps(current: WorkflowStep[], incoming: WorkflowStep[]): Workflow
   return order.map((stepID) => byID.get(stepID)).filter((step): step is WorkflowStep => Boolean(step));
 }
 
+// Overlay only meaningful fields so sparse event deltas do not erase known values.
 function mergeDefined<T extends object>(current: T, incoming: Partial<T>): T {
   const output: Record<string, unknown> = { ...(current as Record<string, unknown>) };
   for (const [key, value] of Object.entries(incoming)) {

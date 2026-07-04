@@ -15,8 +15,12 @@ import (
 	"github.com/logserve/logserve/internal/observability"
 )
 
+// This file implements actor creation, serialized actor method calls, ownership
+// fencing, snapshots, and replay-backed status checks for the control service.
 var errNoActiveActorWorker = errors.New("no active worker available for actor")
 
+// CreateActor validates actor class input, records ActorCreated, and materializes
+// actor metadata with idempotency fingerprint checks.
 func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRequest) (*logservepb.CreateActorResponse, error) {
 	if req.GetClassName() == "" {
 		return nil, errors.New("class_name is required")
@@ -84,6 +88,8 @@ func (s *Service) CreateActor(ctx context.Context, req *logservepb.CreateActorRe
 	return actorCreateResponse(owned), nil
 }
 
+// CallActor submits one actor command and waits for its task to reach a terminal
+// state within the request timeout.
 func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorRequest) (*logservepb.CallActorResponse, error) {
 	if req.GetActorId() == "" {
 		return nil, errors.New("actor_id is required")
@@ -147,7 +153,11 @@ func (s *Service) CallActor(ctx context.Context, req *logservepb.CallActorReques
 	}
 }
 
+// submitActorCommand serializes command creation for one actor, chooses the next
+// command sequence, records ActorCommandSubmitted, and enqueues the worker task.
 func (s *Service) submitActorCommand(ctx context.Context, req *logservepb.CallActorRequest, deadlineAt time.Time) (metadata.Task, error) {
+	// The per-actor lock keeps SubmittedCommandCount and mailbox task creation linear
+	// even when multiple clients call the same actor concurrently.
 	unlock := s.actorLocks.Lock(req.GetActorId())
 	defer unlock()
 
@@ -155,6 +165,8 @@ func (s *Service) submitActorCommand(ctx context.Context, req *logservepb.CallAc
 	if err != nil {
 		return metadata.Task{}, err
 	}
+	// Metadata restored from a checkpoint can know command counts before loading a
+	// full state blob; replay fills state before dispatching another command.
 	if state.CommandCount > 0 && len(state.StateJSON) == 0 {
 		replayed, err := s.replayActor(ctx, req.GetActorId())
 		if err != nil {
@@ -239,6 +251,7 @@ func (s *Service) submitActorCommand(ctx context.Context, req *logservepb.CallAc
 	return task, nil
 }
 
+// GetActorStatus returns the current actor metadata materialization.
 func (s *Service) GetActorStatus(ctx context.Context, req *logservepb.GetActorStatusRequest) (*logservepb.GetActorStatusResponse, error) {
 	state, ok := s.meta.GetActor(req.GetActorId())
 	if !ok {
@@ -247,6 +260,8 @@ func (s *Service) GetActorStatus(ctx context.Context, req *logservepb.GetActorSt
 	return actorStatusResponse(state), nil
 }
 
+// ReplayActor rebuilds actor state from log records and reports whether it matches
+// the current metadata state.
 func (s *Service) ReplayActor(ctx context.Context, req *logservepb.ReplayActorRequest) (*logservepb.ReplayActorResponse, error) {
 	replayed, err := s.replayActor(ctx, req.GetActorId())
 	if err != nil {
@@ -262,6 +277,8 @@ func (s *Service) ReplayActor(ctx context.Context, req *logservepb.ReplayActorRe
 	}, nil
 }
 
+// waitActorOwner retries ownership assignment until a worker is available, the
+// context is canceled, or the actor call deadline passes.
 func (s *Service) waitActorOwner(ctx context.Context, actorID string, deadlineAt time.Time) (actor.State, error) {
 	for {
 		state, err := s.ensureActorOwner(ctx, actorID)
@@ -284,6 +301,8 @@ func (s *Service) waitActorOwner(ctx context.Context, actorID string, deadlineAt
 	}
 }
 
+// ensureActorOwner returns an active owner or grants ownership to the lowest worker
+// ID among currently active workers, advancing the actor epoch as a fence.
 func (s *Service) ensureActorOwner(ctx context.Context, actorID string) (actor.State, error) {
 	state, ok := s.meta.GetActor(actorID)
 	if !ok {
@@ -324,11 +343,14 @@ func (s *Service) ensureActorOwner(ctx context.Context, actorID string) (actor.S
 	})
 }
 
+// completeActorCall applies a terminal actor command if the worker still owns the
+// actor epoch and the command sequence is exactly the next mailbox entry.
 func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req *logservepb.CompleteTaskRequest) error {
 	state, ok := s.meta.GetActor(task.ActorID)
 	if !ok {
 		return errors.New("actor not found")
 	}
+	// Worker ID and epoch together fence stale completions from a previous owner.
 	if req.GetWorkerId() != state.OwnerWorkerID || req.GetActorEpoch() != state.Epoch {
 		return fmt.Errorf("stale actor completion rejected: actor=%s task_epoch=%d request_epoch=%d current_epoch=%d owner=%s worker=%s",
 			task.ActorID, task.ActorEpoch, req.GetActorEpoch(), state.Epoch, state.OwnerWorkerID, req.GetWorkerId())
@@ -337,6 +359,7 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 	if commandSeq == 0 {
 		commandSeq = state.CommandCount + 1
 	}
+	// Actor state is only valid when commands apply in mailbox order.
 	if commandSeq != state.CommandCount+1 {
 		return fmt.Errorf("out-of-order actor command rejected: actor=%s call_id=%s command_seq=%d expected=%d",
 			task.ActorID, task.ActorCallID, commandSeq, state.CommandCount+1)
@@ -390,19 +413,21 @@ func (s *Service) completeActorCall(ctx context.Context, task metadata.Task, req
 	}
 	if commandCount == 1 || commandCount%100 == 0 {
 		observability.Info("actor_command_applied", map[string]any{
-			"actor_id":           task.ActorID,
-			"call_id":            task.ActorCallID,
-			"command_count":      commandCount,
-			"epoch":              req.GetActorEpoch(),
-			"latency_ms":         now - task.CreatedAtMs,
-			"state_json_bytes":   len(stateJSON),
-			"args_json_bytes":    len(spec.GetArgsJson()),
-			"result_json_bytes":  len(req.GetResultJson()),
+			"actor_id":          task.ActorID,
+			"call_id":           task.ActorCallID,
+			"command_count":     commandCount,
+			"epoch":             req.GetActorEpoch(),
+			"latency_ms":        now - task.CreatedAtMs,
+			"state_json_bytes":  len(stateJSON),
+			"args_json_bytes":   len(spec.GetArgsJson()),
+			"result_json_bytes": len(req.GetResultJson()),
 		})
 	}
 	return nil
 }
 
+// failActorCommand records a failed actor command and advances the command counter
+// so later commands are not blocked behind a terminal failure.
 func (s *Service) failActorCommand(ctx context.Context, task metadata.Task, req *logservepb.CompleteTaskRequest, spec *logservepb.TaskSpec, commandSeq uint64) error {
 	now := actor.NowMs()
 	payload, _ := actor.MarshalEventPayload(actor.EventPayload{
@@ -437,6 +462,8 @@ func (s *Service) failActorCommand(ctx context.Context, task metadata.Task, req 
 	return err
 }
 
+// createActorSnapshot stores actor state in the object store, records a snapshot
+// event, trims older actor log records, and updates snapshot metadata.
 func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) error {
 	if s.resultStore == nil {
 		return nil
@@ -467,6 +494,8 @@ func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) er
 	if err != nil {
 		return err
 	}
+	// After a snapshot, older actor events are no longer needed for replay and can be
+	// trimmed while keeping the snapshot event itself as the new stream base.
 	if snapshotResp.GetSeq() > 1 {
 		if _, err := s.log.TrimStream(ctx, &logservepb.TrimStreamRequest{
 			StreamId:  actorStream(state.ActorID),
@@ -486,6 +515,7 @@ func (s *Service) createActorSnapshot(ctx context.Context, state actor.State) er
 	return err
 }
 
+// replayActor streams an actor log through the actor replay engine.
 func (s *Service) replayActor(ctx context.Context, actorID string) (actor.ReplayResult, error) {
 	streamID := actorStream(actorID)
 	return actor.ReplayRawEach(actorID, func(emit func(logrecord.RawRecord) error) error {
@@ -493,12 +523,14 @@ func (s *Service) replayActor(ctx context.Context, actorID string) (actor.Replay
 	}, s)
 }
 
+// specForTask returns a cloned task spec from the in-memory spec cache.
 func (s *Service) specForTask(taskID string) *logservepb.TaskSpec {
 	s.specMu.RLock()
 	defer s.specMu.RUnlock()
 	return cloneSpec(s.specs[taskID])
 }
 
+// actorCreateResponse shapes actor metadata for CreateActor responses.
 func actorCreateResponse(state actor.State) *logservepb.CreateActorResponse {
 	return &logservepb.CreateActorResponse{
 		ActorId:       state.ActorID,
@@ -508,6 +540,7 @@ func actorCreateResponse(state actor.State) *logservepb.CreateActorResponse {
 	}
 }
 
+// actorStatusResponse shapes actor metadata for status and replay responses.
 func actorStatusResponse(state actor.State) *logservepb.GetActorStatusResponse {
 	return &logservepb.GetActorStatusResponse{
 		ActorId:              state.ActorID,
@@ -524,6 +557,8 @@ func actorStatusResponse(state actor.State) *logservepb.GetActorStatusResponse {
 	}
 }
 
+// defaultJSON returns a defensive copy of value or fallback when the caller omitted
+// JSON input.
 func defaultJSON(value []byte, fallback []byte) []byte {
 	if len(value) == 0 {
 		return append([]byte(nil), fallback...)

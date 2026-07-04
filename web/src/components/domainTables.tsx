@@ -1,9 +1,12 @@
+// Reusable presentational component for the LogServe console UI.
+
 import type { Actor, FunctionRegistryEntry, LogRecord, ModelInfo, StreamStats, Task, Worker, Workflow } from "../types/logserve";
 import { formatTime, modelLabel, payloadPreview, submitTaskURLForFunction } from "../utils/format";
 import { DetailGrid } from "./DetailGrid";
 import { StatusBadge } from "./StatusBadge";
 import { Table, type Column, type TablePagination } from "./Table";
 
+// Render registered functions with copy and submit-task shortcuts.
 export function FunctionTable({ rows, onCopy }: { rows: FunctionRegistryEntry[]; onCopy: (functionHash: string) => void }) {
   return <Table rows={rows} empty="No functions" columns={[
     { label: "Function hash", className: "hash-cell", render: (row) => <code className="payload-cell">{row.function_hash}</code> },
@@ -18,6 +21,7 @@ export function FunctionTable({ rows, onCopy }: { rows: FunctionRegistryEntry[];
   ]} />;
 }
 
+// Render task rows with workflow, actor, and model context.
 export function TaskTable({ rows, pagination }: { rows: Task[]; pagination?: TablePagination }) {
   return <Table rows={rows} empty="No tasks" pagination={pagination} columns={[
     { label: "Task", render: (row) => <a data-nav href={`/tasks/${row.task_id}`}>{row.task_id}</a> },
@@ -30,6 +34,7 @@ export function TaskTable({ rows, pagination }: { rows: Task[]; pagination?: Tab
   ]} />;
 }
 
+// Render workflow rows with aggregate step counts.
 export function WorkflowTable({ rows, pagination }: { rows: Workflow[]; pagination?: TablePagination }) {
   return <Table rows={rows} empty="No workflows" pagination={pagination} columns={[
     { label: "Workflow", render: (row) => <a data-nav href={`/workflows/${row.workflow_id}`}>{row.workflow_name || row.workflow_id}</a> },
@@ -41,6 +46,7 @@ export function WorkflowTable({ rows, pagination }: { rows: Workflow[]; paginati
   ]} />;
 }
 
+// Render workflow step rows for detail pages.
 export function StepTable({ rows }: { rows: NonNullable<Workflow["steps"]> }) {
   return <Table rows={rows} empty="No steps" columns={[
     { label: "Step", render: (row) => row.step_id },
@@ -52,6 +58,7 @@ export function StepTable({ rows }: { rows: NonNullable<Workflow["steps"]> }) {
   ]} />;
 }
 
+// Render actor state and ownership rows.
 export function ActorTable({ rows }: { rows: Actor[] }) {
   return <Table rows={rows} empty="No actors" columns={[
     { label: "Actor", render: (row) => <a data-nav href={`/actors/${row.actor_id}`}>{row.actor_id}</a> },
@@ -63,6 +70,7 @@ export function ActorTable({ rows }: { rows: Actor[] }) {
   ]} />;
 }
 
+// Render model registry rows.
 export function ModelTable({ rows }: { rows: ModelInfo[] }) {
   return <Table rows={rows} empty="No models" columns={[
     { label: "Model", render: (row) => `${row.name}:${row.version || "v1"}` },
@@ -72,6 +80,7 @@ export function ModelTable({ rows }: { rows: ModelInfo[] }) {
   ]} />;
 }
 
+// Render worker capacity and cache rows.
 export function WorkerTable({ rows }: { rows: Worker[] }) {
   return <Table rows={rows} empty="No workers" columns={[
     { label: "Worker", render: (row) => row.worker_id },
@@ -82,6 +91,7 @@ export function WorkerTable({ rows }: { rows: Worker[] }) {
   ]} />;
 }
 
+// Render selectable log streams with sequence stats.
 export function LogStreamTable({ streamIDs, stats, selected, onSelect }: { streamIDs: string[]; stats: Map<string, StreamStats>; selected: string; onSelect: (streamID: string) => void }) {
   return <Table rows={streamIDs} empty="No streams" columns={[
     { label: "Stream", render: (streamID) => <button type="button" className={streamID === selected ? "primary compact-button" : "ghost compact-button"} onClick={() => onSelect(streamID)}>{streamID}</button> },
@@ -92,6 +102,7 @@ export function LogStreamTable({ streamIDs, stats, selected, onSelect }: { strea
   ]} />;
 }
 
+// Render log records with optional inspect/copy actions.
 export function LogRecordTable({ rows, pagination, onInspect, onCopyPayload }: { rows: LogRecord[]; pagination?: TablePagination; onInspect?: (row: LogRecord) => void; onCopyPayload?: (row: LogRecord) => void }) {
   const columns: Column<LogRecord>[] = [
     { label: "Seq", render: (row) => row.seq },
@@ -114,6 +125,7 @@ export function LogRecordTable({ rows, pagination, onInspect, onCopyPayload }: {
   return <Table rows={rows} empty="No records" pagination={pagination} columns={columns} />;
 }
 
+// Render sequence and compaction stats for the selected log stream.
 export function StreamStatsPanel({ stats }: { stats?: StreamStats | null }) {
   if (!stats) return <div className="empty">No stream stats</div>;
   return <DetailGrid items={[

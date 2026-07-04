@@ -1,3 +1,5 @@
+// Unit tests for console form validation and workflow DAG validation.
+
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -9,6 +11,7 @@ import {
   validateWorkflowForm
 } from "../.tmp-form-tests/src/utils/formValidation.js";
 
+// Verifies parseJSONField reports the field and JSON error position.
 test("parseJSONField reports the field and JSON error position", () => {
   const result = parseJSONField("Args JSON", "[1, }", []);
 
@@ -18,6 +21,7 @@ test("parseJSONField reports the field and JSON error position", () => {
   assert.match(result.message ?? "", /line 1, column 5/);
 });
 
+// Verifies validateTaskForm blocks empty names and bad args before submit.
 test("validateTaskForm blocks empty names and bad args before submit", () => {
   const result = validateTaskForm({
     mode: "source",
@@ -39,6 +43,7 @@ test("validateTaskForm blocks empty names and bad args before submit", () => {
 });
 
 
+// Verifies validateTaskForm requires the selected function identity.
 test("validateTaskForm requires the selected function identity", () => {
   const refResult = validateTaskForm({
     mode: "ref",
@@ -80,6 +85,7 @@ test("validateTaskForm requires the selected function identity", () => {
   assert.equal(hashResult.errors.functionHash, "Function hash is required.");
 });
 
+// Verifies validateTaskForm accepts registered function ref with hash.
 test("validateTaskForm accepts registered function ref with hash", () => {
   const result = validateTaskForm({
     mode: "ref",
@@ -95,6 +101,7 @@ test("validateTaskForm accepts registered function ref with hash", () => {
   assert.equal(result.valid, true);
   assert.deepEqual(result.parsedArgs, [1, 2]);
 });
+// Verifies validateTaskForm accepts hash mode with parsed args and kwargs.
 test("validateTaskForm accepts hash mode with parsed args and kwargs", () => {
   const result = validateTaskForm({
     mode: "hash",
@@ -112,6 +119,7 @@ test("validateTaskForm accepts hash mode with parsed args and kwargs", () => {
   assert.deepEqual(result.parsedKwargs, { scale: 3 });
 });
 
+// Verifies validateWorkflowForm validates name and definition JSON immediately.
 test("validateWorkflowForm validates name and definition JSON immediately", () => {
   const result = validateWorkflowForm(" ", "{\"steps\": [}");
 
@@ -121,6 +129,7 @@ test("validateWorkflowForm validates name and definition JSON immediately", () =
   assert.match(result.errors.definition ?? "", /Workflow definition JSON:.*position 11/);
 });
 
+// Verifies validateActorCallForm requires method and valid args.
 test("validateActorCallForm requires method and valid args", () => {
   const result = validateActorCallForm(" ", "[1, }");
 
@@ -130,6 +139,7 @@ test("validateActorCallForm requires method and valid args", () => {
   assert.match(result.errors.args ?? "", /Args JSON:.*position 4/);
 });
 
+// Verifies validateLLMForm requires model name and prompt.
 test("validateLLMForm requires model name and prompt", () => {
   const result = validateLLMForm(" ", " ");
 
@@ -142,6 +152,7 @@ test("validateLLMForm requires model name and prompt", () => {
   });
 });
 
+// Verifies analyzeWorkflowDefinition validates DAG shape and topological order.
 test("analyzeWorkflowDefinition validates DAG shape and topological order", () => {
   const valid = analyzeWorkflowDefinition({
     result_step_id: "finish",

@@ -1,3 +1,5 @@
+// Command logserve-dev starts logd, the control plane, and one worker in a
+// single process for local development and smoke testing.
 package main
 
 import (
@@ -17,6 +19,8 @@ import (
 	"github.com/logserve/logserve/internal/worker"
 )
 
+// main starts the local all-in-one development stack and waits for either an
+// OS signal or worker failure before returning.
 func main() {
 	logAddr := flag.String("log-addr", "127.0.0.1:50051", "log service address")
 	controlAddr := flag.String("control-addr", "127.0.0.1:50052", "control service address")
@@ -46,6 +50,8 @@ func main() {
 	}
 	defer controlServer.Stop()
 
+	// One cancellation context coordinates Ctrl+C, SIGTERM, and worker failures
+	// so the embedded services leave together instead of orphaning a worker.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
@@ -81,6 +87,9 @@ func main() {
 	<-ctx.Done()
 }
 
+// splitCSV normalizes optional list flags such as cached model names. Empty
+// input is represented as nil so worker defaults can distinguish unset from
+// a populated list.
 func splitCSV(value string) []string {
 	if strings.TrimSpace(value) == "" {
 		return nil

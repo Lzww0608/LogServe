@@ -1,3 +1,5 @@
+// Command logserve-logbench runs a local logstore microbenchmark across fsync
+// policies and emits a JSON report for append, read, and recovery timing.
 package main
 
 import (
@@ -13,6 +15,8 @@ import (
 	"github.com/logserve/logserve/internal/logstore"
 )
 
+// report is the top-level JSON document. It records workload parameters once
+// and then stores per-policy measurements for easy side-by-side comparison.
 type report struct {
 	GeneratedAt  string         `json:"generated_at"`
 	Records      int            `json:"records"`
@@ -21,6 +25,8 @@ type report struct {
 	Policies     []policyReport `json:"policies"`
 }
 
+// policyReport captures measurements for one fsync policy using an isolated
+// temporary logstore directory.
 type policyReport struct {
 	Policy           string  `json:"policy"`
 	DataDir          string  `json:"data_dir"`
@@ -34,6 +40,8 @@ type policyReport struct {
 	ReadRecords      int     `json:"read_records"`
 }
 
+// main validates benchmark flags, runs each requested fsync policy, and emits
+// the combined report to stdout or the requested JSON file.
 func main() {
 	records := flag.Int("records", 20000, "records to append per policy")
 	streams := flag.Int("streams", 16, "number of streams")
@@ -94,11 +102,16 @@ func main() {
 	fmt.Println(string(data))
 }
 
+// runPolicy measures a single fsync policy by appending records, reading every
+// stream back, closing cleanly, and reopening the store to time recovery.
 func runPolicy(policy string, records, streams, payloadBytes int, segmentSizeBytes int64, fsyncInterval time.Duration, keepData bool) (policyReport, error) {
 	dir, err := os.MkdirTemp("", "logserve-logbench-"+policy+"-")
 	if err != nil {
 		return policyReport{}, err
 	}
+	// Each policy gets a fresh directory so segment counts and recovery time are
+	// not affected by a previous policy run. --keep-data preserves that directory
+	// for manual inspection after the benchmark exits.
 	if !keepData {
 		defer os.RemoveAll(dir)
 	}
@@ -130,6 +143,8 @@ func runPolicy(policy string, records, streams, payloadBytes int, segmentSizeByt
 	}
 	appendDuration := time.Since(appendStart)
 
+	// The read pass walks each stream from sequence 1 until the store returns an
+	// empty batch, matching the public Read API rather than inspecting segments.
 	readStart := time.Now()
 	readRecords := 0
 	for i := 0; i < streams; i++ {
@@ -154,6 +169,8 @@ func runPolicy(policy string, records, streams, payloadBytes int, segmentSizeByt
 		return policyReport{}, err
 	}
 
+	// Recovery is approximated by reopening after a clean close, which exercises
+	// segment discovery and metadata reconstruction for the generated workload.
 	recoverStart := time.Now()
 	recovered, err := logstore.OpenWithOptions(dir, opts)
 	if err != nil {
@@ -183,6 +200,8 @@ func runPolicy(policy string, records, streams, payloadBytes int, segmentSizeByt
 	}, nil
 }
 
+// splitPolicies accepts human-friendly comma-separated input and drops empty
+// entries so trailing commas do not create invalid policy names.
 func splitPolicies(raw string) []string {
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
@@ -195,6 +214,8 @@ func splitPolicies(raw string) []string {
 	return out
 }
 
+// countSegments reports how many rolled segment log files were produced for
+// a benchmark run.
 func countSegments(dir string) (int, error) {
 	paths, err := filepath.Glob(filepath.Join(dir, "segment-*.log"))
 	if err != nil {
@@ -203,6 +224,7 @@ func countSegments(dir string) (int, error) {
 	return len(paths), nil
 }
 
+// rate avoids division by zero for extremely small or failed timing windows.
 func rate(records int, duration time.Duration) float64 {
 	if duration <= 0 {
 		return 0
@@ -210,6 +232,7 @@ func rate(records int, duration time.Duration) float64 {
 	return float64(records) / duration.Seconds()
 }
 
+// fatalf prints a benchmark error to stderr and exits with a non-zero status.
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)

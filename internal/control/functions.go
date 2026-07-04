@@ -16,8 +16,11 @@ import (
 	"github.com/logserve/logserve/internal/workflow"
 )
 
+// This file normalizes inline Python function sources into content-addressed
+// object-store references and replays the function registry at startup.
 const functionRegistryStream = "system:functions"
 
+// functionRegisteredPayload is the durable registry record for one function hash.
 type functionRegisteredPayload struct {
 	FunctionHash string `json:"function_hash"`
 	SourceRef    string `json:"source_ref"`
@@ -26,6 +29,8 @@ type functionRegisteredPayload struct {
 	TimestampMs  int64  `json:"timestamp_ms,omitempty"`
 }
 
+// normalizeTaskFunction replaces inline Python task source with a registered
+// source reference and stable hash before the task is logged.
 func (s *Service) normalizeTaskFunction(ctx context.Context, spec *logservepb.TaskSpec) error {
 	if spec == nil || !requiresPythonFunction(spec) {
 		return nil
@@ -36,10 +41,14 @@ func (s *Service) normalizeTaskFunction(ctx context.Context, spec *logservepb.Ta
 	}
 	spec.FunctionRef = ref
 	spec.FunctionHash = hash
+	// Once source is stored by hash/ref, clear the inline body so task events stay small
+	// and do not duplicate code already present in the object store.
 	spec.FunctionSource = ""
 	return nil
 }
 
+// normalizeWorkflowDefinition registers workflow-level and step-level Python
+// sources while preserving LLM steps as logical model invocations.
 func (s *Service) normalizeWorkflowDefinition(ctx context.Context, def *workflow.Definition) error {
 	if def == nil {
 		return nil
@@ -72,10 +81,14 @@ func (s *Service) normalizeWorkflowDefinition(ctx context.Context, def *workflow
 	return nil
 }
 
+// isWorkflowLLMStep recognizes workflow steps that should be scheduled as LLM work
+// rather than Python function execution.
 func isWorkflowLLMStep(step workflow.StepDefinition) bool {
 	return strings.TrimSpace(step.LLMModelName) != "" || strings.TrimSpace(step.FunctionName) == "__logserve_llm__"
 }
 
+// normalizeWorkflowLLMStep validates a model-backed step and fills defaults for
+// version, adapter, synthetic function name, and max tokens.
 func (s *Service) normalizeWorkflowLLMStep(step *workflow.StepDefinition) error {
 	step.LLMModelName = strings.TrimSpace(step.LLMModelName)
 	if step.LLMModelName == "" {
@@ -108,6 +121,8 @@ func (s *Service) normalizeWorkflowLLMStep(step *workflow.StepDefinition) error 
 	return nil
 }
 
+// ensureFunctionRegistered validates or computes a function hash, stores source if
+// necessary, and records the registry entry exactly once per hash.
 func (s *Service) ensureFunctionRegistered(ctx context.Context, entrypoint, source, requestedRef, requestedHash string) (string, string, error) {
 	requestedRef = strings.TrimSpace(requestedRef)
 	requestedHash = strings.TrimSpace(requestedHash)
@@ -171,6 +186,7 @@ func (s *Service) ensureFunctionRegistered(ctx context.Context, entrypoint, sour
 	return ref, hash, nil
 }
 
+// bootstrapFunctions replays the function registry stream into the in-memory hash map.
 func (s *Service) bootstrapFunctions(ctx context.Context) error {
 	return s.forEachRawLogRecord(ctx, functionRegistryStream, 1, func(rec logrecord.RawRecord) error {
 		if rec.EventType != "FunctionRegistered" {
@@ -190,6 +206,7 @@ func (s *Service) bootstrapFunctions(ctx context.Context) error {
 	})
 }
 
+// functionEntrypoint normalizes bare function names into the worker module:name form.
 func functionEntrypoint(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" || strings.Contains(name, ":") {
@@ -197,15 +214,19 @@ func functionEntrypoint(name string) string {
 	}
 	return "module:" + name
 }
+
+// requiresPythonFunction reports whether a task needs Python function registration.
 func requiresPythonFunction(spec *logservepb.TaskSpec) bool {
 	return spec.GetLlmModelName() == "" && spec.GetActorId() == ""
 }
 
+// hashFunctionSource returns the sha256 content address used by the registry.
 func hashFunctionSource(source string) string {
 	sum := sha256.Sum256([]byte(source))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+// taskFunctionIdentity returns the stable function identity used in task fingerprints.
 func taskFunctionIdentity(spec *logservepb.TaskSpec) string {
 	if spec == nil {
 		return ""

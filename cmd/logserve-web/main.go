@@ -1,3 +1,5 @@
+// Command logserve-web starts the HTTP API and static frontend that bridge
+// browser clients to the control-plane and log-service gRPC APIs.
 package main
 
 import (
@@ -12,6 +14,8 @@ import (
 	"github.com/logserve/logserve/internal/webapi"
 )
 
+// main assembles web API configuration from defaults, flags, and selected
+// environment overrides, then serves the HTTP API and static frontend.
 func main() {
 	defaults := webapi.DefaultConfig()
 	addr := flag.String("addr", defaults.Addr, "HTTP listen address")
@@ -38,6 +42,8 @@ func main() {
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 5 * time.Second
 	}
+	// Environment overrides are compatibility shortcuts for deployments that do
+	// not pass flags. Explicit CLI flags always win.
 	if envAddr := os.Getenv("LOGSERVE_WEB_ADDR"); envAddr != "" && !flagVisited("addr") {
 		cfg.Addr = envAddr
 	}
@@ -66,8 +72,10 @@ func main() {
 		"dev_cors":     cfg.DevCORS,
 	})
 	httpServer := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           srv.Handler(),
+		Addr:    cfg.Addr,
+		Handler: srv.Handler(),
+		// Keep connection-level limits here so the webapi package can focus on
+		// request routing, auth, and backend RPC timeouts.
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      2 * time.Minute,
@@ -78,6 +86,8 @@ func main() {
 	}
 }
 
+// flagVisited tells env fallback logic whether the operator supplied a flag
+// explicitly; the standard flag package only exposes this through iteration.
 func flagVisited(name string) bool {
 	visited := false
 	flag.Visit(func(f *flag.Flag) {

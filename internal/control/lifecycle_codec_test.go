@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+// TestTaskLifecyclePayloadBinaryAndJSONFallback verifies compact lifecycle payloads
+// decode correctly and legacy JSON remains replayable.
 func TestTaskLifecyclePayloadBinaryAndJSONFallback(t *testing.T) {
 	want := taskLifecyclePayload{
 		TaskLeaseEpoch: 3,

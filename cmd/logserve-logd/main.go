@@ -1,3 +1,5 @@
+// Command logserve-logd starts the durable log service with locally supplied
+// segment, fsync, compaction, and read-path options.
 package main
 
 import (
@@ -12,6 +14,8 @@ import (
 	"github.com/logserve/logserve/internal/observability"
 )
 
+// main parses logstore serving options, opens logd, and keeps the process
+// alive after the background gRPC server starts.
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "gRPC listen address")
 	pprofAddr := flag.String("pprof-addr", observability.PprofAddrFromEnv(), "optional pprof listen address, for example 127.0.0.1:6061")
@@ -33,6 +37,8 @@ func main() {
 	opts.CompactionInterval = time.Duration(*compactionIntervalMs) * time.Millisecond
 	opts.CompactionCopyLiveRatioThreshold = *compactionCopyLiveRatio
 	opts.CompactionMaxBytesPerSecond = *compactionMaxBytesPerSecond
+	// Mmap reads are deliberately guarded by an environment variable instead of
+	// a public flag because the option changes the read path for all streams.
 	if v := os.Getenv("LOGSERVE_LOG_MMAP_READ"); v == "1" || strings.EqualFold(v, "true") {
 		opts.MmapRead = true
 	}
@@ -52,5 +58,7 @@ func main() {
 		"compaction_max_bytes_per_second": opts.CompactionMaxBytesPerSecond,
 		"mmap_read":                       opts.MmapRead,
 	})
+	// logd.StartWithOptions returns after the server is listening; the process
+	// itself stays alive until an external signal or supervisor stops it.
 	select {}
 }

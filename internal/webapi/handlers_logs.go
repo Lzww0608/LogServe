@@ -1,5 +1,8 @@
 package webapi
 
+// This file implements log explorer endpoints and converts log payload bytes
+// into JSON, text, or base64 views.
+
 import (
 	"encoding/base64"
 	"encoding/json"
@@ -13,6 +16,8 @@ import (
 
 const maxLogReadLimit uint32 = 1000
 
+// logRecordDTO is the log explorer representation of one log record. Payload is
+// exposed as JSON, text, or base64 depending on its bytes.
 type logRecordDTO struct {
 	StreamID       string          `json:"stream_id"`
 	Seq            uint64          `json:"seq"`
@@ -25,6 +30,7 @@ type logRecordDTO struct {
 	CRC32          uint32          `json:"crc32,omitempty"`
 }
 
+// streamStatsDTO mirrors log-service stream stats for the log explorer UI.
 type streamStatsDTO struct {
 	StreamID           string `json:"stream_id"`
 	FirstSeq           uint64 `json:"first_seq"`
@@ -34,6 +40,8 @@ type streamStatsDTO struct {
 	CompactableBytes   uint64 `json:"compactable_bytes"`
 }
 
+// handleListLogStreams returns stream IDs plus compactability stats for an
+// optional prefix.
 func (s *Server) handleListLogStreams(w http.ResponseWriter, r *http.Request) {
 	prefix := r.URL.Query().Get("prefix")
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
@@ -54,6 +62,8 @@ func (s *Server) handleListLogStreams(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleReadLogStream reads a bounded page from one log stream and computes the
+// next sequence cursor used by the explorer.
 func (s *Server) handleReadLogStream(w http.ResponseWriter, r *http.Request) {
 	streamID := r.PathValue("stream_id")
 	if streamID == "" {
@@ -101,6 +111,8 @@ func (s *Server) handleReadLogStream(w http.ResponseWriter, r *http.Request) {
 		stat = statDTO
 		hasStat = true
 	}
+	// If the requested cursor is before a trimmed prefix and no records are returned,
+	// jump the next cursor to the first retained sequence to keep polling moving.
 	if len(recordDTOs) == 0 && hasStat && nextSeq < statDTO.FirstSeq && nextSeq < statDTO.NextSeq {
 		nextSeq = statDTO.FirstSeq
 	}
@@ -119,6 +131,8 @@ func (s *Server) handleReadLogStream(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLogStats returns per-stream retention and compactability stats for one
+// stream or prefix.
 func (s *Server) handleLogStats(w http.ResponseWriter, r *http.Request) {
 	streamID := r.URL.Query().Get("stream_id")
 	prefix := r.URL.Query().Get("prefix")
@@ -132,6 +146,7 @@ func (s *Server) handleLogStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"streams": streamStatsDTOs(stats.GetStreams())})
 }
 
+// logRecordDTOs converts protobuf log records into explorer DTOs.
 func logRecordDTOs(records []*logservepb.LogRecord) []logRecordDTO {
 	out := make([]logRecordDTO, 0, len(records))
 	for _, record := range records {
@@ -140,6 +155,8 @@ func logRecordDTOs(records []*logservepb.LogRecord) []logRecordDTO {
 	return out
 }
 
+// logRecordDTOFromProto chooses the most useful payload representation without
+// losing binary data.
 func logRecordDTOFromProto(record *logservepb.LogRecord) logRecordDTO {
 	out := logRecordDTO{
 		StreamID:       record.GetStreamId(),
@@ -165,6 +182,7 @@ func logRecordDTOFromProto(record *logservepb.LogRecord) logRecordDTO {
 	return out
 }
 
+// streamStatsDTOs converts protobuf stream stats into JSON DTOs.
 func streamStatsDTOs(stats []*logservepb.StreamStats) []streamStatsDTO {
 	out := make([]streamStatsDTO, 0, len(stats))
 	for _, stat := range stats {
@@ -180,6 +198,7 @@ func streamStatsDTOs(stats []*logservepb.StreamStats) []streamStatsDTO {
 	return out
 }
 
+// uint64Query parses an unsigned integer query parameter with a fallback.
 func uint64Query(r *http.Request, name string, fallback uint64) (uint64, error) {
 	value := r.URL.Query().Get(name)
 	if value == "" {
@@ -192,6 +211,8 @@ func uint64Query(r *http.Request, name string, fallback uint64) (uint64, error) 
 	return parsed, nil
 }
 
+// uint32Query parses an unsigned integer query parameter and rejects values that
+// cannot fit into uint32.
 func uint32Query(r *http.Request, name string, fallback uint32) (uint32, error) {
 	value, err := uint64Query(r, name, uint64(fallback))
 	if err != nil {

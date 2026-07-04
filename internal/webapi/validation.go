@@ -1,5 +1,8 @@
 package webapi
 
+// This file normalizes backend enum values, scheduling-policy aliases, and
+// terminal-state checks for polling handlers.
+
 import (
 	"fmt"
 	"strings"
@@ -7,6 +10,7 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// taskStatusString converts control-plane task enums into stable console labels.
 func taskStatusString(status logservepb.TaskStatus) string {
 	switch status {
 	case logservepb.TaskStatus_TASK_STATUS_QUEUED:
@@ -22,6 +26,7 @@ func taskStatusString(status logservepb.TaskStatus) string {
 	}
 }
 
+// workflowStatusString converts workflow enums into stable console labels.
 func workflowStatusString(status logservepb.WorkflowStatus) string {
 	switch status {
 	case logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING:
@@ -35,6 +40,8 @@ func workflowStatusString(status logservepb.WorkflowStatus) string {
 	}
 }
 
+// workflowStepStatusString converts workflow step enums into stable console
+// labels.
 func workflowStepStatusString(status logservepb.WorkflowStepStatus) string {
 	switch status {
 	case logservepb.WorkflowStepStatus_WORKFLOW_STEP_STATUS_SCHEDULED:
@@ -50,6 +57,7 @@ func workflowStepStatusString(status logservepb.WorkflowStepStatus) string {
 	}
 }
 
+// actorStatusString converts actor enums into stable console labels.
 func actorStatusString(status logservepb.ActorStatus) string {
 	switch status {
 	case logservepb.ActorStatus_ACTOR_STATUS_ACTIVE:
@@ -61,6 +69,7 @@ func actorStatusString(status logservepb.ActorStatus) string {
 	}
 }
 
+// schedulingPolicyString converts scheduler policy enums into API strings.
 func schedulingPolicyString(policy logservepb.SchedulingPolicy) string {
 	switch policy {
 	case logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY:
@@ -74,6 +83,8 @@ func schedulingPolicyString(policy logservepb.SchedulingPolicy) string {
 	}
 }
 
+// parseSchedulingPolicy accepts the console policy aliases and returns the
+// control-plane enum value.
 func parseSchedulingPolicy(value string) (logservepb.SchedulingPolicy, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", "locality-aware", "locality_aware", "locality aware":
@@ -87,10 +98,12 @@ func parseSchedulingPolicy(value string) (logservepb.SchedulingPolicy, error) {
 	}
 }
 
+// terminalTaskStatus reports whether wait loops can stop polling a task.
 func terminalTaskStatus(status string) bool {
 	return status == "SUCCEEDED" || status == "FAILED"
 }
 
+// terminalWorkflowStatus reports whether wait loops can stop polling a workflow.
 func terminalWorkflowStatus(status string) bool {
 	return status == "COMPLETED" || status == "FAILED"
 }

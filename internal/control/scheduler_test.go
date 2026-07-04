@@ -11,6 +11,7 @@ import (
 	"github.com/logserve/logserve/internal/metadata"
 )
 
+// TestSchedulerAssignsGeneralFIFO verifies general tasks are assigned FIFO.
 func TestSchedulerAssignsGeneralFIFO(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.Enqueue(SchedMeta{TaskID: "task-1", CreatedAtMs: 1})
@@ -24,6 +25,8 @@ func TestSchedulerAssignsGeneralFIFO(t *testing.T) {
 	}
 }
 
+// TestSchedulerTargetWorkerPrecedesGeneralQueue verifies targeted work wins for its
+// worker without blocking other workers from general work.
 func TestSchedulerTargetWorkerPrecedesGeneralQueue(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.Enqueue(SchedMeta{TaskID: "general", CreatedAtMs: 1})
@@ -40,6 +43,8 @@ func TestSchedulerTargetWorkerPrecedesGeneralQueue(t *testing.T) {
 	}
 }
 
+// TestSchedulerActorCommandSeqGatesPerActorQueue verifies actor queues wait for the
+// next expected command sequence and do not block general tasks.
 func TestSchedulerActorCommandSeqGatesPerActorQueue(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.Enqueue(SchedMeta{TaskID: "actor-future", ActorID: "actor-1", CommandSeq: 2, CreatedAtMs: 1})
@@ -65,6 +70,8 @@ func TestSchedulerActorCommandSeqGatesPerActorQueue(t *testing.T) {
 	}
 }
 
+// TestSchedulerPrunesEmptyActorPendingQueue verifies drained actor queues are removed
+// and recreated on later enqueue.
 func TestSchedulerPrunesEmptyActorPendingQueue(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.Enqueue(SchedMeta{TaskID: "actor-ready", ActorID: "actor-1", CommandSeq: 1, CreatedAtMs: 1})
@@ -88,6 +95,8 @@ func TestSchedulerPrunesEmptyActorPendingQueue(t *testing.T) {
 	}
 }
 
+// TestSchedulerLLMLocalityUsesModelIndex verifies cached workers get LLM work before
+// cold workers while locality wait is active.
 func TestSchedulerLLMLocalityUsesModelIndex(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.UpsertWorker(metadata.Worker{
@@ -121,6 +130,8 @@ func TestSchedulerLLMLocalityUsesModelIndex(t *testing.T) {
 	}
 }
 
+// TestSchedulerColdWorkerCanTakeLLMAfterLocalityWait verifies cold workers can take
+// LLM tasks once cached workers are unavailable or the wait has elapsed.
 func TestSchedulerColdWorkerCanTakeLLMAfterLocalityWait(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.UpsertWorker(metadata.Worker{
@@ -139,6 +150,8 @@ func TestSchedulerColdWorkerCanTakeLLMAfterLocalityWait(t *testing.T) {
 	}
 }
 
+// TestSchedulerDeadlineHeapReturnsOnlyExpiredLeases verifies stale heap entries are
+// ignored and only currently tracked expired leases are returned.
 func TestSchedulerDeadlineHeapReturnsOnlyExpiredLeases(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.TrackRunning("slow", 200, 1)
@@ -160,6 +173,8 @@ func TestSchedulerDeadlineHeapReturnsOnlyExpiredLeases(t *testing.T) {
 	}
 }
 
+// BenchmarkSchedulerAssignMixedBacklog measures assignment over mixed actor, LLM,
+// targeted, and general queues.
 func BenchmarkSchedulerAssignMixedBacklog(b *testing.B) {
 	for _, depth := range []int{1000, 10000, 100000} {
 		for _, workers := range []int{1, 10, 100, 1000} {
@@ -180,6 +195,7 @@ func BenchmarkSchedulerAssignMixedBacklog(b *testing.B) {
 	}
 }
 
+// mixedBacklogScheduler builds a synthetic mixed scheduler backlog for benchmarks.
 func mixedBacklogScheduler(depth, workers int) *Scheduler {
 	scheduler := newScheduler()
 	for i := 0; i < workers; i++ {
@@ -222,6 +238,7 @@ func mixedBacklogScheduler(depth, workers int) *Scheduler {
 	return scheduler
 }
 
+// mustAssignScheduler assigns one task or fails the test.
 func mustAssignScheduler(t *testing.T, scheduler *Scheduler, snapshot workerSnapshot, now ...int64) SchedMeta {
 	t.Helper()
 	nowMs := int64(0)
@@ -235,10 +252,13 @@ func mustAssignScheduler(t *testing.T, scheduler *Scheduler, snapshot workerSnap
 	return meta
 }
 
+// schedulerAssignAll accepts every scheduler candidate.
 func schedulerAssignAll(SchedMeta) schedulerDecision {
 	return schedulerAssign
 }
 
+// TestSchedulerPreferredLocalityWorkerUsesPlacement verifies the placement index
+// chooses cached workers and falls back when cached capacity is full.
 func TestSchedulerPreferredLocalityWorkerUsesPlacement(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.UpsertWorker(metadata.Worker{
@@ -274,6 +294,8 @@ func TestSchedulerPreferredLocalityWorkerUsesPlacement(t *testing.T) {
 	}
 }
 
+// TestSchedulerAssignSkipsRejectedLLMAndFallsBackToGeneral verifies a skipped LLM
+// candidate does not hide assignable general work.
 func TestSchedulerAssignSkipsRejectedLLMAndFallsBackToGeneral(t *testing.T) {
 	scheduler := newScheduler()
 	scheduler.Enqueue(SchedMeta{TaskID: "llm", ModelName: "model-A", ModelVersion: "v1", CreatedAtMs: 1})
@@ -298,6 +320,8 @@ func TestSchedulerAssignSkipsRejectedLLMAndFallsBackToGeneral(t *testing.T) {
 
 var _ = logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE
 
+// TestPollTaskIndexedDoesNotLetActorAndLLMBacklogBlockGeneral verifies unrelated
+// general work can dispatch despite blocked actor and LLM queues.
 func TestPollTaskIndexedDoesNotLetActorAndLLMBacklogBlockGeneral(t *testing.T) {
 	t.Setenv("LOGSERVE_SCHEDULER_V2", "1")
 	meta := metadata.NewMemoryStore()
@@ -369,6 +393,8 @@ func TestPollTaskIndexedDoesNotLetActorAndLLMBacklogBlockGeneral(t *testing.T) {
 	}
 }
 
+// TestRedeliveryIndexedRequeuesOnlyTrackedExpiredLease verifies indexed redelivery
+// only touches leases tracked by the scheduler deadline heap.
 func TestRedeliveryIndexedRequeuesOnlyTrackedExpiredLease(t *testing.T) {
 	t.Setenv("LOGSERVE_SCHEDULER_V2", "1")
 	meta := metadata.NewMemoryStore()
@@ -420,6 +446,8 @@ func TestRedeliveryIndexedRequeuesOnlyTrackedExpiredLease(t *testing.T) {
 	}
 }
 
+// TestPollTaskIndexedAssignsLLMToCachedWorker verifies scheduler v2 dispatches LLM
+// work to a worker that reports the model as cached.
 func TestPollTaskIndexedAssignsLLMToCachedWorker(t *testing.T) {
 	t.Setenv("LOGSERVE_SCHEDULER_V2", "1")
 	meta := metadata.NewMemoryStore()

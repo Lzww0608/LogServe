@@ -1,5 +1,8 @@
 package webapi
 
+// This file implements workflow list, submit, detail, replay, validation, and
+// wait-polling endpoints.
+
 import (
 	"encoding/json"
 	"net/http"
@@ -10,6 +13,8 @@ import (
 	"github.com/logserve/logserve/internal/workflow"
 )
 
+// submitWorkflowRequest is the JSON shape for workflow submission and validation.
+// It supports either definition or definition_json for frontend compatibility.
 type submitWorkflowRequest struct {
 	WorkflowName   string          `json:"workflow_name"`
 	Definition     json.RawMessage `json:"definition"`
@@ -17,6 +22,8 @@ type submitWorkflowRequest struct {
 	IdempotencyKey string          `json:"idempotency_key"`
 }
 
+// handleListWorkflows filters dashboard workflows by status and applies shared
+// pagination.
 func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
 	dashboard, err := s.dashboard(r)
 	if err != nil {
@@ -45,6 +52,8 @@ func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSubmitWorkflow validates raw workflow JSON, submits it to the control
+// plane, and optionally waits for terminal status.
 func (s *Server) handleSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 	var input submitWorkflowRequest
 	if err := decodeJSON(w, r, &input); err != nil {
@@ -78,6 +87,7 @@ func (s *Server) handleSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, dto)
 }
 
+// handleGetWorkflow reads detailed workflow status from the control plane.
 func (s *Server) handleGetWorkflow(w http.ResponseWriter, r *http.Request) {
 	workflowID := r.PathValue("workflow_id")
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
@@ -90,6 +100,8 @@ func (s *Server) handleGetWorkflow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, workflowStatusDTO(resp))
 }
 
+// handleReplayWorkflow returns the workflow state reconstructed from logs plus a
+// consistency flag against metadata state.
 func (s *Server) handleReplayWorkflow(w http.ResponseWriter, r *http.Request) {
 	workflowID := r.PathValue("workflow_id")
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
@@ -106,6 +118,8 @@ func (s *Server) handleReplayWorkflow(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleValidateWorkflow parses workflow JSON locally and returns a normalized
+// definition without submitting it to the control plane.
 func (s *Server) handleValidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	var input submitWorkflowRequest
 	if err := decodeJSON(w, r, &input); err != nil {
@@ -132,6 +146,8 @@ func (s *Server) handleValidateWorkflow(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// waitWorkflow polls workflow status until completion/failure or timeout,
+// returning the latest observed workflow on timeout.
 func (s *Server) waitWorkflow(r *http.Request, workflowID string, timeout time.Duration) (WorkflowDTO, error) {
 	ctx, cancel := requestContext(r, timeout)
 	defer cancel()

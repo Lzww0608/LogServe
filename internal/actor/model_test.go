@@ -1,3 +1,5 @@
+// Tests in package actor cover replay compatibility and payload encoding
+// behavior that the control plane depends on for actor recovery.
 package actor
 
 import (
@@ -8,12 +10,17 @@ import (
 	"github.com/logserve/logserve/internal/eventcodec"
 )
 
+// mapResultLoader is a test snapshot loader backed by in-memory byte slices.
 type mapResultLoader map[string][]byte
 
+// LoadResult returns a defensive copy so tests exercise replay ownership of
+// loaded snapshot bytes.
 func (l mapResultLoader) LoadResult(ref string) ([]byte, error) {
 	return append([]byte(nil), l[ref]...), nil
 }
 
+// TestReplayRestoresOwnerAndEpochFromSnapshotAndTailCommands verifies snapshot
+// hydration followed by tail-command replay preserves owner, epoch, and state.
 func TestReplayRestoresOwnerAndEpochFromSnapshotAndTailCommands(t *testing.T) {
 	records := []*logservepb.LogRecord{
 		actorRecord(t, "ActorSnapshotCreated", EventPayload{
@@ -65,6 +72,8 @@ func TestReplayRestoresOwnerAndEpochFromSnapshotAndTailCommands(t *testing.T) {
 	}
 }
 
+// actorRecord builds a protobuf log record with the legacy JSON payload form
+// used by compatibility tests.
 func actorRecord(t *testing.T, eventType string, payload EventPayload) *logservepb.LogRecord {
 	t.Helper()
 	data, err := json.Marshal(payload)
@@ -79,6 +88,8 @@ func actorRecord(t *testing.T, eventType string, payload EventPayload) *logserve
 	}
 }
 
+// TestActorEventPayloadBinaryAndJSONFallback verifies new binary payloads and
+// legacy JSON payloads both decode into the same actor event fields.
 func TestActorEventPayloadBinaryAndJSONFallback(t *testing.T) {
 	payload := EventPayload{
 		ActorID:              "actor-1",
@@ -117,11 +128,13 @@ func TestActorEventPayloadBinaryAndJSONFallback(t *testing.T) {
 	}
 }
 
+// TestActorEventPayloadRecordsByteSizes verifies eventcodec payload maps retain
+// byte-size metadata for large JSON fields.
 func TestActorEventPayloadRecordsByteSizes(t *testing.T) {
 	fields := eventPayloadMap(EventPayload{
-		ArgsJSON:    json.RawMessage(`{"args":[1]}`),
-		ResultJSON:  json.RawMessage(`{"ok":true}`),
-		StateJSON:   json.RawMessage(`{"value":3}`),
+		ArgsJSON:   json.RawMessage(`{"args":[1]}`),
+		ResultJSON: json.RawMessage(`{"ok":true}`),
+		StateJSON:  json.RawMessage(`{"value":3}`),
 	})
 	if got := eventcodec.Int64Value(fields["args_json_bytes"]); got != int64(len(`{"args":[1]}`)) {
 		t.Fatalf("args_json_bytes = %d, want %d", got, len(`{"args":[1]}`))

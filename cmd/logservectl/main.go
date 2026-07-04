@@ -1,3 +1,6 @@
+// Command logservectl is a JSON-oriented CLI for the control-plane gRPC API.
+// Mutating commands read request bodies from stdin and successful commands write
+// JSON to stdout so shell scripts can compose task, workflow, actor, and LLM calls.
 package main
 
 import (
@@ -15,6 +18,8 @@ import (
 	"google.golang.org/grpc"
 )
 
+// submitInput is the stdin payload for submitting a Python task. Args and
+// kwargs stay raw so the CLI does not reinterpret user JSON before gRPC.
 type submitInput struct {
 	TaskName       string          `json:"task_name"`
 	FunctionName   string          `json:"function_name"`
@@ -26,6 +31,7 @@ type submitInput struct {
 	IdempotencyKey string          `json:"idempotency_key"`
 }
 
+// submitOutput is the terminal task result printed after submit polling ends.
 type submitOutput struct {
 	TaskID string          `json:"task_id"`
 	Status string          `json:"status"`
@@ -33,12 +39,16 @@ type submitOutput struct {
 	Error  string          `json:"error,omitempty"`
 }
 
+// workflowSubmitInput carries a workflow definition exactly as provided by the
+// caller; validation of the definition happens in the control plane.
 type workflowSubmitInput struct {
 	WorkflowName   string          `json:"workflow_name"`
 	Definition     json.RawMessage `json:"definition"`
 	IdempotencyKey string          `json:"idempotency_key"`
 }
 
+// workflowOutput is shared by status-like workflow commands and includes
+// replay consistency only when a replay command can compute it.
 type workflowOutput struct {
 	WorkflowID string                          `json:"workflow_id"`
 	Status     string                          `json:"status"`
@@ -49,6 +59,8 @@ type workflowOutput struct {
 	Consistent bool                            `json:"consistent_with_metadata,omitempty"`
 }
 
+// actorCreateInput describes actor construction plus the optional snapshot
+// cadence forwarded to the runtime.
 type actorCreateInput struct {
 	ClassName      string          `json:"class_name"`
 	ClassSource    string          `json:"class_source"`
@@ -58,6 +70,8 @@ type actorCreateInput struct {
 	SnapshotEvery  uint32          `json:"snapshot_every"`
 }
 
+// actorCallInput describes one actor method invocation. TimeoutMs is forwarded
+// to the runtime and also shapes the client's own RPC deadline.
 type actorCallInput struct {
 	ActorID        string          `json:"actor_id"`
 	MethodName     string          `json:"method_name"`
@@ -67,6 +81,8 @@ type actorCallInput struct {
 	TimeoutMs      int64           `json:"timeout_ms"`
 }
 
+// modelRegisterInput maps directly to ModelInfo registration for mock or
+// external model adapters.
 type modelRegisterInput struct {
 	Name      string `json:"name"`
 	Version   string `json:"version"`
@@ -75,10 +91,13 @@ type modelRegisterInput struct {
 	Adapter   string `json:"adapter"`
 }
 
+// schedulerPolicyInput accepts policy names in CLI-friendly aliases before
+// converting them to protobuf enum values.
 type schedulerPolicyInput struct {
 	Policy string `json:"policy"`
 }
 
+// llmSubmitInput is the stdin payload for LLM task submission.
 type llmSubmitInput struct {
 	ModelName      string `json:"model_name"`
 	ModelVersion   string `json:"model_version"`
@@ -88,12 +107,16 @@ type llmSubmitInput struct {
 	IdempotencyKey string `json:"idempotency_key"`
 }
 
+// backpressureInput updates scheduler thresholds that influence queueing,
+// redelivery, and slow log append handling.
 type backpressureInput struct {
 	QueueHighWatermark  uint32 `json:"queue_high_watermark"`
 	RedeliveryTimeoutMs int64  `json:"redelivery_timeout_ms"`
 	LogAppendSlowMs     int64  `json:"log_append_slow_ms"`
 }
 
+// llmOutput combines task status with replay-time model/cache metrics when
+// those fields are available from the control plane.
 type llmOutput struct {
 	TaskID             string                 `json:"task_id"`
 	Status             string                 `json:"status,omitempty"`
@@ -113,6 +136,8 @@ type llmOutput struct {
 	Events             []*logservepb.LLMEvent `json:"events,omitempty"`
 }
 
+// actorOutput is the CLI's stable JSON envelope for actor creation, calls,
+// status, and replay diagnostics.
 type actorOutput struct {
 	ActorID                string          `json:"actor_id"`
 	CallID                 string          `json:"call_id,omitempty"`
@@ -131,6 +156,8 @@ type actorOutput struct {
 	SnapshotReplayCommands uint64          `json:"snapshot_replay_commands,omitempty"`
 }
 
+// main dispatches the first CLI argument to a subcommand and reports any
+// command error through the shared fatal path.
 func main() {
 	if len(os.Args) < 2 {
 		fatal(errors.New("usage: logservectl <submit|status|workflow-submit|workflow-status|workflow-replay|model-register|scheduler-policy|llm-submit|llm-replay|backpressure-set|dashboard-snapshot|actor-create|actor-call|actor-status|actor-replay>"))
@@ -201,6 +228,8 @@ func main() {
 	}
 }
 
+// submit reads a task request from stdin, submits it, and polls until the task
+// reaches a terminal state or the command timeout expires.
 func submit(args []string) error {
 	fs := flag.NewFlagSet("submit", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -267,6 +296,8 @@ func submit(args []string) error {
 	}
 }
 
+// status fetches the current task state for a task id and prints the
+// control-plane response as CLI JSON.
 func status(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -292,6 +323,8 @@ func status(args []string) error {
 	return writeJSON(resp)
 }
 
+// workflowSubmit queues a workflow and polls status so batch callers receive a
+// single terminal JSON document rather than a queued-only acknowledgement.
 func workflowSubmit(args []string) error {
 	fs := flag.NewFlagSet("workflow-submit", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -364,6 +397,7 @@ func workflowSubmit(args []string) error {
 	}
 }
 
+// workflowStatus fetches workflow metadata without replaying log history.
 func workflowStatus(args []string) error {
 	fs := flag.NewFlagSet("workflow-status", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -389,6 +423,8 @@ func workflowStatus(args []string) error {
 	return writeJSON(resp)
 }
 
+// workflowReplay reconstructs workflow state from log history and reports
+// whether the replayed state matches current metadata.
 func workflowReplay(args []string) error {
 	fs := flag.NewFlagSet("workflow-replay", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -423,6 +459,8 @@ func workflowReplay(args []string) error {
 	})
 }
 
+// modelRegister reads model metadata from stdin, fills CLI defaults, and
+// registers the model with the control plane.
 func modelRegister(args []string) error {
 	fs := flag.NewFlagSet("model-register", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -467,6 +505,8 @@ func modelRegister(args []string) error {
 	return writeJSON(resp.GetModel())
 }
 
+// schedulerPolicy reads the desired scheduling policy from stdin and applies
+// it through the control-plane API.
 func schedulerPolicy(args []string) error {
 	fs := flag.NewFlagSet("scheduler-policy", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -500,6 +540,8 @@ func schedulerPolicy(args []string) error {
 	return writeJSON(map[string]string{"policy": schedulingPolicyString(resp.GetPolicy())})
 }
 
+// llmSubmit queues an LLM request and polls the backing task status until the
+// request succeeds, fails, or the command timeout expires.
 func llmSubmit(args []string) error {
 	fs := flag.NewFlagSet("llm-submit", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -566,6 +608,8 @@ func llmSubmit(args []string) error {
 	}
 }
 
+// llmReplay returns the recorded LLM execution events plus cache and latency
+// metrics recovered from the control plane replay path.
 func llmReplay(args []string) error {
 	fs := flag.NewFlagSet("llm-replay", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -605,6 +649,8 @@ func llmReplay(args []string) error {
 	})
 }
 
+// backpressureSet updates queue and redelivery thresholds used by the
+// scheduler backpressure logic.
 func backpressureSet(args []string) error {
 	fs := flag.NewFlagSet("backpressure-set", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -638,6 +684,7 @@ func backpressureSet(args []string) error {
 	return writeJSON(resp)
 }
 
+// dashboardSnapshot retrieves a point-in-time control-plane dashboard view.
 func dashboardSnapshot(args []string) error {
 	fs := flag.NewFlagSet("dashboard-snapshot", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -659,6 +706,8 @@ func dashboardSnapshot(args []string) error {
 	return writeJSON(resp)
 }
 
+// actorCreate wraps raw init args into the runtime's args/kwargs envelope and
+// returns the actor identity assigned by the control plane.
 func actorCreate(args []string) error {
 	fs := flag.NewFlagSet("actor-create", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -706,6 +755,8 @@ func actorCreate(args []string) error {
 	})
 }
 
+// actorCall forwards one method invocation and returns the task-like result
+// produced by the actor runtime.
 func actorCall(args []string) error {
 	fs := flag.NewFlagSet("actor-call", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -727,6 +778,8 @@ func actorCall(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Give the client deadline a small envelope beyond the actor method timeout
+	// so the server can return a terminal failure instead of a transport timeout.
 	timeout := time.Duration(input.TimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -763,6 +816,8 @@ func actorCall(args []string) error {
 	return writeJSON(out)
 }
 
+// actorStatus fetches the current actor metadata snapshot without replaying
+// the actor command log.
 func actorStatus(args []string) error {
 	fs := flag.NewFlagSet("actor-status", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -788,6 +843,8 @@ func actorStatus(args []string) error {
 	return writeJSON(actorStatusOutput(resp))
 }
 
+// actorReplay rebuilds actor state from the log and includes replay counters so
+// callers can compare full-log and snapshot-assisted recovery cost.
 func actorReplay(args []string) error {
 	fs := flag.NewFlagSet("actor-replay", flag.ContinueOnError)
 	controlAddr := fs.String("control-addr", getenv("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052"), "control service address")
@@ -817,17 +874,22 @@ func actorReplay(args []string) error {
 	return writeJSON(out)
 }
 
+// writeJSON is the only stdout writer for successful commands; HTML escaping is
+// disabled so raw JSON payloads stay readable and round-trippable.
 func writeJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
 	return enc.Encode(v)
 }
 
+// fatal writes command errors to stderr and exits with status 1.
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, err)
 	os.Exit(1)
 }
 
+// getenv provides environment defaults for flags without treating empty
+// variables as intentional overrides.
 func getenv(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -835,6 +897,8 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// defaultRaw supplies the runtime's default JSON envelopes for omitted args
+// and kwargs while preserving any caller-provided raw JSON verbatim.
 func defaultRaw(value json.RawMessage, fallback []byte) json.RawMessage {
 	if len(value) == 0 {
 		return fallback
@@ -842,6 +906,7 @@ func defaultRaw(value json.RawMessage, fallback []byte) json.RawMessage {
 	return value
 }
 
+// taskStatusString maps protobuf task status values to stable CLI strings.
 func taskStatusString(status logservepb.TaskStatus) string {
 	switch status {
 	case logservepb.TaskStatus_TASK_STATUS_QUEUED:
@@ -857,6 +922,7 @@ func taskStatusString(status logservepb.TaskStatus) string {
 	}
 }
 
+// actorStatusString maps protobuf actor status values to stable CLI strings.
 func actorStatusString(status logservepb.ActorStatus) string {
 	switch status {
 	case logservepb.ActorStatus_ACTOR_STATUS_ACTIVE:
@@ -868,6 +934,8 @@ func actorStatusString(status logservepb.ActorStatus) string {
 	}
 }
 
+// parseSchedulingPolicy accepts both enum-style and CLI-style spellings so
+// scripts do not need to depend on protobuf constant names.
 func parseSchedulingPolicy(value string) (logservepb.SchedulingPolicy, error) {
 	switch value {
 	case "", "LOCALITY_AWARE", "locality-aware", "locality_aware":
@@ -881,6 +949,7 @@ func parseSchedulingPolicy(value string) (logservepb.SchedulingPolicy, error) {
 	}
 }
 
+// schedulingPolicyString maps protobuf scheduling policies to CLI output strings.
 func schedulingPolicyString(policy logservepb.SchedulingPolicy) string {
 	switch policy {
 	case logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY:
@@ -894,6 +963,7 @@ func schedulingPolicyString(policy logservepb.SchedulingPolicy) string {
 	}
 }
 
+// actorStatusOutput keeps status and replay commands on the same JSON shape.
 func actorStatusOutput(resp *logservepb.GetActorStatusResponse) actorOutput {
 	return actorOutput{
 		ActorID:              resp.GetActorId(),

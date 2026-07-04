@@ -1,5 +1,8 @@
 package webapi
 
+// This file implements polling-backed Server-Sent Events for dashboard, task,
+// workflow, and raw log stream updates.
+
 import (
 	"bytes"
 	"encoding/json"
@@ -18,6 +21,8 @@ const (
 	maxEventPollInterval     = 10 * time.Second
 )
 
+// eventSubscription describes one polling-backed SSE stream: dashboard, task,
+// workflow, or raw log records.
 type eventSubscription struct {
 	TaskID     string
 	StreamID   string
@@ -27,6 +32,8 @@ type eventSubscription struct {
 	Interval   time.Duration
 }
 
+// handleEvents implements SSE by polling the selected source and only emitting
+// when the serialized payload changes.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	sub, err := parseEventSubscription(r)
 	if err != nil {
@@ -52,6 +59,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flusher.Flush()
+	// Keep an owned copy of the last payload because the next marshal result may be
+	// reused or replaced before comparison.
 	last := append([]byte(nil), data...)
 
 	ticker := time.NewTicker(sub.Interval)
@@ -80,6 +89,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// parseEventSubscription converts query parameters into a concrete SSE polling
+// mode and validates mutually exclusive task/log subscriptions.
 func parseEventSubscription(r *http.Request) (eventSubscription, error) {
 	query := r.URL.Query()
 	taskID := strings.TrimSpace(query.Get("task_id"))
@@ -96,6 +107,8 @@ func parseEventSubscription(r *http.Request) (eventSubscription, error) {
 	if streamID == "" {
 		return sub, nil
 	}
+	// Workflow log streams default to workflow-summary events; records=true forces
+	// raw log-record streaming for the same stream.
 	if strings.HasPrefix(streamID, "wf:") && !recordsOnly {
 		sub.WorkflowID = strings.TrimSpace(strings.TrimPrefix(streamID, "wf:"))
 		if sub.WorkflowID == "" {
@@ -119,6 +132,7 @@ func parseEventSubscription(r *http.Request) (eventSubscription, error) {
 	return sub, nil
 }
 
+// boolQuery parses common truthy query values for feature toggles.
 func boolQuery(raw string) bool {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "1", "true", "yes", "y", "on":
@@ -127,6 +141,9 @@ func boolQuery(raw string) bool {
 		return false
 	}
 }
+
+// eventPollInterval parses interval_ms and clamps it to protect the backend from
+// overly aggressive polling.
 func eventPollInterval(raw string) (time.Duration, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -146,6 +163,8 @@ func eventPollInterval(raw string) (time.Duration, error) {
 	return interval, nil
 }
 
+// nextEventPayload reads the current state for one subscription and returns the
+// SSE event name plus serialized JSON payload.
 func (s *Server) nextEventPayload(r *http.Request, sub *eventSubscription) (string, []byte, error) {
 	switch {
 	case sub.TaskID != "":
@@ -179,6 +198,8 @@ func (s *Server) nextEventPayload(r *http.Request, sub *eventSubscription) (stri
 	}
 }
 
+// eventTask fetches task status and merges dashboard metadata for richer SSE
+// task updates.
 func (s *Server) eventTask(r *http.Request, taskID string) (TaskDTO, error) {
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
 	defer cancel()
@@ -193,6 +214,7 @@ func (s *Server) eventTask(r *http.Request, taskID string) (TaskDTO, error) {
 	return dto, nil
 }
 
+// eventWorkflow fetches detailed workflow status for a workflow SSE update.
 func (s *Server) eventWorkflow(r *http.Request, workflowID string) (WorkflowDTO, error) {
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
 	defer cancel()
@@ -203,12 +225,15 @@ func (s *Server) eventWorkflow(r *http.Request, workflowID string) (WorkflowDTO,
 	return workflowStatusDTO(resp), nil
 }
 
+// logRecordsEventPayload is the SSE payload for raw log-record subscriptions.
 type logRecordsEventPayload struct {
 	StreamID string         `json:"stream_id"`
 	Records  []logRecordDTO `json:"records"`
 	NextSeq  uint64         `json:"next_seq"`
 }
 
+// eventLogRecords reads the next log batch and advances the subscription cursor
+// to avoid re-sending already delivered records.
 func (s *Server) eventLogRecords(r *http.Request, sub *eventSubscription) (logRecordsEventPayload, error) {
 	ctx, cancel := requestContext(r, s.cfg.RequestTimeout)
 	defer cancel()
@@ -227,6 +252,7 @@ func (s *Server) eventLogRecords(r *http.Request, sub *eventSubscription) (logRe
 	return logRecordsEventPayload{StreamID: sub.StreamID, Records: records, NextSeq: nextSeq}, nil
 }
 
+// writeSSE writes one Server-Sent Event frame with a single JSON data line.
 func writeSSE(w http.ResponseWriter, eventName string, data []byte) error {
 	if _, err := fmt.Fprintf(w, "event: %s\n", eventName); err != nil {
 		return err

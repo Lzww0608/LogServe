@@ -1,3 +1,5 @@
+// SSE client helpers for dashboard, task, workflow, and log streaming.
+
 import { APIError, getStoredToken, requestID } from "./client.js";
 
 export type EventStreamOptions = {
@@ -15,6 +17,7 @@ export type SSEMessage = {
   data: string;
 };
 
+// Build the SSE subscription URL from supported dashboard/task/log filters.
 export function createEventStreamURL(options: EventStreamOptions = {}): string {
   const params = new URLSearchParams();
   if (options.taskID) params.set("task_id", options.taskID);
@@ -27,9 +30,11 @@ export function createEventStreamURL(options: EventStreamOptions = {}): string {
   return query ? `/api/events?${query}` : "/api/events";
 }
 
+// Accumulate partial SSE chunks and emit only complete blank-line-delimited messages.
 export function parseSSEChunk(buffer: string, chunk: string): { buffer: string; messages: SSEMessage[] } {
   let pending = (buffer + chunk).replace(/\r\n/g, "\n");
   const messages: SSEMessage[] = [];
+  // Keep the incomplete tail in buffer; SSE frames are complete only after a blank line.
   let boundary = pending.indexOf("\n\n");
   while (boundary >= 0) {
     const rawMessage = pending.slice(0, boundary);
@@ -41,6 +46,7 @@ export function parseSSEChunk(buffer: string, chunk: string): { buffer: string; 
   return { buffer: pending, messages };
 }
 
+// Parse one SSE frame, preserving multi-line data fields and ignoring comments.
 function parseSSEMessage(rawMessage: string): SSEMessage | null {
   let event = "message";
   const data: string[] = [];
@@ -58,14 +64,17 @@ function parseSSEMessage(rawMessage: string): SSEMessage | null {
   return { event, data: data.join("\n") };
 }
 
+// Remove the optional single leading space allowed after SSE field colons.
 function trimSSEValue(value: string): string {
   return value.startsWith(" ") ? value.slice(1) : value;
 }
 
+// Decode a typed JSON payload from one parsed SSE message.
 export function parseEventData<T>(message: SSEMessage): T {
   return JSON.parse(message.data) as T;
 }
 
+// Convert backend error events into the same APIError shape used by fetch calls.
 function eventStreamError(message: SSEMessage): Error {
   try {
     const payload = JSON.parse(message.data) as { message?: unknown; error?: { message?: unknown } };
@@ -80,6 +89,7 @@ function eventStreamError(message: SSEMessage): Error {
   }
 }
 
+// Dispatch parsed SSE messages, stopping immediately on backend error events.
 function deliverMessages(messages: SSEMessage[], onMessage: (message: SSEMessage) => void): void {
   for (const message of messages) {
     if (message.event === "error") {
@@ -89,6 +99,7 @@ function deliverMessages(messages: SSEMessage[], onMessage: (message: SSEMessage
   }
 }
 
+// Open an authenticated SSE stream and feed decoded messages until EOF or abort.
 export async function consumeEventStream(
   options: EventStreamOptions,
   onMessage: (message: SSEMessage) => void,

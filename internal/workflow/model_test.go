@@ -11,6 +11,7 @@ import (
 	"github.com/logserve/logserve/internal/logrecord"
 )
 
+// TestParseDefinitionRejectsInvalidDAG verifies validation rejects missing result steps, unknown dependencies, cycles, and duplicate IDs.
 func TestParseDefinitionRejectsInvalidDAG(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -64,6 +65,7 @@ func TestParseDefinitionRejectsInvalidDAG(t *testing.T) {
 	}
 }
 
+// TestParseDefinitionDefaultsResultStepToLastStep verifies legacy definitions without result_step_id use the last step.
 func TestParseDefinitionDefaultsResultStepToLastStep(t *testing.T) {
 	def, err := ParseDefinition([]byte(`{
 		"steps":[
@@ -79,6 +81,7 @@ func TestParseDefinitionDefaultsResultStepToLastStep(t *testing.T) {
 	}
 }
 
+// TestWorkflowEventPayloadBinaryAndJSONFallback verifies binary workflow events and legacy JSON payloads decode to the same fields.
 func TestWorkflowEventPayloadBinaryAndJSONFallback(t *testing.T) {
 	payload := EventPayload{
 		WorkflowID:     "wf-1",
@@ -116,6 +119,7 @@ func TestWorkflowEventPayloadBinaryAndJSONFallback(t *testing.T) {
 	}
 }
 
+// TestReplayRawEachConsumesRawWorkflowRecords verifies raw replay applies workflow start and scheduling records without protobuf conversion.
 func TestReplayRawEachConsumesRawWorkflowRecords(t *testing.T) {
 	definition := json.RawMessage(`{"workflow_name":"wf","steps":[{"step_id":"step-1","task_name":"task","function_name":"fn","function_source":"def fn():\n    return 1\n"}],"result_step_id":"step-1"}`)
 	started, err := MarshalEventPayload(EventPayload{DefinitionJSON: definition, TimestampMs: 10})
@@ -144,6 +148,7 @@ func TestReplayRawEachConsumesRawWorkflowRecords(t *testing.T) {
 	}
 }
 
+// TestReplayRawEachRestoresResolvedArgsCache verifies replayed StepScheduled events preserve the cached resolved args payload.
 func TestReplayRawEachRestoresResolvedArgsCache(t *testing.T) {
 	definition := json.RawMessage(`{"workflow_name":"wf","steps":[{"step_id":"step-1","task_name":"task","function_name":"fn","function_source":"def fn():\n    return 1\n"}],"result_step_id":"step-1"}`)
 	started, err := MarshalEventPayload(EventPayload{DefinitionJSON: definition, TimestampMs: 10})
@@ -192,14 +197,18 @@ func TestReplayRawEachRestoresResolvedArgsCache(t *testing.T) {
 	}
 }
 
+// errFailingLoader marks tests where cached args must avoid dereferencing result refs.
 var errFailingLoader = errors.New("result loader should not be called")
 
+// failingResultLoader fails any unexpected attempt to load a referenced result during cached resolution tests.
 type failingResultLoader struct{}
 
+// LoadResult implements ResultLoader and always fails so cache-only paths are observable.
 func (failingResultLoader) LoadResult(string) ([]byte, error) {
 	return nil, errFailingLoader
 }
 
+// TestResolveCachedArgsUsesStepCache verifies cached resolved args bypass recursive reference resolution.
 func TestResolveCachedArgsUsesStepCache(t *testing.T) {
 	args, hash, err := ResolveCachedArgs(
 		StepDefinition{StepID: "step-1", ArgsJSON: json.RawMessage(`{"args":[{"__step_ref__":"dep"}],"kwargs":{}}`)},
@@ -215,6 +224,7 @@ func TestResolveCachedArgsUsesStepCache(t *testing.T) {
 	}
 }
 
+// TestRuntimeDAGReadyQueueUsesTopologicalOrder verifies topological ordering and downstream readiness after dependency success.
 func TestRuntimeDAGReadyQueueUsesTopologicalOrder(t *testing.T) {
 	def, err := ParseDefinition([]byte(`{
 		"result_step_id":"b",
@@ -245,6 +255,7 @@ func TestRuntimeDAGReadyQueueUsesTopologicalOrder(t *testing.T) {
 	}
 }
 
+// TestStateJSONAcceptsLegacyStepMapAndRebuildsRuntime verifies old map-shaped state JSON still restores a schedulable runtime DAG.
 func TestStateJSONAcceptsLegacyStepMapAndRebuildsRuntime(t *testing.T) {
 	def, err := ParseDefinition([]byte(`{
 		"result_step_id":"b",

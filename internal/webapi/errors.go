@@ -1,5 +1,8 @@
 package webapi
 
+// This file centralizes the JSON error envelope and maps gRPC/local errors
+// onto HTTP status codes used by the console.
+
 import (
 	"encoding/json"
 	"errors"
@@ -10,22 +13,28 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// errorBody is the stable JSON envelope for API errors.
 type errorBody struct {
 	Error apiError `json:"error"`
 }
 
+// apiError carries machine-readable code, user-facing message, and optional
+// structured details.
 type apiError struct {
 	Code    string         `json:"code"`
 	Message string         `json:"message"`
 	Details map[string]any `json:"details,omitempty"`
 }
 
+// writeAPIError writes one error response using the webapi error envelope.
 func writeAPIError(w http.ResponseWriter, httpStatus int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatus)
 	_ = json.NewEncoder(w).Encode(errorBody{Error: apiError{Code: code, Message: message}})
 }
 
+// writeErr translates gRPC status errors and local validation failures into HTTP
+// status codes while preserving the original message.
 func writeErr(w http.ResponseWriter, err error) {
 	if err == nil {
 		return

@@ -15,8 +15,13 @@ import (
 	"github.com/logserve/logserve/internal/workflow"
 )
 
+// This file rebuilds control-plane metadata from durable log streams during
+// startup, preferring metadata checkpoints when available and falling back to
+// full stream replay when needed.
 const bootstrapReadLimit = 1000
 
+// BootstrapFromLog restores system configuration, functions, tasks, workflows,
+// actors, and LLM statistics from the log before the service starts serving work.
 func (s *Service) BootstrapFromLog(ctx context.Context) error {
 	if err := s.bootstrapModels(ctx); err != nil {
 		return err
@@ -37,6 +42,8 @@ func (s *Service) BootstrapFromLog(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// A checkpoint is an optimization only; if checkpoint bootstrap fails, the full log
+	// replay path below remains the correctness fallback.
 	if checkpoint != nil {
 		checkpoint.normalizeStreamKinds()
 		if err := s.bootstrapMetadataFromCheckpoint(ctx, *checkpoint); err != nil {
@@ -61,6 +68,8 @@ func (s *Service) BootstrapFromLog(ctx context.Context) error {
 	return nil
 }
 
+// bootstrapTasks replays every task stream and restores task metadata plus queue or
+// scheduler membership for non-terminal tasks.
 func (s *Service) bootstrapTasks(ctx context.Context) error {
 	streams, err := s.listStreams(ctx, "task:")
 	if err != nil {
@@ -82,6 +91,9 @@ func (s *Service) bootstrapTasks(ctx context.Context) error {
 	}
 	return nil
 }
+
+// replayTaskSpec is a compatibility helper that replays task state from an in-memory
+// slice of protobuf log records.
 func replayTaskSpec(records []*logservepb.LogRecord) (*logservepb.TaskSpec, logservepb.TaskStatus, uint64, bool, error) {
 	return replayTaskSpecEach(func(emit func(*logservepb.LogRecord) error) error {
 		for _, rec := range records {
@@ -93,6 +105,8 @@ func replayTaskSpec(records []*logservepb.LogRecord) (*logservepb.TaskSpec, logs
 	})
 }
 
+// replayTaskSpecEach reconstructs the latest task spec, status, and lease epoch
+// from ordered task lifecycle records.
 func replayTaskSpecEach(iterate func(func(*logservepb.LogRecord) error) error) (*logservepb.TaskSpec, logservepb.TaskStatus, uint64, bool, error) {
 	var spec *logservepb.TaskSpec
 	status := logservepb.TaskStatus_TASK_STATUS_QUEUED
@@ -159,11 +173,16 @@ func replayTaskSpecEach(iterate func(func(*logservepb.LogRecord) error) error) (
 		return nil, status, leaseEpoch, false, nil
 	}
 	spec.TaskLeaseEpoch = leaseEpoch
+	// In-flight work cannot be trusted after a control restart, so replay exposes it
+	// as queued for redelivery instead of running.
 	if status == logservepb.TaskStatus_TASK_STATUS_RUNNING {
 		status = logservepb.TaskStatus_TASK_STATUS_QUEUED
 	}
 	return spec, status, leaseEpoch, true, nil
 }
+
+// taskTerminalEventApplies decides whether a terminal event belongs to the active
+// lease rather than a lease that was later redelivered.
 func taskTerminalEventApplies(status logservepb.TaskStatus, currentLeaseEpoch, redeliveredLeaseEpoch uint64, payload []byte) bool {
 	if isTerminalTaskStatus(status) {
 		return false
@@ -178,10 +197,12 @@ func taskTerminalEventApplies(status logservepb.TaskStatus, currentLeaseEpoch, r
 	return eventLeaseEpoch == currentLeaseEpoch && eventLeaseEpoch > redeliveredLeaseEpoch
 }
 
+// taskEventLeaseEpoch extracts the lease epoch from a lifecycle payload.
 func taskEventLeaseEpoch(payload []byte) uint64 {
 	return decodeTaskLifecyclePayload(payload).TaskLeaseEpoch
 }
 
+// bootstrapModels replays registered model definitions from the system model stream.
 func (s *Service) bootstrapModels(ctx context.Context) error {
 	return s.forEachRawLogRecord(ctx, "system:models", 1, func(rec logrecord.RawRecord) error {
 		if rec.EventType != "ModelRegistered" {
@@ -196,6 +217,8 @@ func (s *Service) bootstrapModels(ctx context.Context) error {
 	})
 }
 
+// bootstrapWorkers replays worker registrations and refreshes scheduler indexes for
+// their cached model and capacity metadata.
 func (s *Service) bootstrapWorkers(ctx context.Context) error {
 	return s.forEachRawLogRecord(ctx, "system:workers", 1, func(rec logrecord.RawRecord) error {
 		if rec.EventType != "WorkerRegistered" {
@@ -237,6 +260,7 @@ func (s *Service) bootstrapWorkers(ctx context.Context) error {
 	})
 }
 
+// bootstrapScheduler restores the latest persisted scheduling policy if one exists.
 func (s *Service) bootstrapScheduler(ctx context.Context) error {
 	var policy logservepb.SchedulingPolicy
 	if err := s.forEachRawLogRecord(ctx, "system:scheduler", 1, func(rec logrecord.RawRecord) error {
@@ -264,6 +288,7 @@ func (s *Service) bootstrapScheduler(ctx context.Context) error {
 	return nil
 }
 
+// bootstrapBackpressure restores the latest persisted backpressure configuration.
 func (s *Service) bootstrapBackpressure(ctx context.Context) error {
 	var payload struct {
 		QueueHighWatermark uint32 `json:"queue_high_watermark"`
@@ -292,10 +317,13 @@ func (s *Service) bootstrapBackpressure(ctx context.Context) error {
 	return nil
 }
 
+// bootstrapWorkflows restores workflows and reschedules runnable steps.
 func (s *Service) bootstrapWorkflows(ctx context.Context) error {
 	return s.bootstrapWorkflowsWithScheduling(ctx, true)
 }
 
+// bootstrapWorkflowsWithScheduling replays workflow streams and optionally recreates
+// queued step tasks and schedules ready work.
 func (s *Service) bootstrapWorkflowsWithScheduling(ctx context.Context, schedule bool) error {
 	streams, err := s.listStreams(ctx, "wf:")
 	if err != nil {
@@ -325,6 +353,9 @@ func (s *Service) bootstrapWorkflowsWithScheduling(ctx context.Context, schedule
 	}
 	return nil
 }
+
+// prepareRetryableFailedSteps converts failed-but-retryable running workflow steps
+// back into a retryable state before scheduling after restart.
 func (s *Service) prepareRetryableFailedSteps(state *workflow.State) {
 	if state.Status != logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING {
 		return
@@ -340,6 +371,8 @@ func (s *Service) prepareRetryableFailedSteps(state *workflow.State) {
 	}
 }
 
+// restoreWorkflowTasks recreates queued task metadata and specs for workflow steps
+// that were scheduled or started when the control process stopped.
 func (s *Service) restoreWorkflowTasks(state workflow.State) error {
 	if state.Status != logservepb.WorkflowStatus_WORKFLOW_STATUS_RUNNING {
 		return nil
@@ -408,6 +441,7 @@ func (s *Service) restoreWorkflowTasks(state workflow.State) error {
 	return nil
 }
 
+// bootstrapActors replays actor streams and upserts their latest materialized state.
 func (s *Service) bootstrapActors(ctx context.Context) error {
 	streams, err := s.listStreams(ctx, "actor:")
 	if err != nil {
@@ -426,6 +460,7 @@ func (s *Service) bootstrapActors(ctx context.Context) error {
 	return nil
 }
 
+// listStreams asks the log service for streams under a logical prefix.
 func (s *Service) listStreams(ctx context.Context, prefix string) ([]string, error) {
 	resp, err := s.log.ListStreams(ctx, &logservepb.ListStreamsRequest{Prefix: prefix})
 	if err != nil {
@@ -434,6 +469,7 @@ func (s *Service) listStreams(ctx context.Context, prefix string) ([]string, err
 	return resp.GetStreamIds(), nil
 }
 
+// containsTaskID reports whether the legacy FIFO queue already contains a task ID.
 func containsTaskID(taskIDs []string, taskID string) bool {
 	for _, existing := range taskIDs {
 		if existing == taskID {
@@ -443,6 +479,8 @@ func containsTaskID(taskIDs []string, taskID string) bool {
 	return false
 }
 
+// LogBootstrapResult records bootstrap success or failure and returns the original
+// error for caller control flow.
 func (s *Service) LogBootstrapResult(err error) error {
 	if err != nil {
 		observability.Error("control_bootstrap_failed", err, nil)

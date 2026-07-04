@@ -1,5 +1,8 @@
 package metadata
 
+// This file adapts the in-memory metadata Store to PostgreSQL. Mutations update
+// memory first, then persist either synchronously or through the async materializer.
+
 import (
 	"context"
 	"database/sql"
@@ -18,9 +21,13 @@ import (
 	"github.com/logserve/logserve/internal/workflow"
 )
 
+// migrationsFS embeds the schema migration applied when a PostgresStore is opened.
+//
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+// PostgresStore wraps a memory Store with PostgreSQL persistence. The memory store
+// remains the read path and PostgreSQL is the durable projection of mutations.
 type PostgresStore struct {
 	memory       Store
 	db           *sql.DB
@@ -31,13 +38,19 @@ type PostgresStore struct {
 	last         error
 }
 
+// PostgresWriteMode controls whether mutation calls wait for SQL writes.
 type PostgresWriteMode string
 
+// Postgres write modes choose whether the caller waits for SQL durability or
+// only for an enqueue into the asynchronous materializer.
 const (
-	PostgresWriteModeSync  PostgresWriteMode = "sync"
+	// PostgresWriteModeSync returns SQL persistence errors from mutation calls.
+	PostgresWriteModeSync PostgresWriteMode = "sync"
+	// PostgresWriteModeAsync returns after memory mutation and materializer enqueue.
 	PostgresWriteModeAsync PostgresWriteMode = "async"
 )
 
+// PostgresOptions configures sync/async write behavior and async batch sizing.
 type PostgresOptions struct {
 	Mode          PostgresWriteMode
 	BatchMax      int
@@ -45,10 +58,13 @@ type PostgresOptions struct {
 	QueueSize     int
 }
 
+// OpenPostgresStore opens a Postgres-backed store with default write options.
 func OpenPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 	return OpenPostgresStoreWithOptions(ctx, dsn, PostgresOptions{})
 }
 
+// OpenPostgresStoreWithOptions opens the database, waits for connectivity, applies
+// migrations, and returns a Store wrapper using the requested write mode.
 func OpenPostgresStoreWithOptions(ctx context.Context, dsn string, opts PostgresOptions) (*PostgresStore, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("postgres dsn is required")
@@ -69,6 +85,8 @@ func OpenPostgresStoreWithOptions(ctx context.Context, dsn string, opts Postgres
 	return store, nil
 }
 
+// pingPostgres retries until the database accepts connections, ctx is canceled,
+// or the timeout expires.
 func pingPostgres(ctx context.Context, db *sql.DB, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var last error
@@ -84,15 +102,21 @@ func pingPostgres(ctx context.Context, db *sql.DB, timeout time.Duration) error 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+
+		// Use a fixed short delay so startup tolerates container/database boot races
+		// without hiding long outages beyond the explicit timeout.
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
 
+// NewPostgresStore wraps an existing DB handle in synchronous persistence mode.
 func NewPostgresStore(db *sql.DB) *PostgresStore {
 	return NewPostgresStoreWithOptions(db, PostgresOptions{})
 }
 
+// NewPostgresStoreWithOptions wraps an existing DB handle and starts the
+// materializer when async writes are requested.
 func NewPostgresStoreWithOptions(db *sql.DB, opts PostgresOptions) *PostgresStore {
 	opts = normalizePostgresOptions(opts)
 	store := &PostgresStore{memory: NewMemoryStore(), db: db, mode: opts.Mode}
@@ -103,6 +127,8 @@ func NewPostgresStoreWithOptions(db *sql.DB, opts PostgresOptions) *PostgresStor
 	return store
 }
 
+// normalizePostgresOptions lowercases write mode input and fills conservative
+// async batching defaults.
 func normalizePostgresOptions(opts PostgresOptions) PostgresOptions {
 	switch PostgresWriteMode(strings.ToLower(strings.TrimSpace(string(opts.Mode)))) {
 	case PostgresWriteModeAsync:
@@ -122,6 +148,7 @@ func normalizePostgresOptions(opts PostgresOptions) PostgresOptions {
 	return opts
 }
 
+// ApplyMigrations executes the embedded schema SQL against the configured DB.
 func (s *PostgresStore) ApplyMigrations(ctx context.Context) error {
 	data, err := migrationsFS.ReadFile("migrations/001_init.sql")
 	if err != nil {
@@ -131,6 +158,8 @@ func (s *PostgresStore) ApplyMigrations(ctx context.Context) error {
 	return err
 }
 
+// Close flushes pending async metadata before closing the database handle and
+// reports the first error observed.
 func (s *PostgresStore) Close() error {
 	var firstErr error
 	if s.materializer != nil {
@@ -149,16 +178,22 @@ func (s *PostgresStore) Close() error {
 	return firstErr
 }
 
+// LastError returns the last remembered persistence error, including async flush
+// failures reported by the materializer.
 func (s *PostgresStore) LastError() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.last
 }
 
+// NonBlockingPersistence reports whether mutations enqueue durable writes instead
+// of waiting for SQL execution.
 func (s *PostgresStore) NonBlockingPersistence() bool {
 	return s != nil && s.mode == PostgresWriteModeAsync
 }
 
+// MaterializerStats exposes async flush state and returns a sync-mode placeholder
+// when no materializer is configured.
 func (s *PostgresStore) MaterializerStats() MaterializerStats {
 	mode := string(PostgresWriteModeSync)
 	if s != nil && s.mode != "" {
@@ -170,6 +205,7 @@ func (s *PostgresStore) MaterializerStats() MaterializerStats {
 	return s.materializer.Stats(mode)
 }
 
+// Flush waits for all queued async metadata writes; it is a no-op in sync mode.
 func (s *PostgresStore) Flush(ctx context.Context) error {
 	if s == nil || s.materializer == nil {
 		return nil
@@ -177,17 +213,23 @@ func (s *PostgresStore) Flush(ctx context.Context) error {
 	return s.materializer.Flush(ctx)
 }
 
+// remember stores the last persistence error under a small mutex.
 func (s *PostgresStore) remember(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.last = err
 }
 
+// recordPersist records sync write results immediately, while async mode records
+// enqueue errors here and lets the materializer clear or set LastError on flush.
 func (s *PostgresStore) recordPersist(err error) {
 	if err != nil || !s.NonBlockingPersistence() {
 		s.remember(err)
 	}
 }
+
+// CreateTask updates memory first and persists only newly created tasks;
+// idempotent duplicates do not rewrite PostgreSQL.
 func (s *PostgresStore) CreateTask(task Task, idempotencyKey string) (Task, bool) {
 	created, duplicate := s.memory.CreateTask(task, idempotencyKey)
 	if !duplicate {
@@ -196,18 +238,23 @@ func (s *PostgresStore) CreateTask(task Task, idempotencyKey string) (Task, bool
 	return created, duplicate
 }
 
+// GetTask reads from the memory projection.
 func (s *PostgresStore) GetTask(taskID string) (Task, bool) {
 	return s.memory.GetTask(taskID)
 }
 
+// GetTaskByIdempotencyKey reads the memory idempotency index.
 func (s *PostgresStore) GetTaskByIdempotencyKey(idempotencyKey string) (Task, bool) {
 	return s.memory.GetTaskByIdempotencyKey(idempotencyKey)
 }
 
+// ListTasks snapshots tasks from memory rather than querying PostgreSQL.
 func (s *PostgresStore) ListTasks() []Task {
 	return s.memory.ListTasks()
 }
 
+// LeaseTask updates the memory lease first, then persists or enqueues the new
+// task state. Sync mode returns persistence errors to the caller.
 func (s *PostgresStore) LeaseTask(taskID, workerID string) (Task, error) {
 	task, err := s.memory.LeaseTask(taskID, workerID)
 	if err != nil {
@@ -222,10 +269,14 @@ func (s *PostgresStore) LeaseTask(taskID, workerID string) (Task, error) {
 	s.recordPersist(nil)
 	return task, nil
 }
+
+// ValidateTaskLease checks the in-memory lease fence without touching PostgreSQL.
 func (s *PostgresStore) ValidateTaskLease(taskID, workerID string, leaseEpoch uint64) (Task, error) {
 	return s.memory.ValidateTaskLease(taskID, workerID, leaseEpoch)
 }
 
+// RequeueExpiredRunningTasks requeues expired leases in memory and persists each
+// changed task state.
 func (s *PostgresStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task {
 	tasks := s.memory.RequeueExpiredRunningTasks(maxAge)
 	for _, task := range tasks {
@@ -234,6 +285,8 @@ func (s *PostgresStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task 
 	return tasks
 }
 
+// RequeueTaskIfLeaseExpired persists the targeted requeue only when the lease
+// actually expired and changed state.
 func (s *PostgresStore) RequeueTaskIfLeaseExpired(taskID string, leaseEpoch uint64, maxAge time.Duration) (Task, bool) {
 	task, requeued := s.memory.RequeueTaskIfLeaseExpired(taskID, leaseEpoch, maxAge)
 	if requeued {
@@ -242,6 +295,8 @@ func (s *PostgresStore) RequeueTaskIfLeaseExpired(taskID string, leaseEpoch uint
 	return task, requeued
 }
 
+// CompleteTask commits the in-memory result after lease validation, then persists
+// the completed task state.
 func (s *PostgresStore) CompleteTask(taskID, workerID string, leaseEpoch uint64, status logservepb.TaskStatus, resultJSON []byte, taskErr string) (Task, error) {
 	task, err := s.memory.CompleteTask(taskID, workerID, leaseEpoch, status, resultJSON, taskErr)
 	if err != nil {
@@ -256,20 +311,27 @@ func (s *PostgresStore) CompleteTask(taskID, workerID string, leaseEpoch uint64,
 	s.recordPersist(nil)
 	return task, nil
 }
+
+// RegisterModel updates the memory registry and persists the normalized model
+// record.
 func (s *PostgresStore) RegisterModel(model *logservepb.ModelInfo) *logservepb.ModelInfo {
 	registered := s.memory.RegisterModel(model)
 	s.recordPersist(s.persistModelOrEnqueue(registered))
 	return registered
 }
 
+// GetModel reads the memory model registry.
 func (s *PostgresStore) GetModel(name, version string) (*logservepb.ModelInfo, bool) {
 	return s.memory.GetModel(name, version)
 }
 
+// ListModels snapshots the memory model registry.
 func (s *PostgresStore) ListModels() []*logservepb.ModelInfo {
 	return s.memory.ListModels()
 }
 
+// CreateWorkflow updates memory and persists only the first state for an
+// idempotency key.
 func (s *PostgresStore) CreateWorkflow(state workflow.State, idempotencyKey string) (workflow.State, bool) {
 	created, duplicate := s.memory.CreateWorkflow(state, idempotencyKey)
 	if !duplicate {
@@ -278,18 +340,23 @@ func (s *PostgresStore) CreateWorkflow(state workflow.State, idempotencyKey stri
 	return created, duplicate
 }
 
+// GetWorkflow reads workflow state from memory.
 func (s *PostgresStore) GetWorkflow(workflowID string) (workflow.State, bool) {
 	return s.memory.GetWorkflow(workflowID)
 }
 
+// GetWorkflowByIdempotencyKey reads the memory workflow idempotency index.
 func (s *PostgresStore) GetWorkflowByIdempotencyKey(idempotencyKey string) (workflow.State, bool) {
 	return s.memory.GetWorkflowByIdempotencyKey(idempotencyKey)
 }
 
+// ListWorkflows snapshots workflows from memory.
 func (s *PostgresStore) ListWorkflows() []workflow.State {
 	return s.memory.ListWorkflows()
 }
 
+// UpdateWorkflow applies the memory mutation and persists the resulting snapshot
+// if the callback succeeds.
 func (s *PostgresStore) UpdateWorkflow(workflowID string, fn func(*workflow.State) error) (workflow.State, error) {
 	state, err := s.memory.UpdateWorkflow(workflowID, fn)
 	if err != nil {
@@ -304,35 +371,45 @@ func (s *PostgresStore) UpdateWorkflow(workflowID string, fn func(*workflow.Stat
 	s.recordPersist(nil)
 	return state, nil
 }
+
+// UpsertWorkflow replaces memory state and persists that snapshot.
 func (s *PostgresStore) UpsertWorkflow(state workflow.State) {
 	s.memory.UpsertWorkflow(state)
 	s.recordPersist(s.persistWorkflowOrEnqueue(state))
 }
 
+// UpsertWorker refreshes memory, then persists the normalized worker snapshot
+// read back from the memory store.
 func (s *PostgresStore) UpsertWorker(worker Worker) {
 	s.memory.UpsertWorker(worker)
 	current, _ := s.memory.GetWorker(worker.WorkerID)
 	s.recordPersist(s.persistWorkerOrEnqueue(current))
 }
 
+// GetWorker reads worker state from memory.
 func (s *PostgresStore) GetWorker(workerID string) (Worker, bool) {
 	return s.memory.GetWorker(workerID)
 }
 
+// ActiveWorkers returns scheduler-visible memory workers filtered by heartbeat.
 func (s *PostgresStore) ActiveWorkers(maxAge time.Duration) []Worker {
 	return s.memory.ActiveWorkers(maxAge)
 }
 
+// ListWorkers snapshots workers from memory.
 func (s *PostgresStore) ListWorkers() []Worker {
 	return s.memory.ListWorkers()
 }
 
+// Heartbeat updates memory liveness immediately and persists the worker snapshot.
 func (s *PostgresStore) Heartbeat(workerID string, cachedModels map[string]bool) (Worker, bool) {
 	worker, existed := s.memory.Heartbeat(workerID, cachedModels)
 	s.recordPersist(s.persistWorkerOrEnqueue(worker))
 	return worker, existed
 }
 
+// IncrementWorkerLoad changes the memory load counter and persists the refreshed
+// worker when it exists.
 func (s *PostgresStore) IncrementWorkerLoad(workerID string) {
 	s.memory.IncrementWorkerLoad(workerID)
 	if worker, ok := s.memory.GetWorker(workerID); ok {
@@ -340,6 +417,8 @@ func (s *PostgresStore) IncrementWorkerLoad(workerID string) {
 	}
 }
 
+// DecrementWorkerLoad changes the memory load counter and persists the refreshed
+// worker when it exists.
 func (s *PostgresStore) DecrementWorkerLoad(workerID string) {
 	s.memory.DecrementWorkerLoad(workerID)
 	if worker, ok := s.memory.GetWorker(workerID); ok {
@@ -347,6 +426,7 @@ func (s *PostgresStore) DecrementWorkerLoad(workerID string) {
 	}
 }
 
+// CreateActor stores actor state in memory and persists only new actor records.
 func (s *PostgresStore) CreateActor(state actor.State, idempotencyKey string) (actor.State, bool) {
 	created, duplicate := s.memory.CreateActor(state, idempotencyKey)
 	if !duplicate {
@@ -355,18 +435,23 @@ func (s *PostgresStore) CreateActor(state actor.State, idempotencyKey string) (a
 	return created, duplicate
 }
 
+// GetActor reads actor state from memory.
 func (s *PostgresStore) GetActor(actorID string) (actor.State, bool) {
 	return s.memory.GetActor(actorID)
 }
 
+// GetActorByIdempotencyKey reads the memory actor idempotency index.
 func (s *PostgresStore) GetActorByIdempotencyKey(idempotencyKey string) (actor.State, bool) {
 	return s.memory.GetActorByIdempotencyKey(idempotencyKey)
 }
 
+// ListActors snapshots actor state from memory.
 func (s *PostgresStore) ListActors() []actor.State {
 	return s.memory.ListActors()
 }
 
+// UpdateActor applies a memory actor mutation and persists the resulting snapshot
+// when the callback succeeds.
 func (s *PostgresStore) UpdateActor(actorID string, fn func(*actor.State) error) (actor.State, error) {
 	state, err := s.memory.UpdateActor(actorID, fn)
 	if err != nil {
@@ -381,15 +466,21 @@ func (s *PostgresStore) UpdateActor(actorID string, fn func(*actor.State) error)
 	s.recordPersist(nil)
 	return state, nil
 }
+
+// UpsertActor replaces memory actor state and persists that snapshot.
 func (s *PostgresStore) UpsertActor(state actor.State) {
 	s.memory.UpsertActor(state)
 	s.recordPersist(s.persistActorOrEnqueue(state))
 }
 
+// sqlExecutor is the common subset shared by *sql.DB and *sql.Tx for persistence
+// helpers.
 type sqlExecutor interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+// persistTaskOrEnqueue writes task state now in sync mode or enqueues a cloned
+// delta in async mode.
 func (s *PostgresStore) persistTaskOrEnqueue(task Task) error {
 	if !s.NonBlockingPersistence() {
 		return s.persistTask(context.Background(), task)
@@ -397,6 +488,8 @@ func (s *PostgresStore) persistTaskOrEnqueue(task Task) error {
 	return s.enqueueDelta(DeltaTask, task.TaskID, cloneTask(task))
 }
 
+// persistModelOrEnqueue writes model metadata now or enqueues a cloned async
+// delta.
 func (s *PostgresStore) persistModelOrEnqueue(model *logservepb.ModelInfo) error {
 	if !s.NonBlockingPersistence() {
 		return s.persistModel(context.Background(), model)
@@ -404,6 +497,8 @@ func (s *PostgresStore) persistModelOrEnqueue(model *logservepb.ModelInfo) error
 	return s.enqueueDelta(DeltaModel, ModelKey(model.GetName(), model.GetVersion()), cloneModel(model))
 }
 
+// persistWorkflowOrEnqueue writes workflow state now or enqueues a cloned async
+// delta.
 func (s *PostgresStore) persistWorkflowOrEnqueue(state workflow.State) error {
 	if !s.NonBlockingPersistence() {
 		return s.persistWorkflow(context.Background(), state)
@@ -411,6 +506,8 @@ func (s *PostgresStore) persistWorkflowOrEnqueue(state workflow.State) error {
 	return s.enqueueDelta(DeltaWorkflow, state.WorkflowID, cloneWorkflow(state))
 }
 
+// persistWorkerOrEnqueue writes worker state now or enqueues a cloned async
+// delta.
 func (s *PostgresStore) persistWorkerOrEnqueue(worker Worker) error {
 	if !s.NonBlockingPersistence() {
 		return s.persistWorker(context.Background(), worker)
@@ -418,6 +515,7 @@ func (s *PostgresStore) persistWorkerOrEnqueue(worker Worker) error {
 	return s.enqueueDelta(DeltaWorker, worker.WorkerID, cloneWorker(worker))
 }
 
+// persistActorOrEnqueue writes actor state now or enqueues a cloned async delta.
 func (s *PostgresStore) persistActorOrEnqueue(state actor.State) error {
 	if !s.NonBlockingPersistence() {
 		return s.persistActor(context.Background(), state)
@@ -425,6 +523,8 @@ func (s *PostgresStore) persistActorOrEnqueue(state actor.State) error {
 	return s.enqueueDelta(DeltaActor, state.ActorID, cloneActor(state))
 }
 
+// enqueueDelta assigns a monotonic version so the materializer can discard older
+// coalesced writes for the same logical key.
 func (s *PostgresStore) enqueueDelta(kind DeltaKind, key string, payload any) error {
 	if s.materializer == nil {
 		return errors.New("metadata materializer is not configured")
@@ -437,6 +537,8 @@ func (s *PostgresStore) enqueueDelta(kind DeltaKind, key string, payload any) er
 	})
 }
 
+// persistDeltas writes a materialized batch in one transaction so coalesced
+// metadata updates become durable together.
 func (s *PostgresStore) persistDeltas(ctx context.Context, deltas []metadataDelta) error {
 	if len(deltas) == 0 {
 		return nil
@@ -445,6 +547,8 @@ func (s *PostgresStore) persistDeltas(ctx context.Context, deltas []metadataDelt
 	if err != nil {
 		return err
 	}
+	// Rollback is intentionally deferred even on success; database/sql treats it
+	// as a no-op after Commit, and it keeps early returns transaction-safe.
 	defer tx.Rollback()
 	for _, delta := range deltas {
 		if err := s.persistDeltaWith(ctx, tx, delta); err != nil {
@@ -454,6 +558,8 @@ func (s *PostgresStore) persistDeltas(ctx context.Context, deltas []metadataDelt
 	return tx.Commit()
 }
 
+// persistDeltaWith validates the concrete delta payload type before dispatching
+// to the table-specific UPSERT helper.
 func (s *PostgresStore) persistDeltaWith(ctx context.Context, exec sqlExecutor, delta metadataDelta) error {
 	switch delta.kind {
 	case DeltaTask:
@@ -490,10 +596,14 @@ func (s *PostgresStore) persistDeltaWith(ctx context.Context, exec sqlExecutor, 
 		return errors.New("unknown metadata delta kind")
 	}
 }
+
+// persistTask writes one task through the store DB handle.
 func (s *PostgresStore) persistTask(ctx context.Context, task Task) error {
 	return s.persistTaskWith(ctx, s.db, task)
 }
 
+// persistTaskWith upserts task_instances and mirrors LLM task metadata into
+// llm_requests when the task names a model.
 func (s *PostgresStore) persistTaskWith(ctx context.Context, exec sqlExecutor, task Task) error {
 	_, err := exec.ExecContext(ctx, `
 INSERT INTO task_instances (
@@ -564,10 +674,13 @@ ON CONFLICT (task_id) DO UPDATE SET
 	return err
 }
 
+// persistModel writes one model registry record through the store DB handle.
 func (s *PostgresStore) persistModel(ctx context.Context, model *logservepb.ModelInfo) error {
 	return s.persistModelWith(ctx, s.db, model)
 }
 
+// persistModelWith upserts a model registry row, applying the same v1/mock
+// defaults as the in-memory store.
 func (s *PostgresStore) persistModelWith(ctx context.Context, exec sqlExecutor, model *logservepb.ModelInfo) error {
 	if model == nil {
 		return nil
@@ -589,11 +702,14 @@ ON CONFLICT (name, version) DO UPDATE SET
 	return err
 }
 
+// persistWorkflow writes workflow instance and step rows in one transaction.
 func (s *PostgresStore) persistWorkflow(ctx context.Context, state workflow.State) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	// Rollback is intentionally deferred even on success; database/sql treats it
+	// as a no-op after Commit, and it keeps early returns transaction-safe.
 	defer tx.Rollback()
 	if err := s.persistWorkflowWith(ctx, tx, state); err != nil {
 		return err
@@ -601,6 +717,8 @@ func (s *PostgresStore) persistWorkflow(ctx context.Context, state workflow.Stat
 	return tx.Commit()
 }
 
+// persistWorkflowWith upserts the workflow header followed by each ordered step
+// snapshot.
 func (s *PostgresStore) persistWorkflowWith(ctx context.Context, exec sqlExecutor, state workflow.State) error {
 	definitionJSON, err := json.Marshal(state.Definition)
 	if err != nil {
@@ -640,6 +758,8 @@ ON CONFLICT (workflow_id) DO UPDATE SET
 		return err
 	}
 
+	// Step order is derived from workflow.State so SQL writes remain deterministic
+	// across map-backed and slice-backed workflow representations.
 	stepStates := state.StepStatesInOrder()
 	for _, step := range stepStates {
 		if _, err := exec.ExecContext(ctx, `
@@ -677,11 +797,14 @@ ON CONFLICT (workflow_id, step_id) DO UPDATE SET
 	return nil
 }
 
+// persistWorker writes a worker and its cached-model rows in one transaction.
 func (s *PostgresStore) persistWorker(ctx context.Context, worker Worker) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	// Rollback is intentionally deferred even on success; database/sql treats it
+	// as a no-op after Commit, and it keeps early returns transaction-safe.
 	defer tx.Rollback()
 	if err := s.persistWorkerWith(ctx, tx, worker); err != nil {
 		return err
@@ -689,6 +812,8 @@ func (s *PostgresStore) persistWorker(ctx context.Context, worker Worker) error 
 	return tx.Commit()
 }
 
+// persistWorkerWith upserts worker metadata and rebuilds the worker model-cache
+// projection from the current snapshot.
 func (s *PostgresStore) persistWorkerWith(ctx context.Context, exec sqlExecutor, worker Worker) error {
 	labelsJSON, err := json.Marshal(worker.Labels)
 	if err != nil {
@@ -712,6 +837,9 @@ ON CONFLICT (worker_id) DO UPDATE SET
 	); err != nil {
 		return err
 	}
+
+	// Rebuild cache rows from scratch so false/removed model entries disappear from
+	// the durable projection.
 	if _, err := exec.ExecContext(ctx, `DELETE FROM worker_model_cache WHERE worker_id = $1`, worker.WorkerID); err != nil {
 		return err
 	}
@@ -721,6 +849,8 @@ ON CONFLICT (worker_id) DO UPDATE SET
 			keys = append(keys, key)
 		}
 	}
+
+	// Sort cache keys to make SQL execution order deterministic for tests and logs.
 	sort.Strings(keys)
 	for _, key := range keys {
 		name, version := splitModelKey(key)
@@ -738,10 +868,13 @@ ON CONFLICT (worker_id, model_name, model_version) DO UPDATE SET updated_at = no
 	return nil
 }
 
+// persistActor writes one actor state through the store DB handle.
 func (s *PostgresStore) persistActor(ctx context.Context, state actor.State) error {
 	return s.persistActorWith(ctx, s.db, state)
 }
 
+// persistActorWith upserts actor_instances, including snapshot and command-count
+// fields used for actor replay/fencing.
 func (s *PostgresStore) persistActorWith(ctx context.Context, exec sqlExecutor, state actor.State) error {
 	_, err := exec.ExecContext(ctx, `
 INSERT INTO actor_instances (
@@ -786,6 +919,8 @@ ON CONFLICT (actor_id) DO UPDATE SET
 	return err
 }
 
+// jsonValue maps empty JSON payloads to SQL NULL and non-empty payloads to jsonb
+// strings.
 func jsonValue(data []byte) any {
 	if len(data) == 0 {
 		return nil
@@ -793,6 +928,7 @@ func jsonValue(data []byte) any {
 	return string(data)
 }
 
+// nullString maps empty Go strings to SQL NULL for optional text fields.
 func nullString(value string) any {
 	if value == "" {
 		return nil
@@ -800,6 +936,7 @@ func nullString(value string) any {
 	return value
 }
 
+// nullTime maps non-positive millisecond timestamps to SQL NULL.
 func nullTime(ms int64) any {
 	if ms <= 0 {
 		return nil
@@ -807,6 +944,8 @@ func nullTime(ms int64) any {
 	return time.UnixMilli(ms)
 }
 
+// msTime converts millisecond timestamps for required columns, using now when
+// callers omitted a timestamp.
 func msTime(ms int64) time.Time {
 	if ms <= 0 {
 		return time.Now()
@@ -814,6 +953,7 @@ func msTime(ms int64) time.Time {
 	return time.UnixMilli(ms)
 }
 
+// firstNonEmpty returns the first non-empty value from a default chain.
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {
@@ -823,6 +963,8 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// splitModelKey parses canonical name:version keys and defaults legacy keys
+// without a separator to version v1.
 func splitModelKey(key string) (string, string) {
 	name, version, ok := strings.Cut(key, ":")
 	if !ok {
