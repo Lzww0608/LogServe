@@ -8,6 +8,7 @@ import { usePolling } from "../hooks/usePolling";
 import type { ConsoleSession } from "../types/logserve";
 import { roleAtLeast } from "../utils/roles";
 
+// Match the backend-friendly default while still allowing URL query overrides.
 const defaultPageSize = 50;
 
 // Render task filters and token-based list pagination.
@@ -27,11 +28,13 @@ export function TasksPage({ session }: { session?: ConsoleSession | null }) {
   const trimmedWorkflowID = workflowID.trim();
   const currentPageToken = pageTokens[pageIndex] ?? "";
 
+  // Any filter change invalidates previously returned opaque page tokens.
   useEffect(() => {
     setPageIndex(0);
     setPageTokens([""]);
   }, [trimmedQuery, status, trimmedWorkerID, trimmedWorkflowID, pageSize]);
 
+  // Memoize the API query object so polling dependencies reflect the opaque page token and active filters.
   const taskQuery = useMemo<TaskListQuery>(() => ({
     q: trimmedQuery,
     status,
@@ -71,6 +74,7 @@ export function TasksPage({ session }: { session?: ConsoleSession | null }) {
         onPrevious: () => setPageIndex((current) => Math.max(0, current - 1)),
         onNext: () => {
           if (!nextToken) return;
+          // Drop forward-history tokens before storing the next token for this filter set.
           setPageTokens((current) => [...current.slice(0, pageIndex + 1), nextToken]);
           setPageIndex((current) => current + 1);
         },

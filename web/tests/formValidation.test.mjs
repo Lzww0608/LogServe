@@ -11,6 +11,7 @@ import {
   validateWorkflowForm
 } from "../.tmp-form-tests/src/utils/formValidation.js";
 
+// The test script compiles source into .tmp-form-tests before running these Node tests.
 // Verifies parseJSONField reports the field and JSON error position.
 test("parseJSONField reports the field and JSON error position", () => {
   const result = parseJSONField("Args JSON", "[1, }", []);

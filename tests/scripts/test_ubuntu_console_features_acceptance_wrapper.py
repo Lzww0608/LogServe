@@ -1,3 +1,4 @@
+# Tests delegation from the feature-specific console acceptance wrapper.
 import unittest
 from pathlib import Path
 
@@ -6,7 +7,9 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "ubuntu_console_features_6_10_acceptance.sh"
 
 
+# UbuntuConsoleFeaturesAcceptanceWrapperTest pins the feature-specific wrapper delegation contract.
 class UbuntuConsoleFeaturesAcceptanceWrapperTest(unittest.TestCase):
+    # test_wrapper_delegates_to_full_console_acceptance_with_feature_result_dir checks canonical feature result naming.
     def test_wrapper_delegates_to_full_console_acceptance_with_feature_result_dir(self):
         text = SCRIPT.read_text(encoding="utf-8")
 

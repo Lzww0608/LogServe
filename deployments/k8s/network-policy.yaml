@@ -1,3 +1,5 @@
+# Default namespace policy for the demo topology: pods may talk to each other
+# and resolve DNS, while other ingress/egress is denied by omission.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -9,9 +11,12 @@ spec:
     - Ingress
     - Egress
   ingress:
+    # Allow only traffic from pods in the same namespace.
     - from:
         - podSelector: {}
   egress:
+    # Internal service calls stay inside the namespace; DNS is the only broader
+    # egress required so pods can resolve ClusterIP service names.
     - to:
         - podSelector: {}
     - to:

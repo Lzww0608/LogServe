@@ -23,8 +23,10 @@ export function WorkflowDetailPage({ workflowID, session }: { workflowID: string
   const [error, setError] = useState("");
   const [replay, setReplay] = useState<unknown>(null);
   const [message, setMessage] = useState("");
+  // Replay is an operator action because it asks the backend to reconstruct workflow state.
   const canReplay = roleAtLeast(session, "operator");
 
+  // Route changes must discard stale workflow/replay state before new SSE snapshots arrive.
   useEffect(() => {
     setWorkflow(undefined);
     setError("");
@@ -49,6 +51,7 @@ export function WorkflowDetailPage({ workflowID, session }: { workflowID: string
     try {
       const replayResult = await api.replayWorkflow(workflowID);
       setReplay(replayResult);
+      // Prefer replayed metadata when present so the DAG reflects the reconstructed state.
       if (replayResult.workflow) setWorkflow(replayResult.workflow);
       setMessage("");
     } catch (error) {
@@ -105,6 +108,7 @@ function ReplaySummary({ replay }: { replay: unknown }) {
 // Recover the optional replay consistency flag from an unknown response shape.
 function replayConsistency(value: unknown): boolean | undefined {
   if (typeof value !== "object" || value === null || !("consistent_with_metadata" in value)) return undefined;
+  // The replay endpoint returns unknown JSON, so narrow just the optional consistency flag.
   const consistent = (value as { consistent_with_metadata?: unknown }).consistent_with_metadata;
   return typeof consistent === "boolean" ? consistent : undefined;
 }

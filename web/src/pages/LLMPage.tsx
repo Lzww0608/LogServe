@@ -17,6 +17,7 @@ import { errorMessage } from "../utils/status";
 
 // Render model registry, LLM submit form, scheduling policy, and replay trace tools.
 export function LLMPage({ session }: { session?: ConsoleSession | null }) {
+  // Poll model metadata so cache/registration changes made by other sessions become visible.
   const modelsState = usePolling(() => api.models(), 1000);
   const [modelName, setModelName] = useState("model-A");
   const [modelVersion, setModelVersion] = useState("v1");
@@ -28,6 +29,7 @@ export function LLMPage({ session }: { session?: ConsoleSession | null }) {
   const [submittedTrace, setSubmittedTrace] = useState<LLMTrace | null>(null);
   const [policy, setPolicy] = useState("LOCALITY_AWARE");
   const [message, setMessage] = useState("");
+  // Model submission/replay is operator-level, while model registration is admin-only.
   const canOperate = roleAtLeast(session, "operator");
   const canAdmin = roleAtLeast(session, "admin");
 
@@ -73,6 +75,7 @@ export function LLMPage({ session }: { session?: ConsoleSession | null }) {
       });
       if (result.task_id) setTaskID(result.task_id);
       setSubmittedTrace(result);
+      // Submit can return only an acknowledgement; defer trace cards until timing fields exist.
       setTrace(hasTimingTrace(result) ? result : null);
     } catch (error) {
       setMessage(errorMessage(error));
@@ -225,6 +228,7 @@ function traceResultText(trace: LLMTrace): string {
   const result = trace.result_json;
   if (typeof result === "string") return result;
   if (typeof result === "object" && result !== null && "text" in result) {
+    // Narrow only the optional text field; other result JSON shapes remain valid raw trace data.
     const text = (result as { text?: unknown }).text;
     return typeof text === "string" ? text : "";
   }

@@ -12,9 +12,11 @@ import { copyToClipboard } from "../utils/clipboard";
 import { payloadPreview } from "../utils/format";
 import { errorMessage } from "../utils/status";
 
+// Keep browser-side log page requests bounded so large payload streams do not freeze the console.
 const defaultRecordPageSize = 50;
 const maxRecordPageSize = 1000;
 const detailPollIntervalMs = 1000;
+// Prefix tabs encode the stream-id conventions used by system, workflow, actor, and LLM logs.
 const prefixTabs = [
   { label: "All", value: "" },
   { label: "System", value: "system:" },
@@ -43,11 +45,13 @@ export function LogsPage() {
 
   const streamIDs = streamsState.data?.stream_ids ?? [];
   const visibleStreamIDs = useMemo(() => {
+    // Stream search is client-side because the backend endpoint filters by prefix only.
     const query = streamQuery.trim().toLowerCase();
     return query ? streamIDs.filter((streamID) => streamID.toLowerCase().includes(query)) : streamIDs;
   }, [streamIDs, streamQuery]);
 
   useEffect(() => {
+    // Keep the selected stream valid after prefix/search filters hide the previous selection.
     if (!visibleStreamIDs.length) {
       if (selectedStream) setSelectedStream("");
       return;
@@ -58,6 +62,7 @@ export function LogsPage() {
   }, [visibleStreamIDs, selectedStream]);
 
   useEffect(() => {
+    // Stream or limit changes reset sequence pagination because previous anchors no longer describe this query.
     setDetail(undefined);
     setDetailError("");
     setRecordPageIndex(0);
@@ -94,6 +99,7 @@ export function LogsPage() {
     };
   }, [selectedStream, currentFromSeq, recordPageSize, autoRefresh]);
 
+  // Index stats by stream id for table lookups without re-scanning the response per row.
   const statsByStream = useMemo(() => {
     const entries = streamsState.data?.stats ?? [];
     return new Map(entries.map((item) => [item.stream_id, item]));
@@ -103,6 +109,7 @@ export function LogsPage() {
   const eventTypes = useMemo(() => Array.from(new Set(rows.map((row) => row.event_type).filter(Boolean))) as string[], [rows]);
   const filteredRows = eventType ? rows.filter((row) => row.event_type === eventType) : rows;
   const nextSeq = detail?.next_seq ?? nextSeqFromRows(rows, currentFromSeq);
+  // A page can advance either because the detail response says so or because stream stats show a newer tail.
   const canNext = nextSeq > currentFromSeq && (Boolean(detail?.has_more) || (stats?.next_seq !== undefined && nextSeq < stats.next_seq));
 
   // Reset record pagination to a user-entered sequence number.
@@ -158,6 +165,7 @@ export function LogsPage() {
               },
               onNext: () => {
                 if (!canNext) return;
+                // Drop forward-history sequence anchors before storing the next page start.
                 setRecordFromSeqs((current) => [...current.slice(0, recordPageIndex + 1), nextSeq]);
                 setFromSeqText(String(nextSeq));
                 setRecordPageIndex((current) => current + 1);

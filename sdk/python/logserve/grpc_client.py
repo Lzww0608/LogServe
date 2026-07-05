@@ -1,4 +1,7 @@
 # Direct Python gRPC transport for the LogServe control-plane API.
+#
+# Generated Python gRPC stubs are not checked in here, so this file binds ControlService
+# methods manually with protobuf serializers from the generated message module.
 import json
 import os
 import time
@@ -14,9 +17,11 @@ class GrpcControlTransport:
     def __init__(self, address="127.0.0.1:50052", *, channel=None, poll_interval_s=0.1, api_token=None):
         self.address = address
         # The Go servers use application-level bearer auth; transport TLS is not configured here.
+        # Injected channels let tests use fakes; the default mirrors the plaintext Go dev services.
         self.channel = channel or grpc.insecure_channel(address)
         self.poll_interval_s = poll_interval_s
         token = api_token if api_token is not None else os.environ.get("LOGSERVE_API_TOKEN", "")
+        # Metadata is captured once per transport so retries/polls reuse the same auth view.
         self._metadata = _auth_metadata(token)
         self._rpc = _ControlRpc(self.channel, self._metadata)
     # Dispatch the same command names used by CLIControlTransport to RPC helpers.
@@ -56,6 +61,8 @@ class GrpcControlTransport:
 
     # Submit a task request and wait until the task reaches a terminal state.
     def _submit_task(self, payload, timeout=None):
+        # Match the Go control-plane executor envelope exactly so gRPC and CLI
+        # transports submit interchangeable task payloads.
         args_json = _json_bytes({"args": payload.get("args", []), "kwargs": payload.get("kwargs", {})})
         resp = self._rpc.SubmitTask(
             pb.SubmitTaskRequest(
@@ -160,6 +167,8 @@ class GrpcControlTransport:
 
     # Create an actor and normalize ownership and epoch metadata.
     def _create_actor(self, payload, timeout=None):
+        # Actor init args use the same {args, kwargs} JSON envelope as task calls,
+        # which keeps Python executor parsing identical for constructors and methods.
         resp = self._rpc.CreateActor(
             pb.CreateActorRequest(
                 class_name=payload.get("class_name", ""),
@@ -246,6 +255,9 @@ class GrpcControlTransport:
 
     # Poll task status until success, failure, or the caller-provided timeout.
     def _wait_task(self, task_id, timeout=None):
+        # timeout is both the per-RPC timeout and the overall polling budget when supplied.
+        # This keeps the public transport API small but means a very small timeout can
+        # fail on either a slow individual RPC or a long-running task.
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             # Reuse the same RPC timeout value per poll; the outer deadline caps total wait time.
@@ -258,6 +270,7 @@ class GrpcControlTransport:
 
     # Poll workflow status until completion, failure, or the caller-provided timeout.
     def _wait_workflow(self, workflow_id, timeout=None):
+        # timeout is both the per-RPC timeout and the overall polling budget when supplied.
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             # Reuse the same RPC timeout value per poll; the outer deadline caps total wait time.
@@ -273,6 +286,8 @@ class GrpcControlTransport:
 class _ControlRpc:
     # Bind each ControlService RPC path to a serializer/deserializer pair.
     def __init__(self, channel, metadata=None):
+        # Method names must match the Go protobuf service exactly because there is
+        # no generated *_pb2_grpc module to catch path drift at import time.
         self.SubmitTask = _unary(channel, metadata, "SubmitTask", pb.SubmitTaskRequest, pb.SubmitTaskResponse)
         self.GetTaskStatus = _unary(channel, metadata, "GetTaskStatus", pb.GetTaskStatusRequest, pb.GetTaskStatusResponse)
         self.SubmitWorkflow = _unary(channel, metadata, "SubmitWorkflow", pb.SubmitWorkflowRequest, pb.SubmitWorkflowResponse)
@@ -315,6 +330,7 @@ def _unary(channel, default_metadata, method, request_cls, response_cls):
 
     # Merge default auth metadata with per-call metadata before invoking gRPC.
     def invoke(request, *, timeout=None, metadata=None):
+        # Start from immutable default metadata, then append any call-specific values without mutating the transport.
         merged_metadata = default_metadata
         if metadata:
             merged_metadata = tuple(default_metadata or ()) + tuple(metadata)
@@ -330,6 +346,8 @@ def _json_bytes(value):
 # Decode optional protobuf JSON bytes into Python values.
 def _decode_json(data):
     if not data:
+        # Empty protobuf bytes mean the backend omitted a JSON value; expose None
+        # rather than forcing callers to distinguish b"" from JSON null.
         return None
     return json.loads(data.decode("utf-8"))
 
@@ -468,6 +486,7 @@ def _actor_status_name(status):
 
 # Parse user-facing scheduling policy aliases into protobuf enum values.
 def _parse_scheduling_policy(value):
+    # Accept CLI-style dashed aliases and protobuf-style enum names through one normalization path.
     normalized = (value or "").replace("-", "_").upper()
     if normalized in ("", "LOCALITY_AWARE"):
         return pb.SCHEDULING_POLICY_LOCALITY_AWARE

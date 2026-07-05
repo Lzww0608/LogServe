@@ -1,10 +1,17 @@
+# Experiment overlay for scripts/run_experiment.sh. It reuses the base Compose
+# topology but mounts script-provided host directories so benchmark artifacts,
+# logstore state, checkpoint source files, and model caches are inspectable.
 services:
   logd:
     environment:
       LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
     volumes:
+      # The experiment harness owns this host path and can preserve or delete it
+      # between fault/recovery runs without affecting the base named volume.
       - ${LOGSERVE_EXPERIMENT_LOGSTORE_DIR:?set LOGSERVE_EXPERIMENT_LOGSTORE_DIR}:/var/lib/logserve/logstore
 
+  # Scheduler v2 is enabled here so experiment runs exercise the newer matching
+  # path without changing the default local Compose file.
   control:
     environment:
       LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
@@ -19,9 +26,13 @@ services:
       LOGSERVE_S3_SECRET_KEY: ${LOGSERVE_S3_SECRET_KEY:?set LOGSERVE_S3_SECRET_KEY}
       LOGSERVE_S3_REGION: ${LOGSERVE_S3_REGION:-us-east-1}
 
+  # Disable the base single worker; the experiment topology below uses explicit
+  # workers with distinct model advertisements and cache directories.
   worker:
     profiles: ["disabled-default-worker"]
 
+  # worker-a and worker-b advertise different model ids to exercise model-aware
+  # routing; each gets a separate cache path under the shared model-cache mount.
   worker-a:
     build:
       context: ..
@@ -66,6 +77,8 @@ services:
     depends_on:
       - control
     volumes:
+      # Checkpoints are read-only inputs; model-cache is writable so the worker
+      # cache implementation can record promotion/eviction behavior per run.
       - ${LOGSERVE_CHECKPOINT_SOURCE_DIR:?set LOGSERVE_CHECKPOINT_SOURCE_DIR}:/var/lib/logserve/checkpoints:ro
       - ${LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR:?set LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR}:/var/lib/logserve/model-cache
     security_opt:
@@ -76,6 +89,8 @@ services:
     cpus: 1.0
     pids_limit: 256
 
+  # worker-b mirrors worker-a with model-B:v1 so benchmark traffic can compare
+  # independent model-specific queues in the same control plane.
   worker-b:
     build:
       context: ..
@@ -120,6 +135,8 @@ services:
     depends_on:
       - control
     volumes:
+      # Checkpoints are read-only inputs; model-cache is writable so the worker
+      # cache implementation can record promotion/eviction behavior per run.
       - ${LOGSERVE_CHECKPOINT_SOURCE_DIR:?set LOGSERVE_CHECKPOINT_SOURCE_DIR}:/var/lib/logserve/checkpoints:ro
       - ${LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR:?set LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR}:/var/lib/logserve/model-cache
     security_opt:
@@ -130,6 +147,8 @@ services:
     cpus: 1.0
     pids_limit: 256
 
+  # worker-c intentionally omits --models, leaving ordinary task capacity in the
+  # experiment while model-specific workers handle LLM-style requests.
   worker-c:
     build:
       context: ..
@@ -172,6 +191,8 @@ services:
     depends_on:
       - control
     volumes:
+      # Checkpoints are read-only inputs; model-cache is writable so the worker
+      # cache implementation can record promotion/eviction behavior per run.
       - ${LOGSERVE_CHECKPOINT_SOURCE_DIR:?set LOGSERVE_CHECKPOINT_SOURCE_DIR}:/var/lib/logserve/checkpoints:ro
       - ${LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR:?set LOGSERVE_EXPERIMENT_MODEL_CACHE_DIR}:/var/lib/logserve/model-cache
     security_opt:

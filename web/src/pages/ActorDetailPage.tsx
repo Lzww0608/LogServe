@@ -17,12 +17,14 @@ import { errorMessage } from "../utils/status";
 
 // Render actor state with method-call and replay actions gated by role.
 export function ActorDetailPage({ actorID, session }: { actorID: string; session?: ConsoleSession | null }) {
+  // Re-poll when the route actor id changes so stale actor snapshots are not reused across detail pages.
   const state = usePolling(() => api.actor(actorID), 1000, [actorID]);
   const [method, setMethod] = useState("inc");
   const [args, setArgs] = useState("[1]");
   const [idempotencyKey, setIdempotencyKey] = useState(defaultID("ui-actor-call"));
   const [callResult, setCallResult] = useState<unknown>(null);
   const [message, setMessage] = useState("");
+  // Actor calls and replay mutate/inspect runtime state, so the UI mirrors the operator gate.
   const canOperate = roleAtLeast(session, "operator");
 
   const validation = useMemo(() => validateActorCallForm(method, args), [method, args]);
@@ -45,6 +47,7 @@ export function ActorDetailPage({ actorID, session }: { actorID: string; session
         args: validation.parsedArgs ?? [],
         kwargs: {},
         idempotency_key: idempotencyKey,
+        // Bound interactive calls so the page cannot wait forever on a stuck actor method.
         timeout_ms: 30000
       }));
     } catch (error) {

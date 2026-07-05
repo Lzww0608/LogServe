@@ -16,15 +16,18 @@ export function CodeEditor({
 }: {
   label: string;
   value: string;
+  // onChange receives the raw editor text on every textarea update.
   onChange: (value: string) => void;
   disabled?: boolean;
   className?: string;
   error?: string;
   language?: "python" | "json" | "text";
+  // onFormat can replace the default whitespace normalizer for language-specific formatting.
   onFormat?: (value: string) => string;
 }) {
   const inputID = useId();
   const labelID = useId();
+  // Scroll offsets keep the transparent textarea, highlight layer, and line numbers aligned.
   const [scroll, setScroll] = useState({ top: 0, left: 0 });
   const lineNumbers = useMemo(() => lineNumberText(value), [value]);
   const highlighted = useMemo(() => highlightCode(value, language), [value, language]);
@@ -89,8 +92,10 @@ function normalizeCode(value: string): string {
 
 // Apply lightweight HTML highlighting after escaping user-controlled source text.
 function highlightCode(value: string, language: "python" | "json" | "text"): string {
+  // A single escaped space keeps the overlay height nonzero for empty editors.
   const escaped = escapeHTML(value || " ");
   if (language === "json") {
+    // JSON highlighting distinguishes object keys from string values by checking the following colon.
     return escaped.replace(/(&quot;[^&]*?&quot;)(\s*:)?|(\btrue\b|\bfalse\b|\bnull\b)|(-?\b\d+(?:\.\d+)?\b)/g, (match, key, colon, literal, number) => {
       if (key) return `<span class="${colon ? "tok-key" : "tok-string"}">${key}</span>${colon ?? ""}`;
       if (literal) return `<span class="tok-keyword">${literal}</span>`;
@@ -99,6 +104,7 @@ function highlightCode(value: string, language: "python" | "json" | "text"): str
     });
   }
   if (language === "python") {
+    // Python highlighting is intentionally lightweight; syntax correctness remains the editor/form validator job.
     return escaped
       .replace(/(#.*)$/gm, "<span class=\"tok-comment\">$1</span>")
       .replace(/\b(def|class|return|raise|import|from|if|else|elif|for|while|in|try|except|with|as|None|True|False)\b/g, "<span class=\"tok-keyword\">$1</span>")

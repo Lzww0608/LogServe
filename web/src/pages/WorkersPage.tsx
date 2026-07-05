@@ -8,6 +8,7 @@ import { usePolling } from "../hooks/usePolling";
 
 // Render polled worker capacity, heartbeat, and cache state.
 export function WorkersPage() {
+  // Worker heartbeats and cached-model lists are live diagnostics, so keep this page on a short poll.
   const state = usePolling(() => api.workers(), 1000);
   if (state.error) return <ErrorPanel message={state.error} />;
   return (

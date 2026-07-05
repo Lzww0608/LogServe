@@ -1,9 +1,14 @@
+# Control-plane deployment for the minimal Kubernetes topology. It connects to
+# logd through the ClusterIP service and reads the API token from the shared
+# logserve-secrets Secret.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: logserve-control
   namespace: logserve
 spec:
+  # A single replica avoids two control planes materializing state from the same
+  # prototype log stream without leader election.
   replicas: 1
   selector:
     matchLabels:
@@ -13,6 +18,8 @@ spec:
       labels:
         app: logserve-control
     spec:
+      # Pod-level ids match the image's logserve user so emptyDir mounts remain
+      # writable even while the container root filesystem is read-only.
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -24,6 +31,8 @@ spec:
         - name: control
           image: logserve:local
           imagePullPolicy: IfNotPresent
+          # Args select the control binary from the shared image and point it at
+          # the in-cluster logd service rather than a host-bound address.
           args: ["logserve-control", "--addr", "0.0.0.0:50052", "--log-addr", "logserve-logd:50051"]
           env:
             - name: LOGSERVE_API_TOKEN
@@ -33,6 +42,8 @@ spec:
                   key: api-token
           ports:
             - containerPort: 50052
+          # TCP probes are sufficient here because the gRPC service binds only
+          # after the control server has started listening.
           readinessProbe:
             tcpSocket:
               port: 50052
@@ -50,6 +61,7 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+          # The process should only write to declared volumes such as /tmp.
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -62,6 +74,8 @@ spec:
         - name: tmp
           emptyDir: {}
 ---
+# ClusterIP keeps control private to the namespace while allowing web/workers to
+# resolve the stable logserve-control DNS name.
 apiVersion: v1
 kind: Service
 metadata:

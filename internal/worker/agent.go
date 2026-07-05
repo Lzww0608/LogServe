@@ -37,40 +37,59 @@ import (
 // Config carries runtime settings for Run.
 // Zero values select worker defaults for identifiers, executor paths, polling, capacity, and mock LLM timings.
 type Config struct {
-	WorkerID                 string
-	ControlAddr              string
-	LogAddr                  string
-	APIToken                 string
-	PythonPath               string
-	ExecutorPath             string
-	PollInterval             time.Duration
-	HeartbeatInterval        time.Duration
-	MaxTasks                 int
-	CachedModels             []string
-	Capacity                 uint32
-	TaskPoolSize             int
-	LLMPoolSize              int
-	ActorPoolSize            int
-	MockModelLoad            time.Duration
-	MockFirstToken           time.Duration
-	VLLMBaseURL              string
+	// WorkerID is the identity registered with the control plane; empty uses a local default.
+	WorkerID string
+	// ControlAddr and LogAddr are the gRPC endpoints used for task scheduling and event appends.
+	ControlAddr string
+	LogAddr     string
+	// APIToken is optional bearer metadata for internal gRPC calls; empty falls back to LOGSERVE_API_TOKEN.
+	APIToken string
+	// PythonPath and ExecutorPath identify the Python interpreter and executor loop script.
+	PythonPath   string
+	ExecutorPath string
+	// PollInterval bounds both empty-poll retry cadence and idle long-poll wait time.
+	PollInterval time.Duration
+	// HeartbeatInterval controls how often cached model state is re-advertised.
+	HeartbeatInterval time.Duration
+	// MaxTasks is a test/dev stop condition; zero means run until ctx is cancelled.
+	MaxTasks int
+	// CachedModels seeds the advertised warm-model set before any local LLM task runs.
+	CachedModels []string
+	// Capacity is the total local task concurrency advertised to the scheduler.
+	Capacity uint32
+	// TaskPoolSize, LLMPoolSize, and ActorPoolSize split local capacity by execution class.
+	TaskPoolSize  int
+	LLMPoolSize   int
+	ActorPoolSize int
+	// MockModelLoad and MockFirstToken make mock LLM latency visible in replayable event logs.
+	MockModelLoad  time.Duration
+	MockFirstToken time.Duration
+	// VLLMBaseURL enables the vLLM adapter; empty falls back to LOGSERVE_VLLM_BASE_URL.
+	VLLMBaseURL string
+	// ModelCheckpointSourceDir and ModelCacheDir enable disk-backed checkpoint caching when both are set.
 	ModelCheckpointSourceDir string
 	ModelCacheDir            string
-	ModelCacheCapacityBytes  int64
+	// ModelCacheCapacityBytes caps on-disk checkpoint bytes; zero disables eviction by size.
+	ModelCacheCapacityBytes int64
 }
 
 // executorRequest is the request envelope sent to the Python executor for stateless function calls.
 type executorRequest struct {
-	FunctionSource string          `json:"function_source,omitempty"`
-	FunctionRef    string          `json:"function_ref,omitempty"`
-	FunctionHash   string          `json:"function_hash,omitempty"`
-	FunctionName   string          `json:"function_name"`
-	ArgsJSON       json.RawMessage `json:"args_json"`
+	// FunctionSource is included only until a runner has learned FunctionHash.
+	FunctionSource string `json:"function_source,omitempty"`
+	// FunctionRef is retained for compatibility with JSON execution and debugging, but Go resolves refs first.
+	FunctionRef string `json:"function_ref,omitempty"`
+	// FunctionHash is the content identity shared with the function cache and Python runner.
+	FunctionHash string `json:"function_hash,omitempty"`
+	FunctionName string `json:"function_name"`
+	// ArgsJSON remains raw JSON so Python observes the same submitted envelope.
+	ArgsJSON json.RawMessage `json:"args_json"`
 }
 
 // executorResponse is the executor reply shape shared by JSON and msgpack protocols.
 type executorResponse struct {
-	OK     bool            `json:"ok"`
+	OK bool `json:"ok"`
+	// Result and State are raw JSON documents, not decoded Go values.
 	Result json.RawMessage `json:"result,omitempty"`
 	State  json.RawMessage `json:"state,omitempty"`
 	Error  string          `json:"error,omitempty"`
@@ -79,10 +98,11 @@ type executorResponse struct {
 // actorExecutorRequest is the Python executor envelope for actor method calls.
 // It carries both the input state and the init arguments needed when the actor is first materialized.
 type actorExecutorRequest struct {
-	Mode         string          `json:"mode"`
-	ClassSource  string          `json:"class_source"`
-	ClassName    string          `json:"class_name"`
-	MethodName   string          `json:"method_name"`
+	Mode        string `json:"mode"`
+	ClassSource string `json:"class_source"`
+	ClassName   string `json:"class_name"`
+	MethodName  string `json:"method_name"`
+	// ArgsJSON, StateJSON, and InitArgsJSON are passed through as JSON bytes to preserve actor semantics in Python.
 	ArgsJSON     json.RawMessage `json:"args_json"`
 	StateJSON    json.RawMessage `json:"state_json"`
 	InitArgsJSON json.RawMessage `json:"init_args_json"`
@@ -169,10 +189,13 @@ func (b *lockedBuffer) String() string {
 // modelCache tracks warmed LLM models and optional on-disk checkpoint files.
 // The disk-backed path uses an LRU list plus a map for O(1) promotion and eviction.
 type modelCache struct {
-	mu            sync.Mutex
-	models        map[string]bool
-	entries       map[string]*list.Element
-	lru           *list.List
+	mu sync.Mutex
+	// models is the scheduler-visible warm set; disk entries are mirrored here after validation.
+	models map[string]bool
+	// entries and lru track disk-backed checkpoints with O(1) lookup and promotion.
+	entries map[string]*list.Element
+	lru     *list.List
+	// inflight is a per-model singleflight table, intentionally not a global load lock.
 	inflight      map[string]*loadCall
 	sourceDir     string
 	cacheDir      string
@@ -182,9 +205,10 @@ type modelCache struct {
 
 // cacheEntry records one checkpoint file in the worker-local model cache.
 type cacheEntry struct {
-	key        string
-	path       string
-	size       int64
+	key  string
+	path string
+	size int64
+	// lastAccess is stored as Unix milliseconds so manifests are stable JSON across platforms.
 	lastAccess int64
 }
 
@@ -235,13 +259,15 @@ type localExecutorPool struct {
 	functionCache *FunctionCache
 	controlClient logservepb.ControlServiceClient
 	logClient     logservepb.LogServiceClient
-	taskQueue     chan workerJob
-	llmQueue      chan workerJob
-	actorQueue    chan workerJob
-	results       chan workerJobResult
-	actorLocks    *actorlock.Table
-	closeOnce     sync.Once
-	wg            sync.WaitGroup
+	// Separate queues prevent LLM model loads and actor serialization from starving normal Python calls.
+	taskQueue  chan workerJob
+	llmQueue   chan workerJob
+	actorQueue chan workerJob
+	// results is consumed only by Run, which owns in-flight counters and completion batching.
+	results    chan workerJobResult
+	actorLocks *actorlock.Table
+	closeOnce  sync.Once
+	wg         sync.WaitGroup
 }
 
 // Run starts the worker process loop.
@@ -400,6 +426,7 @@ func Run(ctx context.Context, cfg Config) error {
 			tasks := pollTasks(resp)
 			if len(tasks) == 0 {
 				if inFlight == 0 {
+					// PollTask already waited up to PollInterval when idle, so the next poll can start immediately.
 					resetTimer(pollTimer, 0)
 				} else {
 					resetTimer(pollTimer, cfg.PollInterval)
@@ -456,6 +483,7 @@ func collectWorkerResult(cfg Config, result workerJobResult, inFlight *int, comp
 	if *inFlight > 0 {
 		*inFlight = *inFlight - 1
 	}
+	// MaxTasks counts local execution attempts, including failures that never produce an accepted completion.
 	*completedTasks = *completedTasks + 1
 	if result.completion != nil {
 		*pendingCompletions = append(*pendingCompletions, result.completion)
@@ -520,6 +548,8 @@ func startLocalExecutorPool(ctx context.Context, cfg Config, cache *modelCache, 
 		}
 		taskRunners = append(taskRunners, runner)
 	}
+	// Actor jobs use separate subprocesses because their adapter protocol carries
+	// state and init args, and per-actor locks can otherwise hold regular tasks behind them.
 	for i := 0; i < actorPoolSize; i++ {
 		runner, err := startPythonRunner(ctx, cfg)
 		if err != nil {
@@ -551,6 +581,8 @@ func startLocalExecutorPool(ctx context.Context, cfg Config, cache *modelCache, 
 		pool.wg.Add(1)
 		go pool.runPythonWorker(ctx, runner, pool.actorQueue, true)
 	}
+	// LLM workers do not need Python runners; keeping them in Go avoids reserving
+	// subprocesses for simulated or OpenAI-compatible model calls.
 	for i := 0; i < llmPoolSize; i++ {
 		pool.wg.Add(1)
 		go pool.runLLMWorker(ctx, pool.llmQueue)
@@ -1078,6 +1110,7 @@ func (r *pythonRunner) readResponseLocked(ctx context.Context, read func() (exec
 		case <-done:
 		case <-time.After(2 * time.Second):
 		}
+		// done is buffered so the reader goroutine can still publish if it unblocks after this timeout.
 		return executorResponse{}, ctx.Err()
 	}
 }
@@ -1169,6 +1202,7 @@ func readExecutorFrame(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	size := binary.BigEndian.Uint32(header[:])
+	// Reject the advertised size before allocating so a corrupted subprocess cannot force unbounded memory growth.
 	if size > maxExecutorFrameBytes {
 		return nil, fmt.Errorf("executor frame %d exceeds max %d", size, maxExecutorFrameBytes)
 	}
@@ -1224,6 +1258,7 @@ func (r *pythonRunner) Restart(ctx context.Context, cfg Config) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Keep the runner locked while replacing process handles so no caller can write into the old stdin.
 	if r.stdin != nil {
 		_ = r.stdin.Close()
 	}
@@ -1442,6 +1477,7 @@ func (c *modelCache) ensureCheckpoint(ctx context.Context, name, version string)
 			}
 		}
 
+		// The producer performs copy/read work outside c.mu; only the per-key inflight entry serializes same-model callers.
 		result, err := c.loadCheckpoint(ctx, key, name, version)
 		c.finishLoadCall(key, call, result, err)
 		return result, err
@@ -1500,6 +1536,7 @@ func (c *modelCache) loadCallForKey(key string) (*loadCall, bool) {
 // finishLoadCall publishes the cold-load result and releases waiters if this call is still current for the key.
 func (c *modelCache) finishLoadCall(key string, call *loadCall, result checkpointLoadResult, err error) {
 	c.mu.Lock()
+	// Ignore stale producers defensively if a future change replaces the inflight call for this key.
 	if current := c.inflight[key]; current == call {
 		call.result = result
 		call.err = err

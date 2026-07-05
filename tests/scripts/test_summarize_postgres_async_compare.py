@@ -1,3 +1,4 @@
+# Tests sync-vs-async PostgreSQL comparison summaries and tolerance behavior.
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts" / "summarize_postgres_async_compare.py"
 
 
+# load_module imports the async-vs-sync comparison summarizer from scripts/.
 def load_module():
     spec = importlib.util.spec_from_file_location("summarize_postgres_async_compare", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -18,6 +20,7 @@ def load_module():
     return module
 
 
+# write_run builds one mode directory with benchmark, Postgres, and materializer fixtures.
 def write_run(root, mode, task, postgres, materializer):
     run_dir = root / mode
     run_dir.mkdir(parents=True)
@@ -27,6 +30,7 @@ def write_run(root, mode, task, postgres, materializer):
     (run_dir / "dashboard_snapshot.json").write_text(json.dumps({"metadata_materializer": materializer}), encoding="utf-8")
 
 
+# write_comparison_case creates paired sync/async runs that either satisfy or violate improvement checks.
 def write_comparison_case(root, async_better):
     write_run(
         root,
@@ -53,7 +57,9 @@ def write_comparison_case(root, async_better):
         )
 
 
+# PostgresAsyncCompareSummaryTest covers acceptance ratios, tolerance windows, and omitted proto-zero fields.
 class PostgresAsyncCompareSummaryTest(unittest.TestCase):
+    # test_writes_pass_summary_and_preserves_zero_flush_errors covers the positive async-improvement case.
     def test_writes_pass_summary_and_preserves_zero_flush_errors(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -68,6 +74,7 @@ class PostgresAsyncCompareSummaryTest(unittest.TestCase):
             self.assertTrue((root / "comparison.json").exists())
             self.assertIn("Acceptance: `PASS`", (root / "summary.md").read_text(encoding="utf-8"))
 
+    # test_main_returns_failure_when_required_improvement_is_missing verifies CLI failure when async regresses.
     def test_main_returns_failure_when_required_improvement_is_missing(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -82,6 +89,7 @@ class PostgresAsyncCompareSummaryTest(unittest.TestCase):
             self.assertFalse(comparison["acceptance"]["pass"])
             self.assertIn("task_throughput_within_tolerance", comparison["acceptance"]["checks"])
 
+    # test_near_equal_task_metrics_pass_with_default_tolerance documents the non-strict tolerance contract.
     def test_near_equal_task_metrics_pass_with_default_tolerance(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -109,6 +117,7 @@ class PostgresAsyncCompareSummaryTest(unittest.TestCase):
             self.assertFalse(comparison["observations"]["task_throughput_strictly_improved"])
             self.assertFalse(comparison["observations"]["task_submit_p99_strictly_improved"])
 
+    # test_omitted_proto_zero_flush_errors_counts_as_zero keeps missing proto-zero fields compatible with old fixtures.
     def test_omitted_proto_zero_flush_errors_counts_as_zero(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:

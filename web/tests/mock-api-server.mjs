@@ -2,8 +2,10 @@
 
 import http from "node:http";
 
+// Match the runner default while allowing tests to override the fixed mock API port.
 const port = Number(process.env.LOGSERVE_MOCK_API_PORT ?? 43080);
 
+// dashboard is the canonical live snapshot pushed through the mock SSE endpoint.
 const dashboard = {
   queue_depth: 2,
   queue_high_watermark: 10,
@@ -31,10 +33,12 @@ const dashboard = {
   metadata_materializer: { mode: "async", eventual_lag_estimate_ms: 12 }
 };
 
+// Templates intentionally cover both operator and admin gates for browser permission tests.
 const templates = [
   { id: "add_task", label: "Add task", kind: "task", description: "Runs add(a, b).", expected_result: "Task succeeds with result_json 3.", required_role: "operator" },
   { id: "mock_llm_request", label: "Mock LLM request", kind: "llm", description: "Runs a mock LLM request.", expected_result: "LLM task succeeds with mock text.", required_role: "admin" }
 ];
+// logStats mirrors stream prefixes shown by the log browser quick tabs.
 const logStats = {
   "system:functions": { stream_id: "system:functions", first_seq: 1, next_seq: 5, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 },
   "system:tasks": { stream_id: "system:tasks", first_seq: 1, next_seq: 2, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 },
@@ -77,6 +81,7 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   if (url.pathname === "/api/events") {
+    // Emit one event and close; the frontend reconnect path is tested without needing an infinite stream.
     const taskID = url.searchParams.get("task_id");
     const streamID = url.searchParams.get("stream") ?? "";
     if (taskID) {
@@ -93,6 +98,7 @@ const server = http.createServer(async (request, response) => {
 
   if (url.pathname === "/api/tasks" && request.method === "GET") {
     const status = url.searchParams.get("status") ?? "";
+    // Keep filtering server-side so list pages exercise query parameter construction.
     const query = (url.searchParams.get("q") ?? "").toLowerCase();
     const workerID = url.searchParams.get("worker_id") ?? "";
     const workflowID = url.searchParams.get("workflow_id") ?? "";
@@ -119,6 +125,7 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   if (url.pathname.startsWith("/api/workflows/") && url.pathname.endsWith("/replay") && request.method === "POST") {
+    // Replay returns a richer workflow than the live snapshot so the UI proves it prefers reconstructed metadata.
     const workflowID = decodeURIComponent(url.pathname.split("/")[3] ?? "wf-1");
     const workflow = workflowDetail(workflowID);
     workflow.steps = [...workflow.steps, { step_id: "verify", task_name: "verify_result", status: "SUCCEEDED", attempts: 1, task_id: "task-verify-1", latency_ms: 7, depends_on: ["add"], started_at_ms: 1782630003000, completed_at_ms: 1782630004000, result_json: { consistent: true } }];
@@ -175,6 +182,7 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (url.pathname.startsWith("/api/llm/") && url.pathname.endsWith("/replay") && request.method === "POST") {
+    // Replay includes timing and timeline fields that submit acknowledgements intentionally omit.
     writeJSON(response, 200, {
       task_id: decodeURIComponent(url.pathname.split("/")[3] ?? "llm-task-1"),
       status: "SUCCEEDED",
@@ -208,6 +216,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     const stats = logStats[streamID] ?? { stream_id: streamID, first_seq: 1, next_seq: 1, trimmed_before_seq: 1, compactable_records: 0, compactable_bytes: 0 };
+    // Use fromSeq in record sequence numbers so pagination assertions can verify page changes.
     const records = [
       { stream_id: streamID, seq: fromSeq, event_type: "APPEND", idempotency_key: `${streamID}-append`, payload_json: { stream_id: streamID }, timestamp_ms: 1782630000000, crc32: 123 },
       { stream_id: streamID, seq: fromSeq + 1, event_type: "COMMIT", idempotency_key: `${streamID}-commit`, payload_json: { ok: true }, timestamp_ms: 1782630001000, crc32: 456 }
@@ -227,10 +236,12 @@ const server = http.createServer(async (request, response) => {
   writeJSON(response, 404, { error: { code: "NOT_FOUND", message: `unhandled mock endpoint ${request.method} ${url.pathname}` } });
 });
 
+// Bind only loopback; Playwright reaches this through the Vite proxy.
 server.listen(port, "127.0.0.1", () => {
   console.log(`LogServe mock API listening on http://127.0.0.1:${port}`);
 });
 
+// Let the runner stop the server cleanly after Playwright exits.
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
 process.on("SIGINT", () => server.close(() => process.exit(0)));
 

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Evaluate a LogServe console acceptance directory or packaged result archive.
+
 import argparse
 import json
 import shutil
@@ -8,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 
+# Local checks must pass even when Docker-based console probing is disabled.
 REQUIRED_LOCAL_CHECKS = (
     "go_web_tests",
     "go_web_vet",
@@ -15,6 +18,7 @@ REQUIRED_LOCAL_CHECKS = (
     "python_script_tests",
 )
 
+# Docker checks prove the compose runtime and web health/probe path actually ran.
 REQUIRED_DOCKER_CHECKS = (
     "docker_compose_config",
     "docker_compose_build",
@@ -23,6 +27,7 @@ REQUIRED_DOCKER_CHECKS = (
     "console_http_probe",
 )
 
+# Probe checks are the expected wire-level console behaviors from console_http_probe.py.
 REQUIRED_PROBE_CHECKS = (
     "healthz_without_auth",
     "dashboard_requires_auth",
@@ -62,29 +67,39 @@ REQUIRED_PROBE_CHECKS = (
 )
 
 
+# Load a required JSON artifact using UTF-8 with BOM tolerance.
 def read_json(path):
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+# Extract a tar.gz package only after rejecting traversal, link, and device entries.
 def safe_extract_tar(package_path, dest):
     with tarfile.open(package_path, "r:gz") as archive:
         dest = dest.resolve()
         for member in archive.getmembers():
             target = (dest / member.name).resolve()
+            # Reject path traversal before extraction; tarfile.extractall does not
+            # enforce this boundary for us.
             if target != dest and dest not in target.parents:
                 raise ValueError(f"unsafe tar member path: {member.name}")
+            # Links can escape the destination even when their member names look safe.
             if member.issym() or member.islnk():
                 raise ValueError(f"unsafe tar link member: {member.name}")
+            # Device files are never needed for acceptance artifacts and are unsafe
+            # to materialize from untrusted packages.
             if member.isdev():
                 raise ValueError(f"unsafe tar device member: {member.name}")
         archive.extractall(dest)
 
 
+# Return an acceptance result directory, extracting tar.gz input to a temporary directory when needed.
 def materialize_input(path):
     path = Path(path)
     if path.is_dir():
         return path, None
     if path.is_file() and path.suffixes[-2:] == [".tar", ".gz"]:
+        # Tar input is unpacked into a caller-invisible temp directory and cleaned
+        # up by main after evaluation.
         tmp = Path(tempfile.mkdtemp(prefix="logserve-console-acceptance-"))
         try:
             safe_extract_tar(path, tmp)
@@ -95,6 +110,7 @@ def materialize_input(path):
     raise ValueError(f"expected result directory or .tar.gz package: {path}")
 
 
+# Interpret a boolean run_config flag from native bools or common string values.
 def bool_config(config, key, default=False):
     value = config.get(key, default)
     if isinstance(value, bool):
@@ -102,6 +118,8 @@ def bool_config(config, key, default=False):
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
+# Feature groups mirror summarize_console_acceptance.py so independent evaluation
+# uses the same product-level grouping as the generated summary.
 FEATURE_GROUPS_6_10 = {
     "feature_6_workflow_dag": {
         "title": "Workflow DAG and replay",
@@ -142,6 +160,8 @@ FEATURE_GROUPS_6_10 = {
     },
 }
 
+# Admin/function probe checks validate protected frontend routes and authenticated
+# API behavior around function registry and backpressure controls.
 FRONTEND_ADMIN_FUNCTION_CHECKS = (
     "static_admin_route",
     "static_functions_route",
@@ -158,6 +178,7 @@ FRONTEND_ADMIN_FUNCTION_CHECKS = (
     "admin_config_reflects_backpressure_update",
 )
 
+# Aggregate feature 6-10 probe checks into per-feature states and an overall verdict.
 def build_feature_groups_6_10(run_docker, probe_checks):
     features = {}
     states = []
@@ -189,6 +210,7 @@ def build_feature_groups_6_10(run_docker, probe_checks):
     return {"verdict": verdict, "features": features}
 
 
+# Aggregate frontend admin and function registry probe checks into one verdict.
 def build_frontend_admin_functions(run_docker, probe_checks):
     probe_checks = probe_checks or {}
     check_results = {name: probe_checks.get(name) is True for name in FRONTEND_ADMIN_FUNCTION_CHECKS}
@@ -208,21 +230,27 @@ def build_frontend_admin_functions(run_docker, probe_checks):
         "failed_checks": failed_checks,
     }
 
+# List required check names that are absent or did not explicitly pass.
 def missing_or_failed(checks, names):
     return [name for name in names if checks.get(name) is not True]
 
 
+# Return non-empty failed command names from a summary document.
 def failed_commands(summary):
     return [name for name in summary.get("failed_commands") or [] if name]
 
 
+# Return non-empty failed check names from a summary document.
 def failed_checks(summary):
     return [name for name in summary.get("failed_checks") or [] if name]
 
 
+# Evaluate one materialized acceptance result directory and return the normalized verdict document.
 def evaluate_result(root):
     root = Path(root)
     summary_path = root / "acceptance_summary.json"
+    # A missing generated summary is an immediate hard failure because there is no
+    # authoritative artifact to evaluate.
     if not summary_path.exists():
         return {
             "verdict": "FAIL",
@@ -257,6 +285,8 @@ def evaluate_result(root):
     run_docker = bool_config(run_config, "run_docker", False)
     features_6_10 = build_feature_groups_6_10(run_docker, probe_checks)
     frontend_admin_functions = build_frontend_admin_functions(run_docker, probe_checks)
+    # Local-only runs can be valid partial evidence, but they cannot prove browser
+    # and HTTP probe behavior, so successful local checks return INCOMPLETE.
     if not run_docker:
         if failures:
             return {
@@ -280,9 +310,12 @@ def evaluate_result(root):
             "summary": summary,
         }
 
+    # Once Docker is enabled, every compose and probe gate is mandatory evidence.
     for name in missing_or_failed(checks, REQUIRED_DOCKER_CHECKS):
         failures.append(f"required Docker check failed or missing: {name}")
 
+    # The summarized probe verdict and individual probe checks must both pass;
+    # this catches mismatches between aggregate and per-check fields.
     if probe.get("verdict") != "PASS":
         failures.append(f"HTTP probe verdict is {probe.get('verdict')!r}, expected 'PASS'")
     for name in missing_or_failed(probe_checks, REQUIRED_PROBE_CHECKS):
@@ -307,6 +340,7 @@ def evaluate_result(root):
     }
 
 
+# Write a human-readable evaluation report from the verdict document.
 def write_markdown(result, path):
     lines = ["# Console Acceptance Evaluation", ""]
     lines.append(f"- Verdict: **{result.get('verdict')}**")
@@ -358,6 +392,7 @@ def write_markdown(result, path):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# Parse CLI arguments, materialize input, write optional reports, and exit from the verdict.
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate a LogServe Console acceptance result directory or package.")
     parser.add_argument("path", help="acceptance result directory or console-acceptance-package.tar.gz")
@@ -376,6 +411,8 @@ def main(argv=None):
         print(json.dumps({k: result[k] for k in ("verdict", "reason", "failures", "warnings") if k in result}, indent=2, ensure_ascii=False))
         return 0 if result.get("verdict") == "PASS" else 1
     finally:
+        # Remove temporary extraction directories even when evaluation or report
+        # writing fails.
         if temp_dir is not None:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

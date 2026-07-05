@@ -24,6 +24,7 @@ func BenchmarkPostgresStoreHeartbeatWriteModes(b *testing.B) {
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			db, recorder := openRecordingPostgresDB(b)
+			// A long flush interval keeps async durable work out of the timed foreground path.
 			store := NewPostgresStoreWithOptions(db, PostgresOptions{
 				Mode:          tc.mode,
 				BatchMax:      1024,
@@ -62,6 +63,8 @@ func BenchmarkPostgresStoreTaskLifecycleWriteModes(b *testing.B) {
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			db, recorder := openRecordingPostgresDB(b)
+			// Size async buffers for create/lease/complete writes so queue pressure does
+			// not dominate this foreground lifecycle benchmark.
 			store := NewPostgresStoreWithOptions(db, PostgresOptions{
 				Mode:          tc.mode,
 				BatchMax:      max(1024, b.N*4),

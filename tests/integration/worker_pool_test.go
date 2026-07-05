@@ -1,5 +1,8 @@
 package integration
 
+// This file verifies that the worker's local task pool executes independent
+// Python tasks concurrently instead of serializing all work on one goroutine.
+
 import (
 	"context"
 	"encoding/json"
@@ -11,6 +14,9 @@ import (
 	"github.com/logserve/logserve/internal/worker"
 )
 
+// TestWorkerLocalTaskPoolExecutesPythonTasksConcurrently submits four sleeping
+// tasks and checks their TaskStarted timestamps are close enough to prove local
+// task pool parallelism.
 func TestWorkerLocalTaskPoolExecutesPythonTasksConcurrently(t *testing.T) {
 	ensureExecutorDeps(t)
 	env := startWorkflowEnv(t)
@@ -20,6 +26,8 @@ func TestWorkerLocalTaskPoolExecutesPythonTasksConcurrently(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
+		// Capacity and TaskPoolSize match the submitted task count so all tasks can
+		// start without queueing inside the worker when batching works correctly.
 		err := worker.Run(ctx, worker.Config{
 			WorkerID:      "pool-worker",
 			ControlAddr:   env.controlServer.Addr(),
@@ -75,6 +83,8 @@ func TestWorkerLocalTaskPoolExecutesPythonTasksConcurrently(t *testing.T) {
 			last = startedAt
 		}
 	}
+	// The tasks each sleep for 350ms; a wide start spread would indicate the worker
+	// serialized execution even though capacity and pool size were both four.
 	if spread := last - first; spread > 700 {
 		t.Fatalf("TaskStarted timestamp spread = %dms, want <= 700ms; local task pool may be serialized", spread)
 	}
@@ -89,6 +99,8 @@ func TestWorkerLocalTaskPoolExecutesPythonTasksConcurrently(t *testing.T) {
 	}
 }
 
+// waitDashboardWorker polls the dashboard until a worker registration is visible
+// to the control plane.
 func waitDashboardWorker(t *testing.T, client logservepb.ControlServiceClient, workerID string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -105,6 +117,8 @@ func waitDashboardWorker(t *testing.T, client logservepb.ControlServiceClient, w
 	t.Fatalf("worker %s did not register", workerID)
 }
 
+// taskStartedTimestamp reads a task stream and returns the durable TaskStarted
+// timestamp used to compare worker-side concurrency.
 func taskStartedTimestamp(t *testing.T, client logservepb.LogServiceClient, taskID string) int64 {
 	t.Helper()
 	records, err := client.ReadLog(context.Background(), &logservepb.ReadLogRequest{

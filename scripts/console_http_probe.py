@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Probe the LogServe Console HTTP API and static routes for acceptance runs.
+
 import argparse
 import json
 import sys
@@ -9,6 +11,7 @@ import urllib.request
 from pathlib import Path
 
 
+# Send one JSON-aware HTTP request and normalize success, HTTP error, and transport failure responses.
 def http_request(method, url, token=None, body=None, timeout=10):
     data = None
     headers = {}
@@ -37,6 +40,7 @@ def http_request(method, url, token=None, body=None, timeout=10):
         return {"status": 0, "content_type": "", "body": "", "error": str(exc)}
 
 
+# Decode a response body as JSON, returning None when the endpoint returned non-JSON text.
 def parse_json(response):
     try:
         return json.loads(response.get("body") or "")
@@ -44,10 +48,12 @@ def parse_json(response):
         return None
 
 
+# Compare JSON scalar values while tolerating stringified numbers from executor responses.
 def same_json_value(actual, expected):
     return actual == expected or str(actual) == str(expected)
 
 
+# Poll a predicate until it succeeds or the timeout expires, returning the last observed detail.
 def wait_for(predicate, timeout_sec=30, interval_sec=1):
     deadline = time.time() + timeout_sec
     last = None
@@ -59,12 +65,14 @@ def wait_for(predicate, timeout_sec=30, interval_sec=1):
     return False, last
 
 
+# Exercise the console HTTP surface and return a verdict, check map, failures, and diagnostic details.
 def run_probe(base_url, token, timeout_sec):
     base_url = base_url.rstrip("/")
     checks = {}
     failures = []
     details = {"base_url": base_url}
 
+    # Store one check result and attach failure details without aborting the remaining probe sequence.
     def record(name, passed, detail=None):
         checks[name] = bool(passed)
         if detail is not None:
@@ -72,6 +80,8 @@ def run_probe(base_url, token, timeout_sec):
         if not passed:
             failures.append({"check": name, "detail": detail})
 
+    # Start with unauthenticated endpoints to prove health is public while
+    # dashboard data remains protected by the bearer token boundary.
     health = http_request("GET", f"{base_url}/api/healthz", timeout=10)
     health_json = parse_json(health)
     record(
@@ -107,6 +117,8 @@ def run_probe(base_url, token, timeout_sec):
         },
     )
 
+    # Static route probes verify the SPA fallback serves deep links that browser
+    # tests and copied URLs depend on.
     for name, path in (
         ("static_root", "/"),
         ("static_deep_link", "/tasks/console-acceptance"),
@@ -118,6 +130,8 @@ def run_probe(base_url, token, timeout_sec):
         ok = resp["status"] == 200 and "LogServe Console" in resp.get("body", "")
         record(name, ok, {"status": resp["status"], "content_type": resp.get("content_type"), "error": resp.get("error")})
 
+    # The task probe uses a tiny inline function and a fixed idempotency key so
+    # repeated acceptance runs avoid creating unbounded duplicate tasks.
     task_body = {
         "task_name": "console_acceptance_add",
         "function_name": "add",
@@ -165,6 +179,7 @@ def run_probe(base_url, token, timeout_sec):
             {"status": task_detail["status"], "body": task_detail_json or task_detail.get("body"), "error": task_detail.get("error")},
         )
 
+        # Poll the task list until the submitted task appears in the dashboard-backed task view.
         def task_visible():
             listed = http_request("GET", f"{base_url}/api/tasks?q=console_acceptance_add", token=token, timeout=10)
             listed_json = parse_json(listed)
@@ -177,6 +192,8 @@ def run_probe(base_url, token, timeout_sec):
         visible, visible_detail = wait_for(task_visible, timeout_sec=20, interval_sec=1)
         record("task_visible_in_dashboard_view", visible, visible_detail)
 
+    # Later resources use a per-run suffix to avoid collisions with previous
+    # workflow/model/actor acceptance artifacts in the same runtime.
     run_id = str(int(time.time() * 1000))
     model_name = f"model-A-{run_id}"
     model_version = "v1"
@@ -236,6 +253,8 @@ def run_probe(base_url, token, timeout_sec):
         steps = workflow_detail_json.get("steps") if isinstance(workflow_detail_json, dict) else []
         if not isinstance(steps, list):
             steps = []
+        # DAG correctness is checked from the detail view because the submit
+        # response alone does not prove dependency edges were persisted.
         has_dependency = any(
             isinstance(step, dict) and step.get("step_id") == "second" and "first" in (step.get("depends_on") or [])
             for step in steps
@@ -307,6 +326,8 @@ def run_probe(base_url, token, timeout_sec):
             and llm_replay_json.get("task_id") == llm_task_id
             and llm_replay_json.get("model_name") == model_name
             and llm_replay_json.get("model_version") == model_version
+            # Replay must expose timing fields and the completion event, not just
+            # the final LLM task status, because the UI renders the trace from them.
             and "total_latency_ms" in llm_replay_json
             and "first_token_ms" in llm_replay_json
             and any(isinstance(event, dict) and event.get("event_type") == "LLMCompleted" for event in events)
@@ -317,6 +338,7 @@ def run_probe(base_url, token, timeout_sec):
             {"status": llm_replay["status"], "body": llm_replay_json if not trace_ok else None, "error": llm_replay.get("error")},
         )
 
+    # Poll worker cache state until the model used by the LLM task is visible on a worker row.
     def worker_has_model():
         workers = http_request("GET", f"{base_url}/api/workers", token=token, timeout=10)
         workers_json = parse_json(workers)
@@ -382,6 +404,7 @@ def run_probe(base_url, token, timeout_sec):
             {"status": actor_status["status"], "body": actor_status_json if not actor_status_ok else None, "error": actor_status.get("error")},
         )
 
+    # List log stream ids for a prefix and normalize malformed responses to an empty list.
     def list_streams(prefix):
         query = urllib.parse.urlencode({"prefix": prefix})
         resp = http_request("GET", f"{base_url}/api/logs/streams?{query}", token=token, timeout=10)
@@ -391,7 +414,10 @@ def run_probe(base_url, token, timeout_sec):
             ids = []
         return resp, parsed, ids
 
+    # Read one log stream from sequence 1 and normalize malformed record lists to an empty list.
     def read_stream(stream_id):
+        # Stream IDs contain ':' and other separators, so path components must be
+        # fully encoded before calling the log stream read endpoint.
         encoded = urllib.parse.quote(stream_id, safe="")
         resp = http_request("GET", f"{base_url}/api/logs/streams/{encoded}?from_seq=1&limit=50", token=token, timeout=10)
         parsed = parse_json(resp)
@@ -400,6 +426,7 @@ def run_probe(base_url, token, timeout_sec):
             records = []
         return resp, parsed, records
 
+    # Verify a log stream response and all returned records belong to the requested stream.
     def stream_read_matches(parsed, records, stream_id):
         if not isinstance(parsed, dict) or parsed.get("stream_id") != stream_id:
             return False
@@ -408,6 +435,7 @@ def run_probe(base_url, token, timeout_sec):
             return False
         return all(isinstance(record, dict) and record.get("stream_id") == stream_id for record in records)
 
+    # Return whether any stream record exposes the expected decoded event type.
     def stream_has_event(records, event_type):
         return any(isinstance(record, dict) and record.get("event_type") == event_type for record in records)
 
@@ -566,6 +594,8 @@ def run_probe(base_url, token, timeout_sec):
         {"status": admin["status"], "metadata_materializer": materializer_stats},
     )
 
+    # Invalid admin updates exercise each positive integer guard independently so
+    # one permissive field cannot hide behind a fully invalid payload.
     invalid_backpressure_cases = (
         {"queue_high_watermark": 0, "redelivery_timeout_ms": 30000, "log_append_slow_ms": 100},
         {"queue_high_watermark": 1024, "redelivery_timeout_ms": 0, "log_append_slow_ms": 100},
@@ -606,6 +636,8 @@ def run_probe(base_url, token, timeout_sec):
         reflected_ok,
         {"status": admin_after["status"], "body": admin_after_json if not reflected_ok else None, "error": admin_after.get("error")},
     )
+    # A probe records every check it can reach and reports a single aggregate
+    # verdict at the end, which gives acceptance summaries complete diagnostics.
     return {
         "verdict": "PASS" if not failures else "FAIL",
         "checks": checks,
@@ -614,6 +646,7 @@ def run_probe(base_url, token, timeout_sec):
     }
 
 
+# Parse CLI arguments, run the probe, write JSON output, and exit from the probe verdict.
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Probe the LogServe Console HTTP surface.")
     parser.add_argument("--base-url", required=True)

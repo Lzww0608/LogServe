@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+# Convert `go test -bench` text output into a compact JSON metric map.
 import json
 import re
 import sys
 from pathlib import Path
 
+# Matches stable benchmark metric columns emitted by Go's testing package.
+# Optional B/op and allocs/op groups keep the parser usable without -benchmem.
 LINE = re.compile(
     r"^(?P<name>Benchmark\S+)(?:/(?P<case>[^/]+))*\s+\d+\s+"
     r"(?P<ns_per_op>[\d.]+)\s+ns/op(?:\s+(?P<bytes_per_op>\d+)\s+B/op)?"
@@ -11,6 +14,8 @@ LINE = re.compile(
 )
 
 
+# Return benchmark rows keyed by benchmark name plus optional subcase.
+# Non-benchmark lines are ignored so verbose test output can be piped in directly.
 def parse_benchmark_text(text):
     out = {}
     current = None
@@ -30,11 +35,14 @@ def parse_benchmark_text(text):
             }
             current = key
             continue
+        # Test failure/detail sections after a benchmark should not be
+        # associated with the previous successful metric row.
         if current and line.startswith("---"):
             current = None
     return out
 
 
+# Read one benchmark text file and print normalized JSON to stdout.
 def main():
     if len(sys.argv) != 2:
         print("usage: parse_go_benchmark.py <bench.txt>", file=sys.stderr)

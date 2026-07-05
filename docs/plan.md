@@ -33,7 +33,7 @@ LogServe 当前已经是一个完整的 shared-log AI runtime，核心机制包�
 | P1 | Python function/code registry，减少重复 function_source | 中高 | 中 | 低中 | 做 |
 | P1 | checkpoint cache per-model lock + O(1) LRU | 中 | 中 | 低 | 做 |
 | P1 | object store streaming Put/Get + local atomic write | 中 | 中 | 低中 | 做 |
-| P2 | CRC32C Castagnoli + 硬件加速验证 | 中 | 低中 | 低 | 做为 logstore 子任务 |
+| P2 | CRC32C Castagnoli + 硬件加速验证 | 中 | 低中 | 低 | 作为 logstore 子任务 |
 | P2 | mmap read path 实验 | 中 | 中高 | 中 | 实验，不先替换主路径 |
 | P2 | sync.Pool / buffer pool | 中 | 低 | 中 | 在 profile 证明确有 GC 压力后做 |
 | P2 | gRPC streaming / batch RPC | 中 | 中 | 中 | 与 AppendBatch/ReadLog 一起做 |
@@ -1156,7 +1156,7 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 ### Phase 0：建立可量化基线
 
-周期：1-2 天。  
+周期：1-2 天。
 目标：让所有后续优化有证据。
 
 任务：
@@ -1174,7 +1174,7 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 ### Phase 1：logstore 写读路径
 
-周期：3-6 天。  
+周期：3-6 天。
 目标：解决最底层 I/O 热点。
 
 任务：
@@ -1195,7 +1195,7 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 ### Phase 2：control scheduler v2
 
-周期：4-8 天。  
+周期：4-8 天。
 目标：消除队列线性扫描和 redelivery 全表扫描。
 
 任务：
@@ -1216,7 +1216,7 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 ### Phase 3：metadata store v2 和 Postgres async
 
-周期：4-7 天。  
+周期：4-7 天。
 目标：降低 metadata 锁竞争和 SQL 写放大。
 
 任务：
@@ -1236,7 +1236,7 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 ### Phase 4：recovery checkpoint 和 compaction
 
-周期：6-12 天。  
+周期：6-12 天。
 目标：解决长期运行后的启动时间和磁盘空间。
 
 任务：
@@ -1256,7 +1256,7 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 ### Phase 5：worker/cache/object store 优化
 
-周期：4-8 天。  
+周期：4-8 天。
 目标：降低 Python 重复 compile、checkpoint cold start 阻塞和大对象内存峰值。
 
 任务：
@@ -1276,7 +1276,7 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 ### Phase 6：高级 I/O 实验
 
-周期：可选。  
+周期：可选。
 目标：只在 P0/P1 完成后验证更底层技术。
 
 候选：
@@ -1300,17 +1300,17 @@ control 的问题不是单纯队列 push/pop 成本，而是队列模型不对�
 
 ### 组合 A：logstore 工程深度
 
-内容：AppendBatch + group commit + binary index + CRC32C + crash recovery。  
+内容：AppendBatch + group commit + binary index + CRC32C + crash recovery。
 面试价值：WAL、fsync、page cache、checksum、恢复、批量提交、二进制格式、性能测试。
 
 ### 组合 B：scheduler 系统设计深度
 
-内容：从 `[]string` 线性队列升级到 typed/indexed scheduler + deadline heap + LLM placement index。  
+内容：从 `[]string` 线性队列升级到 typed/indexed scheduler + deadline heap + LLM placement index。
 面试价值：数据结构选型、调度复杂度、并发控制、backpressure、actor mailbox、LLM locality。
 
 ### 组合 C：replay/compaction 长期运行能力
 
-内容：checkpoint + tail replay + physical compaction。  
+内容：checkpoint + tail replay + physical compaction。
 面试价值：event sourcing、日志压缩、snapshot、恢复一致性、crash safety。
 
 最推荐先做组合 A 和 B。它们最贴近基础架构，并且收益清晰，能直接回应“你如何优化系统瓶颈”的面试追问。

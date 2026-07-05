@@ -25,8 +25,11 @@ const memoryTaskShardCount = 64
 // Task and worker paths use finer-grained locking because they are scheduler hot
 // paths.
 type MemoryStoreV2 struct {
-	tasks     taskStoreV2
-	workers   workerStoreV2
+	// tasks and workers are split out because scheduling, lease recovery, and
+	// heartbeats are the high-concurrency paths.
+	tasks   taskStoreV2
+	workers workerStoreV2
+	// workflows, actors, and models use smaller domain stores with simpler locks.
 	workflows workflowStoreV2
 	actors    actorStoreV2
 	models    modelStoreV2
@@ -214,23 +217,33 @@ func (s *MemoryStoreV2) UpsertActor(state actor.State) {
 // taskStoreV2 stores tasks in shards and maintains secondary indexes for list
 // and lease-recovery paths.
 type taskStoreV2 struct {
+	// shards own task records; each task mutation locks only the shard selected by task ID.
 	shards [memoryTaskShardCount]taskShardV2
 
+	// idemMu protects the idempotency index independently from task shards so a
+	// create can reserve an idempotency key without serializing unrelated reads.
 	idemMu sync.RWMutex
 	byIdem map[string]string
 
-	indexMu  sync.RWMutex
+	// indexMu protects secondary indexes that are updated from immutable before/after snapshots.
+	indexMu sync.RWMutex
+	// allTasks is the authoritative list index for deterministic full snapshots.
 	allTasks map[string]struct{}
+	// byStatus indexes scheduler-hot statuses; terminal statuses fall back to allTasks.
 	byStatus map[logservepb.TaskStatus]map[string]struct{}
+	// byWorker tracks running assignments for diagnostics and future placement logic.
 	byWorker map[string]map[string]struct{}
 
+	// deadlineMu protects the running lease heap separately from list indexes.
 	deadlineMu sync.Mutex
 	running    taskDeadlineQueueV2
 }
 
 // taskShardV2 owns the actual task pointers for one hash shard.
 type taskShardV2 struct {
-	mu    sync.RWMutex
+	// mu protects the task pointers in this shard; callers clone before returning values.
+	mu sync.RWMutex
+	// tasks stores pointers so in-shard updates can mutate one record without copying the map.
 	tasks map[string]*Task
 }
 
@@ -451,6 +464,8 @@ func (s *taskStoreV2) requeueTaskAt(taskID string, leaseEpoch uint64, maxAge tim
 		return Task{}, false
 	}
 	if task.Status != logservepb.TaskStatus_TASK_STATUS_RUNNING || task.TaskLeaseEpoch != leaseEpoch {
+		// Heap and targeted recovery both use this path; the epoch check discards
+		// stale heap entries created by a previous lease for the same task ID.
 		out := cloneTask(*task)
 		shard.mu.Unlock()
 		return out, false
@@ -504,6 +519,8 @@ func (s *taskStoreV2) complete(taskID, workerID string, leaseEpoch uint64, statu
 	previous := cloneTask(*task)
 	task.Status = status
 	task.WorkerID = workerID
+	// Copy result bytes while holding the shard lock so the stored terminal result
+	// cannot alias caller-owned buffers.
 	task.ResultJSON = append([]byte(nil), resultJSON...)
 	task.Error = taskErr
 	task.UpdatedAtMs = time.Now().UnixMilli()
@@ -553,6 +570,8 @@ func (s *taskStoreV2) indexedTaskIDsByStatus(status logservepb.TaskStatus) []str
 // replaceTaskIndexes reconciles secondary indexes and the running-deadline heap
 // after a task mutation.
 func (s *taskStoreV2) replaceTaskIndexes(previous, current *Task) {
+	// previous/current are clones captured under the shard lock; using snapshots
+	// here avoids holding shard locks while touching global secondary indexes.
 	s.indexMu.Lock()
 	if previous != nil {
 		if indexedTaskStatus(previous.Status) {
@@ -671,7 +690,9 @@ type taskDeadlineV2 struct {
 // taskDeadlineQueueV2 is an indexed min-heap so lease updates and removals are
 // O(log n) instead of leaving unbounded stale heap entries.
 type taskDeadlineQueueV2 struct {
-	entries   []taskDeadlineV2
+	// entries is the heap-ordered slice used by container/heap.
+	entries []taskDeadlineV2
+	// positions lets upsert/remove locate a task's current heap slot in O(1).
 	positions map[string]int
 }
 
@@ -764,22 +785,27 @@ func indexedTaskStatus(status logservepb.TaskStatus) bool {
 // workerStoreV2 stores worker records in a map while keeping frequently updated
 // counters inside per-worker records.
 type workerStoreV2 struct {
-	mu      sync.RWMutex
+	// mu protects the worker map; each workerRecordV2 owns its own hot fields.
+	mu sync.RWMutex
+	// workers is stable after getOrCreate returns a record pointer for a worker ID.
 	workers map[string]*workerRecordV2
 }
 
 // workerRecordV2 separates rarely changed identity fields behind a mutex from
 // hot capacity, load, heartbeat, and cache fields updated atomically.
 type workerRecordV2 struct {
+	// mu protects identity fields and labels, which change far less often than load counters.
 	mu       sync.RWMutex
 	workerID string
 	address  string
 	labels   map[string]string
 
+	// capacity, runningTasks, and lastHeartbeat are atomics for heartbeat and placement hot paths.
 	capacity      atomic.Uint32
 	runningTasks  atomic.Uint32
 	lastHeartbeat atomic.Int64
-	cachedModels  atomic.Value
+	// cachedModels stores a cloned map; snapshots clone it again before returning to callers.
+	cachedModels atomic.Value
 }
 
 // init prepares the worker map.
@@ -861,6 +887,8 @@ func (s *workerStoreV2) list() []Worker {
 func (s *workerStoreV2) heartbeat(workerID string, cachedModels map[string]bool) (Worker, bool) {
 	record, existed := s.getOrCreate(workerID)
 	if cachedModels != nil {
+		// nil preserves the existing cache; a non-nil empty map means the worker is
+		// explicitly reporting no cached models.
 		record.cachedModels.Store(cloneModelCache(cachedModels))
 	}
 	if record.capacity.Load() == 0 {
@@ -978,8 +1006,11 @@ type workflowStoreV2 struct {
 // workflowRecordV2 keeps step slices and indexes alongside the cloned workflow
 // state for fast internal access and invariant tests.
 type workflowRecordV2 struct {
-	state     workflow.State
-	steps     []workflow.StepState
+	// state is the cloned workflow header and map representation returned to callers.
+	state workflow.State
+	// steps preserves execution order from State.StepStatesInOrder for internal checks.
+	steps []workflow.StepState
+	// stepIndex maps step ID to the ordered steps slice without scanning.
 	stepIndex map[string]int
 }
 

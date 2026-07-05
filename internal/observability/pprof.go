@@ -1,5 +1,8 @@
 package observability
 
+// This file owns optional runtime profiling setup for command entrypoints.
+// Enabling it affects process-global runtime knobs and starts a diagnostics HTTP server.
+
 import (
 	"log"
 	"net"
@@ -15,8 +18,10 @@ import (
 // Default profile sampling rates keep mutex and block profiles useful when the
 // environment overrides are unset, malformed, or non-positive.
 const (
+	// defaultMutexProfileFraction samples one in ten contended mutex events.
 	defaultMutexProfileFraction = 10
-	defaultBlockProfileRate     = 10000
+	// defaultBlockProfileRate samples blocking events at a low but useful rate.
+	defaultBlockProfileRate = 10000
 )
 
 // EnableRuntimeProfiles turns on mutex and block profiling samples used by
@@ -25,6 +30,8 @@ const (
 // This changes process-global runtime profiling knobs. Invalid, empty, zero,
 // or negative environment overrides are ignored so a malformed deployment
 // value does not silently disable the profiles requested by StartDebugServer.
+// The previous process profile rates are not restored; call this as startup-time
+// diagnostics configuration rather than a scoped enable/disable switch.
 func EnableRuntimeProfiles() {
 	mutexFraction := defaultMutexProfileFraction
 	if v := os.Getenv("LOGSERVE_MUTEX_PROFILE_FRACTION"); v != "" {
@@ -42,6 +49,8 @@ func EnableRuntimeProfiles() {
 			blockRate = parsed
 		}
 	}
+	// These runtime knobs are process-global and replace any value configured by
+	// another package, so this helper intentionally centralizes profiling setup.
 	runtime.SetMutexProfileFraction(mutexFraction)
 	runtime.SetBlockProfileRate(blockRate)
 }
@@ -51,9 +60,10 @@ func EnableRuntimeProfiles() {
 //
 // The server runs in a background goroutine and has no shutdown hook because it
 // is diagnostics-only process state. Passing an empty or whitespace-only addr is
-// a no-op. The nil handler passed to http.Serve intentionally uses
-// http.DefaultServeMux, where the net/http/pprof side-effect import registers
-// the debug endpoints.
+// a no-op. Binding happens asynchronously, so callers learn about listen
+// failures only through logs. The nil handler passed to http.Serve intentionally
+// uses http.DefaultServeMux, where the net/http/pprof side-effect import
+// registers the debug endpoints.
 func StartDebugServer(addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -61,6 +71,8 @@ func StartDebugServer(addr string) {
 	}
 	EnableRuntimeProfiles()
 	go func() {
+		// Keep the debug server best-effort: diagnostics should not take down logd,
+		// control, or worker startup if the requested port is already in use.
 		// Bind inside the goroutine so a pprof port conflict is reported without
 		// preventing the main service from continuing to start.
 		ln, err := net.Listen("tcp", addr)
@@ -69,6 +81,8 @@ func StartDebugServer(addr string) {
 			return
 		}
 		log.Printf("pprof listening on http://%s/debug/pprof/", ln.Addr().String())
+		// http.Serve normally runs for the process lifetime here; any return is a
+		// diagnostics event worth logging because there is no explicit shutdown path.
 		if err := http.Serve(ln, nil); err != nil {
 			log.Printf("pprof server stopped addr=%s err=%v", addr, err)
 		}

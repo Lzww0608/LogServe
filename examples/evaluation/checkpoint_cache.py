@@ -1,3 +1,5 @@
+# Probe checkpoint-cache behavior by issuing one cold and one warm LLM request,
+# then validating replay metadata exported by the worker/model cache path.
 import json
 import os
 import sys
@@ -5,20 +7,27 @@ import sys
 from logserve import register_model, replay_llm, submit_llm
 
 
+# pick accepts both snake_case and camelCase replay fields so the probe remains
+# compatible with JSON emitted by different API layers.
 def pick(data, snake, camel):
     if snake in data:
         return data[snake]
     return data.get(camel)
 
 
+# pick_bool normalizes optional replay fields into booleans for validation checks.
 def pick_bool(data, snake, camel):
     return bool(pick(data, snake, camel))
 
 
+# pick_int treats missing numeric replay fields as zero so failed measurements
+# become explicit validation errors later.
 def pick_int(data, snake, camel):
     return int(pick(data, snake, camel) or 0)
 
 
+# snapshot extracts the replay fields that prove checkpoint fetch, cache use,
+# and worker selection for one LLM task.
 def snapshot(replay):
     return {
         "cache_hit": pick_bool(replay, "cache_hit", "cacheHit"),
@@ -33,6 +42,8 @@ def snapshot(replay):
     }
 
 
+# validation_errors encodes the expected cold/warm cache contract for a fresh
+# model-cache directory: first request misses, second request hits.
 def validation_errors(report):
     errors = []
     cold = report["cold"]
@@ -50,6 +61,8 @@ def validation_errors(report):
     return errors
 
 
+# main registers a checkpoint-backed mock model, submits cold and warm requests,
+# and exits non-zero when replay metadata contradicts cache expectations.
 def main():
     model = os.getenv("LOGSERVE_CHECKPOINT_MODEL", "model-D")
     version = os.getenv("LOGSERVE_CHECKPOINT_VERSION", "v1")

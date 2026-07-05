@@ -14,8 +14,10 @@ import { errorMessage } from "../utils/status";
 import type { ConsoleSession } from "../types/logserve";
 import { roleAtLeast } from "../utils/roles";
 
+// StepPosition stores canvas coordinates for a draft DAG node.
 type StepPosition = { x: number; y: number };
 
+// WorkflowStepDraft is the editable UI model; it intentionally keeps numeric and JSON fields as strings.
 type WorkflowStepDraft = {
   uid: string;
   stepId: string;
@@ -36,8 +38,10 @@ type WorkflowStepDraft = {
   position: StepPosition;
 };
 
+// BuilderErrors is keyed by either global field names or `${step.uid}.${field}` for per-step errors.
 type BuilderErrors = Record<string, string | undefined>;
 
+// StepDraftErrors is the selected-step projection consumed by the form controls.
 type StepDraftErrors = {
   stepId?: string;
   taskName?: string;
@@ -51,8 +55,10 @@ type StepDraftErrors = {
   llmMaxTokens?: string;
 };
 
+// Reuse one empty object to avoid allocating placeholder error maps when no step is selected.
 const emptyStepDraftErrors: StepDraftErrors = {};
 
+// BuiltWorkflowDefinition mirrors the backend workflow definition JSON emitted by the builder.
 type BuiltWorkflowDefinition = {
   workflow_name: string;
   steps: Array<Record<string, unknown>>;
@@ -61,10 +67,12 @@ type BuiltWorkflowDefinition = {
   timeout_ms: number;
 };
 
+// nextStepUID is a process-local React key source; user-editable step ids cannot serve as stable keys.
 let nextStepUID = 0;
 
 // Render the visual workflow DAG editor and generated definition preview.
 export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | null }) {
+  // Hydrate the template once so stepUID allocation and initial canvas positions stay stable across renders.
   const initialSteps = useMemo(() => stepsFromDefinition(workflowTemplate), []);
   const [workflowName, setWorkflowName] = useState(stringValue(workflowTemplate.workflow_name) || "simple_add");
   const [maxAttempts, setMaxAttempts] = useState(numberText(workflowTemplate.max_attempts) || "3");
@@ -82,21 +90,26 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
   const canSubmit = roleAtLeast(session, "operator");
   const dagCanvasRef = useRef<HTMLDivElement>(null);
 
+  // Rebuild the emitted definition only when draft inputs change; validation and preview read from this value.
   const built = useMemo(() => buildWorkflowDefinition(workflowName, steps, resultStepId, maxAttempts, timeoutMs), [workflowName, steps, resultStepId, maxAttempts, timeoutMs]);
   const definitionJSON = useMemo(() => JSON.stringify(built.definition, null, 2), [built.definition]);
   const validation = useMemo(() => validateWorkflowForm(workflowName, definitionJSON), [workflowName, definitionJSON]);
   const topology = useMemo(() => analyzeWorkflowDefinition(built.definition), [built.definition]);
+  // Merge builder-level errors with JSON-schema validation so the UI can show one first error.
   const allErrors = { ...built.errors, ...validation.errors };
   const firstError = firstValidationError(allErrors);
   const formValid = built.valid && validation.valid;
   const validationPreview = formValid
     ? (validationResult ?? { valid: true, order: topology.order })
     : { valid: false, message: firstError, order: topology.order };
+  // Fall back to the first step if the selected uid was removed by template changes or delete actions.
   const currentStep = steps.find((step) => step.uid === selectedStepUid) ?? steps[0];
   const currentErrors = currentStep ? stepErrorsFor(built.errors, currentStep.uid) : emptyStepDraftErrors;
   const stepIDs = steps.map((step) => step.stepId.trim()).filter(Boolean);
+  // Connector selects recover from renamed/deleted steps by falling back to currently valid step ids.
   const effectiveConnectFrom = stepIDs.includes(connectFrom) ? connectFrom : stepIDs[0] ?? "";
   const effectiveConnectTo = stepIDs.includes(connectTo) ? connectTo : stepIDs.find((stepID) => stepID !== effectiveConnectFrom) ?? stepIDs[0] ?? "";
+  // Prevent self-edges and duplicate dependencies before the backend DAG validator runs.
   const canConnect = Boolean(effectiveConnectFrom && effectiveConnectTo && effectiveConnectFrom !== effectiveConnectTo && !stepByID(steps, effectiveConnectTo)?.dependsOn.includes(effectiveConnectFrom));
   const edges = workflowEdges(steps);
 
@@ -224,6 +237,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     if (!rect) return;
     setSelectedStepUid(step.uid);
     setDragging({ uid: step.uid, offsetX: event.clientX - rect.left - step.position.x, offsetY: event.clientY - rect.top - step.position.y });
+    // Capture the pointer so dragging continues even when the cursor leaves the button.
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
@@ -232,6 +246,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
     if (!dragging) return;
     const rect = dagCanvasRef.current?.getBoundingClientRect();
     if (!rect) return;
+    // Clamp by the node footprint so the visible button stays inside the canvas.
     const x = Math.max(10, Math.min(rect.width - 170, event.clientX - rect.left - dragging.offsetX));
     const y = Math.max(10, Math.min(rect.height - 102, event.clientY - rect.top - dragging.offsetY));
     updateStep(dragging.uid, { position: { x, y } });
@@ -328,6 +343,7 @@ export function WorkflowBuilderPage({ session }: { session?: ConsoleSession | nu
               {edges.map((edge) => {
                 const from = stepByID(steps, edge.from);
                 const to = stepByID(steps, edge.to);
+                // Draft edges can briefly reference renamed steps before validation rewrites the selection state.
                 if (!from || !to) return null;
                 return <line key={`${edge.from}->${edge.to}`} x1={from.position.x + 80} y1={from.position.y + 44} x2={to.position.x + 80} y2={to.position.y + 44} />;
               })}
@@ -389,6 +405,7 @@ function stepsFromDefinition(definition: unknown): WorkflowStepDraft[] {
   const rawSteps = Array.isArray(record.steps) ? record.steps : [];
   const steps = rawSteps.map((rawStep, index) => {
     const step = objectValue(rawStep);
+    // Function refs take precedence over hashes because ref mode requires both fields.
     const mode: TaskMode = stringValue(step.function_ref) ? "ref" : stringValue(step.function_hash) ? "hash" : "source";
     return {
       uid: stepUID(),
@@ -440,6 +457,7 @@ function stepDefinitionFromDraft(step: WorkflowStepDraft, errors: BuilderErrors,
   const stepID = step.stepId.trim();
   const taskName = step.taskName.trim();
   const functionName = step.functionName.trim();
+  // LLM steps are identified either by explicit model metadata or the reserved backend function name.
   const isLLMStep = Boolean(step.llmModelName.trim()) || functionName === "__logserve_llm__";
   if (!stepID) errors[key("stepId")] = "Step ID is required.";
   if (!taskName) errors[key("taskName")] = "Task name is required.";
@@ -463,7 +481,9 @@ function stepDefinitionFromDraft(step: WorkflowStepDraft, errors: BuilderErrors,
     step_id: stepID,
     task_name: taskName,
     function_name: functionName,
+    // Preserve invalid args text in the preview payload while field errors block submission.
     args_json: args.valid ? args.value : step.argsJson,
+    // Normalize dependencies so duplicate multi-select values cannot produce duplicate edges.
     depends_on: [...new Set(step.dependsOn.map((dep) => dep.trim()).filter(Boolean))],
     max_attempts: maxAttempts ?? inheritedAttempts,
     timeout_ms: timeoutMs ?? inheritedTimeout
@@ -514,6 +534,7 @@ function selectedValues(select: HTMLSelectElement): string[] {
 
 // Treat only non-array objects as workflow-definition records.
 function objectValue(value: unknown): Record<string, unknown> {
+  // Template definitions enter as unknown JSON, so narrow once at the read boundary.
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 

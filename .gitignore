@@ -1,10 +1,15 @@
+# Workspace-local Go runtime outputs and mutable service data.
 .gocache/
 bin/
 data/
+
+# Python SDK, executor, and smoke-test artifacts.
 __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+
+# Dashboard snapshots are regenerated from the current metadata state.
 dashboard/snapshot.json
 
 # Generated benchmark snapshots (keep README + baseline.example.json)
@@ -20,6 +25,7 @@ benchmarks/*.pprof
 # Top-level report JSON drops (final results live under reports/<run-id>/)
 reports/*.json
 
+# Local binaries, scratch documents, and vendored trees are not source review targets.
 *.word
 *.test
 *.exe

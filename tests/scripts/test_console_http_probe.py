@@ -1,3 +1,4 @@
+# Tests the console HTTP probe contract using a deterministic fake web/API surface.
 import importlib.util
 import json
 import unittest
@@ -8,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts" / "console_http_probe.py"
 
 
+# load_module imports the probe script by path so tests exercise the working tree copy.
 def load_module():
     spec = importlib.util.spec_from_file_location("console_http_probe", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -15,11 +17,14 @@ def load_module():
     return module
 
 
+# ConsoleHTTPProbeTest drives the probe against a fake HTTP layer instead of a live web server.
 class ConsoleHTTPProbeTest(unittest.TestCase):
+    # test_probe_passes_expected_console_surface verifies every expected console route and API check can pass together.
     def test_probe_passes_expected_console_surface(self):
         module = load_module()
         seen = {}
 
+        # fake_http_request is a stateful router for the probe; it records model/backpressure values so later checks can assert continuity.
         def fake_http_request(method, url, token=None, body=None, timeout=10):
             if url.endswith("/api/healthz"):
                 return {"status": 200, "content_type": "application/json", "body": '{"status":"ok"}'}
@@ -149,6 +154,7 @@ class ConsoleHTTPProbeTest(unittest.TestCase):
                 return {"status": 200, "content_type": "application/json", "body": json.dumps(payload)}
             return {"status": 404, "content_type": "text/plain", "body": url}
 
+        # Replace network I/O with the fake router so this remains a deterministic unit test.
         module.http_request = fake_http_request
         summary = module.run_probe("http://127.0.0.1:8080", "secret", 1)
 

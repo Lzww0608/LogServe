@@ -9,6 +9,7 @@ import { usePolling } from "../hooks/usePolling";
 
 // Render registered functions and shortcuts into task submission.
 export function FunctionsPage() {
+  // Function registrations change less often than task state, so this route polls on a slower cadence.
   const state = usePolling(() => api.functions(), 2000);
   const [message, setMessage] = useState("");
 
@@ -16,6 +17,7 @@ export function FunctionsPage() {
   const copyHash = async (functionHash: string) => {
     setMessage("");
     try {
+      // Browser clipboard access can fail outside secure contexts or without user permission.
       await navigator.clipboard.writeText(functionHash);
       setMessage("Copied hash");
     } catch {

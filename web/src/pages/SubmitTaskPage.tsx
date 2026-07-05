@@ -14,6 +14,7 @@ import { errorMessage } from "../utils/status";
 import type { ConsoleSession } from "../types/logserve";
 import { roleAtLeast } from "../utils/roles";
 
+// Built-in examples keep the form usable without requiring a registered function first.
 const sleepSource = `import time
 
 def sleep_ms(ms: int) -> str:
@@ -21,18 +22,22 @@ def sleep_ms(ms: int) -> str:
     return f"slept {ms} ms"
 `;
 
+// taskTemplates define local form presets only; the submitted payload is still built from current state.
 const taskTemplates = {
   add: { label: "Add", taskName: "add", functionName: "add", source: addSource, args: "[1, 2]", kwargs: "{}" },
   fail: { label: "Fail", taskName: "fail", functionName: "fail", source: failSource, args: "[]", kwargs: "{}" },
   sleep: { label: "Sleep", taskName: "sleep_ms", functionName: "sleep_ms", source: sleepSource, args: "[250]", kwargs: "{}" }
 } as const;
 
+// TemplateID includes custom so manual edits can leave the preset selector without losing form state.
 type TemplateID = keyof typeof taskTemplates | "custom";
+// FormMessage carries both validation failures and non-error confirmations through one UI slot.
 type FormMessage = { tone: "error" | "info"; text: string };
 
 // Render task submission controls with client-side JSON validation.
 export function SubmitTaskPage({ session }: { session?: ConsoleSession | null }) {
   const taskParams = new URLSearchParams(window.location.search);
+  // Function registry shortcuts seed hash/ref mode through URL query parameters.
   const initialFunctionHash = taskParams.get("function_hash") ?? "";
   const initialFunctionName = taskParams.get("function_name") ?? "";
   const [mode, setMode] = useState<"source" | "ref" | "hash">(initialFunctionHash ? "hash" : "source");
@@ -48,6 +53,7 @@ export function SubmitTaskPage({ session }: { session?: ConsoleSession | null })
   const [stayAfterSubmit, setStayAfterSubmit] = useState(false);
   const [message, setMessage] = useState<FormMessage | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // The button gate mirrors backend authorization; submit still checks the role before issuing the request.
   const canSubmit = roleAtLeast(session, "operator");
 
   const validation = useMemo(() => validateTaskForm({
@@ -61,6 +67,7 @@ export function SubmitTaskPage({ session }: { session?: ConsoleSession | null })
     kwargsText: kwargs
   }), [mode, taskName, functionName, source, functionRef, functionHash, args, kwargs]);
 
+  // The preview payload uses safe fallbacks while JSON is invalid; submit uses parsed values only.
   const payload = {
     task_name: taskName,
     function_name: functionName,
@@ -126,6 +133,7 @@ export function SubmitTaskPage({ session }: { session?: ConsoleSession | null })
     const value = kind === "args" ? args : kwargs;
     const setter = kind === "args" ? setArgs : setKwargs;
     try {
+      // Empty input formats as JSON null here so users get immediate parser feedback without submitting.
       setter(JSON.stringify(JSON.parse(value || "null"), null, 2));
       setMessage({ tone: "info", text: `${kind === "args" ? "Args" : "Kwargs"} JSON formatted.` });
     } catch (error) {

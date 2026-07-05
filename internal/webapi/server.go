@@ -19,9 +19,13 @@ import (
 // Server owns the HTTP mux, normalized configuration, backend clients, and small
 // in-memory caches used by web-console handlers.
 type Server struct {
-	cfg                   Config
-	clients               *Clients
-	mux                   *http.ServeMux
+	// cfg is normalized during construction and then treated as read-mostly.
+	cfg Config
+	// clients owns the control/log gRPC clients shared by all handlers.
+	clients *Clients
+	// mux contains only raw route handlers; Handler wraps it with middleware.
+	mux *http.ServeMux
+	// functionRegistryCache tails system:functions across list/detail requests.
 	functionRegistryCache *functionRegistryCache
 }
 
@@ -125,6 +129,9 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	if staticDir == "" {
 		staticDir = "web/dist"
 	}
+	// Clean the URL path before joining so SPA deep links and odd slashes resolve
+	// consistently under StaticDir. filepath.Join below still anchors relative paths
+	// under StaticDir; API paths were rejected above before this static fallback.
 	cleanPath := strings.TrimPrefix(filepath.Clean(r.URL.Path), string(os.PathSeparator))
 	path := filepath.Join(staticDir, cleanPath)
 	if info, err := os.Stat(path); err == nil && !info.IsDir() {

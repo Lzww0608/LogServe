@@ -1,7 +1,7 @@
+// Package objectstore persists large immutable runtime payloads and returns
+// compact refs that can be stored in metadata or replay logs.
 package objectstore
 
-// This file defines the object-store abstraction used for larger runtime
-// payloads such as result blobs, snapshots, and checkpoint-adjacent artifacts.
 import (
 	"bytes"
 	"context"
@@ -17,19 +17,29 @@ import (
 // stored in metadata or log records. Implementations should honor ctx while
 // copying data and reject unsupported ref schemes on Get.
 type Store interface {
+	// Put writes the reader into namespace and returns a backend-specific ref.
+	// size >= 0 is treated as an expected byte count; size < 0 means unknown.
 	Put(ctx context.Context, namespace string, r io.Reader, size int64) (string, error)
+	// Get opens a ref produced by a compatible backend and returns a stream plus
+	// best-effort metadata. Callers own and must close the returned reader.
 	Get(ctx context.Context, ref string) (io.ReadCloser, ObjectInfo, error)
 }
 
 // ObjectInfo describes an opened object and carries backend checksum metadata
 // when available.
 type ObjectInfo struct {
-	Ref            string
-	Size           int64
-	SHA256         string
+	// Ref is the original object ref used to open the object.
+	Ref string
+	// Size is the object byte length when known; S3 may report -1 for streaming bodies.
+	Size int64
+	// SHA256 is the whole-object content hash when the backend can recover it.
+	SHA256 string
+	// ChecksumSHA256 is the backend checksum header value when present.
 	ChecksumSHA256 string
-	ETag           string
-	Metadata       map[string]string
+	// ETag is the backend entity tag for systems that expose one.
+	ETag string
+	// Metadata carries normalized backend user metadata.
+	Metadata map[string]string
 }
 
 // PutBytes stores an in-memory byte slice through a Store and returns its ref.
@@ -51,6 +61,8 @@ func GetBytes(ctx context.Context, s Store, ref string, maxBytes int64) ([]byte,
 		return nil, err
 	}
 	defer rc.Close()
+	// Known size metadata can fail fast, but the stream is still limited below so
+	// backends with unknown or stale sizes cannot bypass maxBytes.
 	if maxBytes >= 0 && info.Size > maxBytes {
 		return nil, fmt.Errorf("object %s is %d bytes, exceeds max %d", ref, info.Size, maxBytes)
 	}
@@ -79,6 +91,8 @@ func OpenFromEnv(ctx context.Context) (Store, error) {
 	case "", "local":
 		dir := os.Getenv("LOGSERVE_OBJECTSTORE_DIR")
 		if dir == "" {
+			// The default is intentionally process-external temp storage so dev
+			// services can restart and still resolve refs written earlier.
 			dir = filepath.Join(os.TempDir(), "logserve-objectstore")
 		}
 		return OpenLocal(dir)

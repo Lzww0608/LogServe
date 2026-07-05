@@ -13,6 +13,8 @@ import (
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.DevCORS {
+			// Development CORS is intentionally broad because the Vite dev server runs
+			// on a separate origin from the Go API during local console work.
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
@@ -22,6 +24,8 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 			}
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
+			// API request IDs are normalized before auth so denied requests still carry
+			// the same response header and audit context as accepted requests.
 			var id string
 			r, id = ensureRequestID(r)
 			w.Header().Set("X-Request-ID", id)

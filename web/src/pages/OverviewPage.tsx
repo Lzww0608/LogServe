@@ -23,6 +23,7 @@ export function OverviewPage({ session }: { session?: ConsoleSession | null }) {
     setLastRefreshAt(Date.now());
     setError("");
   }, []);
+  // The dashboard stream emits full snapshots, so replacing local state is safe on each event.
   const streamState = useEventStream({ intervalMs: 1000 }, { onMessage: handleMessage, onError: setError }, []);
   if (error && !dashboard) return <ErrorPanel message={error} />;
   if (!dashboard) return <Loading />;
@@ -33,7 +34,9 @@ export function OverviewPage({ session }: { session?: ConsoleSession | null }) {
   const failedTasks = dashboard.tasks.filter((task) => task.status === "FAILED");
   const workerCapacity = dashboard.workers.reduce((sum, worker) => sum + (worker.capacity || 0), 0);
   const workerRunning = dashboard.workers.reduce((sum, worker) => sum + (worker.running_tasks || 0), 0);
+  // When the backend does not provide a high watermark, use the current depth as a non-zero denominator.
   const queuePressure = percent(dashboard.queue_depth, dashboard.queue_high_watermark || Math.max(1, dashboard.queue_depth));
+  // Empty capacity reports should not produce NaN while workers are still starting.
   const workerUtilization = percent(workerRunning, workerCapacity || Math.max(1, workerRunning));
   const materializer = dashboard.metadata_materializer;
   const materializerLag = materializer?.eventual_lag_estimate_ms ?? 0;

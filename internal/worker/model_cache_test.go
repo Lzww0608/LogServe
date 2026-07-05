@@ -169,6 +169,8 @@ func TestModelCheckpointCacheAllowsDifferentModelsToLoadConcurrently(t *testing.
 
 	originalCopy := copyCheckpointFunc
 	originalRead := readCheckpointFunc
+	// Buffered start notifications let both copy goroutines report progress before
+	// the test releases either one; an unbuffered channel could accidentally serialize the test.
 	copyStarted := make(chan string, 2)
 	releaseCopies := make(chan struct{})
 
@@ -220,6 +222,8 @@ func TestModelCheckpointCacheAllowsDifferentModelsToLoadConcurrently(t *testing.
 	}
 
 	started := map[string]bool{}
+	// A short timeout catches an accidental global load lock while keeping the test
+	// bounded if a goroutine fails before signaling copyStarted.
 	timeout := time.After(500 * time.Millisecond)
 	for len(started) < 2 {
 		select {
@@ -295,6 +299,7 @@ func TestModelCheckpointCacheSnapshotDoesNotWaitForColdLoadIO(t *testing.T) {
 		t.Fatal("checkpoint copy did not start")
 	}
 
+	// Buffer the result so the goroutine can finish even if the timeout branch wins.
 	snapshotDone := make(chan []*logservepb.ModelCacheEntry, 1)
 	go func() {
 		snapshotDone <- cache.snapshotEntries()

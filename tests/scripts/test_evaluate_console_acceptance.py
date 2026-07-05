@@ -1,3 +1,4 @@
+# Tests the console acceptance evaluator across packaged, lightweight, and failed inputs.
 import importlib.util
 import io
 import json
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts" / "evaluate_console_acceptance.py"
 
 
+# load_module imports the evaluator from scripts/ without requiring it to be installed as a package.
 def load_module():
     spec = importlib.util.spec_from_file_location("evaluate_console_acceptance", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -19,6 +21,7 @@ def load_module():
     return module
 
 
+# write_summary creates the minimal acceptance_summary.json shape consumed by evaluate_result.
 def write_summary(root, run_docker=True, verdict="PASS", probe_verdict="PASS", probe_checks=None, include_package_command=True):
     if probe_checks is None:
         probe_checks = {
@@ -95,13 +98,16 @@ def write_summary(root, run_docker=True, verdict="PASS", probe_verdict="PASS", p
     (root / "acceptance_summary.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+# make_package builds a tar.gz fixture so materialize_input can be tested through the packaged path.
 def make_package(source_dir, package_path):
     with tarfile.open(package_path, "w:gz") as archive:
         for path in source_dir.rglob("*"):
             archive.add(path, arcname=path.relative_to(source_dir))
 
 
+# ConsoleAcceptanceEvaluationTest covers evaluator verdicts for full, lightweight, failed, and packaged inputs.
 class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
+    # test_full_pass_result_matches_expectations proves a complete Docker-backed acceptance run maps to PASS.
     def test_full_pass_result_matches_expectations(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -115,6 +121,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("PASS", result["features_6_10"]["verdict"])
             self.assertEqual("PASS", result["frontend_admin_functions"]["verdict"])
 
+    # test_lightweight_result_is_incomplete preserves the rule that local-only runs are incomplete, not full PASS.
     def test_lightweight_result_is_incomplete(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -128,6 +135,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("INCOMPLETE", result["features_6_10"]["verdict"])
             self.assertEqual("INCOMPLETE", result["frontend_admin_functions"]["verdict"])
 
+    # test_lightweight_failed_local_check_is_fail ensures local gate failures still fail without Docker evidence.
     def test_lightweight_failed_local_check_is_fail(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -146,6 +154,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("FAIL", result["verdict"])
             self.assertTrue(any("go_web_tests" in item for item in result["failures"]))
 
+    # test_rejects_unsafe_tar_link_member protects extraction against symlink traversal entries.
     def test_rejects_unsafe_tar_link_member(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -159,6 +168,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unsafe tar link member"):
                 module.materialize_input(package)
 
+    # test_failed_probe_result_fails_expectations verifies probe failures propagate into evaluator failures.
     def test_failed_probe_result_fails_expectations(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -170,6 +180,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("FAIL", result["verdict"])
             self.assertTrue(any("dashboard_requires_auth" in item for item in result["failures"]))
 
+    # test_failed_feature_group_fails_expectations keeps feature 6-10 grouping tied to probe check names.
     def test_failed_feature_group_fails_expectations(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -187,6 +198,7 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("FAIL", result["features_6_10"]["features"]["feature_8_worker_cache_matrix"]["state"])
             self.assertTrue(any("feature_8_worker_cache_matrix" in item for item in result["failures"]))
 
+    # test_failed_frontend_admin_group_fails_expectations covers the admin/functions feature group verdict.
     def test_failed_frontend_admin_group_fails_expectations(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -203,6 +215,8 @@ class ConsoleAcceptanceEvaluationTest(unittest.TestCase):
             self.assertEqual("FAIL", result["verdict"])
             self.assertEqual("FAIL", result["frontend_admin_functions"]["verdict"])
             self.assertTrue(any("frontend admin/functions" in item for item in result["failures"]))
+
+    # test_main_accepts_package exercises CLI-style package input and verifies extracted warnings stay empty.
     def test_main_accepts_package(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:

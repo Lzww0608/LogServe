@@ -18,6 +18,7 @@ export function TemplatesPage({ session }: { session?: ConsoleSession | null }) 
   const [running, setRunning] = useState("");
   const [runError, setRunError] = useState("");
   const [result, setResult] = useState<TemplateRunResponse | null>(null);
+  // This page can still render metadata for viewers; only run actions are role gated.
   const canRunAny = roleAtLeast(session, "operator");
 
   useEffect(() => {
@@ -51,6 +52,7 @@ export function TemplatesPage({ session }: { session?: ConsoleSession | null }) 
     setRunning(template.id);
     setRunError("");
     try {
+      // Template runs are side-effecting, so the UI supplies an idempotency key per click.
       setResult(await api.runTemplate(template.id, { idempotency_key: defaultID(`ui-template-${template.id}`) }));
     } catch (runError) {
       setRunError(errorMessage(runError));

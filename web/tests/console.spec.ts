@@ -4,6 +4,7 @@ import { expect, test, chromium, type Page } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
+// Serial mode keeps shared browser-session and mock-server assumptions deterministic.
 test.describe.configure({ mode: "serial" });
 
 // Verifies settings saves token and sends it on console requests.
@@ -16,6 +17,7 @@ test("settings saves token and sends it on console requests", async ({ page }) =
   await expect(page.getByText("Saved")).toBeVisible();
   await expect(page.evaluate(() => sessionStorage.getItem("logserve.console.token"))).resolves.toBe("browser-token");
 
+  // Wait on the dashboard SSE request because it proves both auth and request-id headers survived navigation.
   const authorizedRequest = page.waitForRequest((request) =>
     request.url().includes("/api/events") && request.headers().authorization === "Bearer browser-token" && Boolean(request.headers()["x-request-id"])
   );
@@ -190,6 +192,7 @@ test("logs page switches stream groups and stream details", async ({ page }) => 
   await expect(page.getByText("Seq 1-2 before 5")).toBeVisible();
 
   await page.getByLabel("Limit").fill("5000");
+  // The page clamps large limits before they reach the mock API's INVALID_ARGUMENT path.
   await expect(page.getByLabel("Limit")).toHaveValue("1000");
   await expect(page.getByText("INVALID_ARGUMENT")).toHaveCount(0);
 
@@ -225,6 +228,7 @@ test("mobile viewport screenshot has no collapsed console layout", async ({ page
 
 // Verifies Lighthouse accessibility score is at least 90 @lighthouse.
 test("Lighthouse accessibility score is at least 90 @lighthouse", async ({ baseURL }, testInfo) => {
+  // Offset the debugging port by worker index so retries or sharding do not collide locally.
   const remoteDebuggingPort = 9222 + testInfo.workerIndex;
   const browser = await chromium.launch({
     args: [
@@ -245,6 +249,7 @@ test("Lighthouse accessibility score is at least 90 @lighthouse", async ({ baseU
       logLevel: "error"
     });
     const score = result?.lhr.categories.accessibility.score ?? 0;
+    // Lighthouse returns [json, html] when multiple outputs are requested.
     const reports = Array.isArray(result?.report) ? result.report : [result?.report ?? ""];
     await writeArtifact(testInfo.outputPath("lighthouse-accessibility.json"), reports[0]);
     await writeArtifact(testInfo.outputPath("lighthouse-accessibility.html"), reports[1] ?? "");
@@ -267,6 +272,7 @@ async function expectOverview(page: Page): Promise<void> {
 
 // Assert the document does not horizontally overflow the viewport.
 async function expectNoDocumentOverflow(page: Page): Promise<void> {
+  // Measure in the browser context so CSS overflow is checked after layout, not inferred from selectors.
   const overflow = await page.evaluate(() => ({
     viewportWidth: document.documentElement.clientWidth,
     scrollWidth: document.documentElement.scrollWidth

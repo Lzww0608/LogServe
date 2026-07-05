@@ -11,6 +11,7 @@ export function SettingsPage({ session, onSessionChange }: { session?: ConsoleSe
   const [message, setMessage] = useState("");
   // Save the entered token and trigger a session refresh in the app shell.
   const save = () => {
+    // Updating storage alone is not enough; the app shell must re-read /session.
     setStoredToken(token);
     onSessionChange?.();
     setMessage("Saved");
@@ -18,6 +19,7 @@ export function SettingsPage({ session, onSessionChange }: { session?: ConsoleSe
   // Clear the stored token and reset visible session state.
   const clear = () => {
     setToken("");
+    // Persist the empty token before notifying the shell so later API calls use viewer access.
     setStoredToken("");
     onSessionChange?.();
     setMessage("Cleared");

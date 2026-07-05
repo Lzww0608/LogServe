@@ -21,6 +21,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 func permissionsForRole(value role) []string {
 	permissions := []string{"read:dashboard", "read:tasks", "read:workflows", "read:logs", "read:templates"}
 	if roleAllows(value, roleOperator) {
+		// Higher roles inherit lower-role feature flags so the frontend can gate by
+		// capability strings without duplicating the role hierarchy.
 		permissions = append(permissions,
 			"submit:tasks",
 			"submit:workflows",

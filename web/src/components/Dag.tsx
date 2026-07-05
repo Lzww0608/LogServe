@@ -8,9 +8,12 @@ import { DetailGrid } from "./DetailGrid";
 import { JsonViewer } from "./JsonViewer";
 import { StatusBadge } from "./StatusBadge";
 
+// WorkflowStep reuses the API payload shape so the graph stays aligned with backend fields.
 type WorkflowStep = NonNullable<Workflow["steps"]>[number];
+// Position stores absolute graph coordinates in CSS pixels.
 type Position = { x: number; y: number };
 
+// DagLayout is the computed graph model shared by SVG edges and positioned nodes.
 type DagLayout = {
   positions: Map<string, Position>;
   edges: Array<{ from: string; to: string }>;
@@ -18,14 +21,20 @@ type DagLayout = {
   height: number;
 };
 
+// Layout constants keep graph geometry stable across data refreshes and node selection.
 const nodeWidth = 172;
+// nodeHeight matches the fixed node body used by edge y-coordinate math.
 const nodeHeight = 96;
+// xGap separates dependency levels so edge lines stay readable.
 const xGap = 84;
+// yGap separates nodes within the same dependency level.
 const yGap = 34;
+// margin leaves room for node focus rings and edge endpoints inside the SVG canvas.
 const margin = 36;
 
 // Render an inspectable workflow DAG with selectable nodes and a detail drawer.
 export function Dag({ steps }: { steps: NonNullable<Workflow["steps"]> }) {
+  // Keep selection by step id so polling updates do not reset the selected drawer when rows refresh.
   const [selectedID, setSelectedID] = useState(steps[0]?.step_id ?? "");
   const layout = useMemo(() => buildLayout(steps), [steps]);
   if (!steps.length) return <div className="empty empty-state">No steps yet. Submit or replay a workflow to populate the DAG.</div>;
@@ -38,6 +47,7 @@ export function Dag({ steps }: { steps: NonNullable<Workflow["steps"]> }) {
             {layout.edges.map((edge) => {
               const from = layout.positions.get(edge.from);
               const to = layout.positions.get(edge.to);
+              // Unknown dependency ids are tolerated here; validation surfaces them before submit.
               if (!from || !to) return null;
               return <line key={`${edge.from}->${edge.to}`} x1={from.x + nodeWidth} y1={from.y + nodeHeight / 2} x2={to.x} y2={to.y + nodeHeight / 2} />;
             })}
@@ -98,9 +108,12 @@ function PanelHeading({ step }: { step: WorkflowStep }) {
 // Lay out workflow steps by dependency depth and produce SVG edge coordinates.
 function buildLayout(steps: WorkflowStep[]): DagLayout {
   const byID = new Map(steps.map((step) => [step.step_id, step]));
+  // Cache depths because shared dependencies can be visited by many downstream steps.
   const depthCache = new Map<string, number>();
+  // Resolve dependency depth recursively; visiting guards cycles from making the render loop unbounded.
   const depthFor = (step: WorkflowStep, visiting = new Set<string>()): number => {
     if (depthCache.has(step.step_id)) return depthCache.get(step.step_id) ?? 0;
+    // Cycles should already be rejected, but return root depth defensively to keep rendering finite.
     if (visiting.has(step.step_id)) return 0;
     visiting.add(step.step_id);
     const deps = step.depends_on ?? [];
@@ -115,6 +128,7 @@ function buildLayout(steps: WorkflowStep[]): DagLayout {
     return depth;
   };
 
+  // Depth buckets become columns; order inside each bucket follows the backend step order.
   const levels = new Map<number, WorkflowStep[]>();
   for (const step of steps) {
     const depth = depthFor(step);
@@ -135,6 +149,7 @@ function buildLayout(steps: WorkflowStep[]): DagLayout {
     });
   }
 
+  // Edges preserve declared dependency direction from prerequisite step to dependent step.
   const edges = steps.flatMap((step) => (step.depends_on ?? []).map((dependency) => ({ from: dependency, to: step.step_id })));
   return {
     positions,

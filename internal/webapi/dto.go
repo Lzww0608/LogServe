@@ -10,7 +10,8 @@ import (
 )
 
 // DashboardDTO is the aggregated console snapshot returned by dashboard and SSE
-// endpoints.
+// endpoints. Slice fields are intentionally emitted as empty arrays rather than
+// null so the frontend can render tables without per-field nil checks.
 type DashboardDTO struct {
 	QueueDepth                uint32                   `json:"queue_depth"`
 	QueueHighWatermark        uint32                   `json:"queue_high_watermark"`
@@ -29,7 +30,8 @@ type DashboardDTO struct {
 }
 
 // TaskDTO is the frontend shape for task state from dashboard, status, and wait
-// responses.
+// responses. Result stays as raw JSON because task outputs can be arbitrary JSON
+// documents and should not be coerced through Go map decoding.
 type TaskDTO struct {
 	TaskID          string          `json:"task_id"`
 	TaskName        string          `json:"task_name,omitempty"`
@@ -190,6 +192,8 @@ type LLMEventDTO struct {
 // dashboardDTO converts a protobuf dashboard snapshot into non-nil JSON slices so
 // empty collections serialize as arrays rather than null.
 func dashboardDTO(snapshot *logservepb.DashboardSnapshot) DashboardDTO {
+	// Pre-seed slices before the nil check so an unavailable dashboard still has
+	// the same JSON shape as an empty dashboard.
 	out := DashboardDTO{
 		Tasks:     []TaskDTO{},
 		Workflows: []WorkflowDTO{},
@@ -285,6 +289,8 @@ func dashboardWorkflowDTO(wf *logservepb.DashboardWorkflow) WorkflowDTO {
 	}
 	for _, step := range wf.GetSteps() {
 		dto := stepDTO(step)
+		// Counters are derived from normalized DTO strings so dashboard and detail
+		// responses use the same status vocabulary.
 		out.Steps = append(out.Steps, dto)
 		out.StepCount++
 		switch dto.Status {
@@ -333,6 +339,8 @@ func workflowStatusDTO(resp *logservepb.GetWorkflowStatusResponse) WorkflowDTO {
 // stepDTO converts one protobuf workflow step and copies dependency slices for
 // caller ownership.
 func stepDTO(step *logservepb.WorkflowStepState) StepDTO {
+	// Copy dependency slices so later protobuf reuse or mutation cannot affect the
+	// already-built response object.
 	return StepDTO{
 		StepID:        step.GetStepId(),
 		DependsOn:     append([]string(nil), step.GetDependsOn()...),
@@ -407,6 +415,8 @@ func workerDTO(worker *logservepb.DashboardWorker) WorkerDTO {
 // llmReplayDTO converts replay output into the LLMDTO shape used by the console
 // timeline and cache panels.
 func llmReplayDTO(resp *logservepb.ReplayLLMResponse) LLMDTO {
+	// Replay fields mirror the worker's lifecycle events rather than live task
+	// status, which keeps cache/latency diagnostics stable after completion.
 	out := LLMDTO{
 		TaskID:             resp.GetTaskId(),
 		ModelName:          resp.GetModelName(),

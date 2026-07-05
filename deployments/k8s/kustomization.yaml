@@ -1,3 +1,5 @@
+# Minimal local kustomize bundle for kind or other developer clusters. Resource
+# ordering keeps namespace/secret creation before workload manifests.
 resources:
   - namespace.yaml
   - logd.yaml

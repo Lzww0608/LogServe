@@ -215,6 +215,8 @@ func (s *Server) runMockLLMTemplate(r *http.Request, idempotencyKey string) (LLM
 	if err != nil {
 		return LLMDTO{}, err
 	}
+	// The route audit records run_template; emit a second explicit audit entry for
+	// the admin-only model registration side effect hidden inside this template.
 	s.auditFrontendOperation(r, principalFromRequest(r), "register_model", http.StatusOK, registerStarted)
 	resp, err := s.clients.Control.SubmitLLM(ctx, &logservepb.SubmitLLMRequest{
 		ModelName:      "model-A",
@@ -296,6 +298,8 @@ func builtinTemplate(id string, includePayload bool) (templateDTO, bool) {
 // simpleRAGWorkflowDefinition returns the built-in three-step DAG used by the
 // simple RAG workflow template.
 func simpleRAGWorkflowDefinition() map[string]any {
+	// __step_ref__ markers are consumed by the workflow package as references to
+	// prior step outputs; keep them in the payload rather than pre-resolving here.
 	return map[string]any{
 		"workflow_name": "simple_rag",
 		"steps": []map[string]any{
@@ -309,14 +313,17 @@ func simpleRAGWorkflowDefinition() map[string]any {
 	}
 }
 
+// addTaskSource is the Python source used by the add_task template.
 const addTaskSource = `def add(a: int, b: int) -> int:
     return a + b
 `
 
+// failTaskSource intentionally raises to demonstrate failure-path handling.
 const failTaskSource = `def fail() -> None:
     raise RuntimeError("demo failure")
 `
 
+// sleepTaskSource creates a short-running task for wait/polling demonstrations.
 const sleepTaskSource = `import time
 
 def sleep_task(seconds: float) -> str:
@@ -324,6 +331,7 @@ def sleep_task(seconds: float) -> str:
     return f"slept:{seconds}"
 `
 
+// counterTemplateSource is the actor class used by the actor_counter template.
 const counterTemplateSource = `class Counter:
     def __init__(self, value=0):
         self.value = value
@@ -336,14 +344,17 @@ const counterTemplateSource = `class Counter:
         return self.value
 `
 
+// embedSource is the first step of the simple RAG workflow template.
 const embedSource = `def embed(query: str) -> str:
     return "vec:" + query
 `
 
+// searchSource is the dependency-consuming lookup step of the simple RAG template.
 const searchSource = `def search(vec: str) -> list[str]:
     return ["doc:" + vec]
 `
 
+// generateMockSource produces the final mock answer for the simple RAG template.
 const generateMockSource = `def generate_mock(query: str, docs: list[str]) -> str:
     return "answer:" + query + ":" + docs[0]
 `

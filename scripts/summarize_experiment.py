@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
+# Summarize a LogServe experiment run directory into JSON and Markdown reports.
 import json
 import re
 import sys
 from pathlib import Path
 
 
+# Go benchmark logs mix standard ns/op metrics with custom unit suffixes emitted by
+# project benchmarks, so parsing keeps the raw line and a flexible metric map.
 BENCH_LINE = re.compile(r"^(Benchmark\S+)\s+\d+\s+(.+)$")
 
 
+# Load an optional JSON artifact, returning None when it is absent or malformed.
 def read_json(path):
     if not path.exists():
         return None
@@ -17,12 +21,14 @@ def read_json(path):
         return None
 
 
+# Load an optional text artifact with BOM tolerance and replacement for bad bytes.
 def read_text(path):
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8-sig", errors="replace")
 
 
+# Read command_status.jsonl and preserve malformed lines as failed command statuses.
 def read_statuses(run_dir):
     path = run_dir / "command_status.jsonl"
     if not path.exists():
@@ -34,24 +40,30 @@ def read_statuses(run_dir):
             continue
         try:
             out.append(json.loads(line))
+        # A malformed status line is still evidence of a failed run; keep it in
+        # the command list instead of dropping it from the verdict calculation.
         except json.JSONDecodeError:
             out.append({"name": "malformed_status_line", "exit_code": 1, "duration_sec": 0, "log": ""})
     return out
 
 
+# Parse environment.txt key-value lines into a dictionary for report metadata.
 def read_environment(run_dir):
     out = {}
     for line in read_text(run_dir / "environment.txt").splitlines():
+        # Ignore indented diagnostic lines such as uname/go/docker output in environment.txt.
         if "=" in line and not line.startswith(" "):
             key, value = line.split("=", 1)
             out[key.strip()] = value.strip()
     return out
 
 
+# Render a command exit code as a PASS or FAIL label.
 def status_label(code):
     return "PASS" if code == 0 else "FAIL"
 
 
+# Render optional numeric values for Markdown, using n/a for missing values.
 def pct(value):
     if value is None:
         return "n/a"
@@ -60,6 +72,7 @@ def pct(value):
     return str(value)
 
 
+# Return the first present key from a dictionary for snake_case and camelCase compatibility.
 def pick_present(data, *keys):
     if not isinstance(data, dict):
         return None
@@ -69,9 +82,11 @@ def pick_present(data, *keys):
     return None
 
 
+# Coerce common scalar values to numbers while returning None for missing or nonnumeric input.
 def as_number(value):
     if value is None:
         return None
+    # bool is a subclass of int in Python; convert explicitly so True/False stay intentional.
     if isinstance(value, bool):
         return int(value)
     if isinstance(value, (int, float)):
@@ -82,6 +97,7 @@ def as_number(value):
         return None
 
 
+# Construct one normalized check record with optional actual and expected values.
 def check(name, status, detail, actual=None, expected=None):
     item = {"name": name, "status": status, "detail": detail}
     if actual is not None:
@@ -91,6 +107,7 @@ def check(name, status, detail, actual=None, expected=None):
     return item
 
 
+# Parse Go benchmark log output into normalized benchmark rows and metric maps.
 def parse_go_benchmarks(path):
     out = []
     for raw in read_text(path).splitlines():
@@ -101,6 +118,7 @@ def parse_go_benchmarks(path):
         tokens = rest.split()
         metrics = {}
         i = 0
+        # Metrics are emitted as value/unit pairs; unknown tokens are skipped without aborting the row.
         while i + 1 < len(tokens):
             try:
                 value = float(tokens[i])
@@ -114,6 +132,8 @@ def parse_go_benchmarks(path):
                 metrics["bytes_per_op"] = value
             elif unit == "allocs/op":
                 metrics["allocs_per_op"] = value
+            # Some local benchmarks emit custom unit labels; normalize dashes so
+            # the generated JSON remains usable as object keys.
             elif unit.endswith("-ns") or unit.endswith("-ms") or unit.endswith("-rate"):
                 metrics[unit.replace("-", "_")] = value
             i += 2
@@ -121,6 +141,7 @@ def parse_go_benchmarks(path):
     return out
 
 
+# Extract user-facing benchmark highlights and explanatory notes from benchmark.json.
 def benchmark_highlights(data):
     if not isinstance(data, dict):
         return {}, []
@@ -169,12 +190,15 @@ def benchmark_highlights(data):
         highlights["resource_only_p95_latency_ms"] = resource.get("p95_latency_ms")
         highlights["locality_aware_p95_latency_ms"] = aware.get("p95_latency_ms")
         highlights["predicted_latency_p95_latency_ms"] = predicted.get("p95_latency_ms")
+        # A lower locality-aware hit rate is not an automatic failure because small
+        # workloads can be noisy, but it should be called out in report notes.
         if aware.get("cache_hit_rate") is not None and resource.get("cache_hit_rate") is not None:
             if aware["cache_hit_rate"] < resource["cache_hit_rate"]:
                 notes.append("locality-aware cache hit rate was lower than resource-only; inspect worker placement and workload size.")
     return highlights, notes
 
 
+# Flatten logstore policy benchmark results into report-friendly metric keys.
 def logstore_highlights(data):
     if not isinstance(data, dict):
         return {}
@@ -192,6 +216,7 @@ def logstore_highlights(data):
     return out
 
 
+# Extract cold and warm checkpoint-cache evidence from the checkpoint probe artifact.
 def checkpoint_highlights(data):
     if not isinstance(data, dict):
         return {}
@@ -211,6 +236,7 @@ def checkpoint_highlights(data):
     }
 
 
+# Extract PostgreSQL benchmark stats only when the artifact reports availability.
 def postgres_highlights(data):
     if not isinstance(data, dict) or not data.get("available"):
         return {}
@@ -224,6 +250,7 @@ def postgres_highlights(data):
     }
 
 
+# Extract dashboard replay consistency evidence for workflows and actors.
 def dashboard_replay_highlights(data):
     if not isinstance(data, dict):
         return {}
@@ -235,9 +262,12 @@ def dashboard_replay_highlights(data):
         "dashboard_replay_failures": data.get("failures") or [],
     }
 
+# Extract dashboard counts, queue depth, compaction, and metadata materializer metrics.
 def dashboard_highlights(data):
     if not isinstance(data, dict):
         return {}
+    # Dashboard snapshots have existed with both JSON naming styles; accept both
+    # so old and new experiment artifacts summarize into the same fields.
     materializer = pick_present(data, "metadata_materializer", "metadataMaterializer") or {}
     return {
         "dashboard_queue_depth": pick_present(data, "queue_depth", "queueDepth"),
@@ -256,14 +286,17 @@ def dashboard_highlights(data):
     }
 
 
+# Build pass, warn, and fail checks from command status and experiment artifacts.
 def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard_replay):
     checks = []
+    # Command failures are hard failures because every experiment gate records into command_status.jsonl.
     failed_commands = [item.get("name") for item in statuses if int(item.get("exit_code", 1)) != 0]
     if failed_commands:
         checks.append(check("all_recorded_commands_pass", "fail", "one or more recorded commands failed", failed_commands, "no failed commands"))
     else:
         checks.append(check("all_recorded_commands_pass", "pass", "all recorded commands passed"))
 
+    # Fsync policy comparison is a health signal, not a hard benchmark claim.
     policies = {}
     if isinstance(logstore, dict):
         for item in logstore.get("policies") or []:
@@ -272,6 +305,7 @@ def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard
     always = policies.get("always")
     batch = policies.get("batch")
     interval = policies.get("interval")
+    # Missing or inverted throughput becomes a warning unless command execution failed.
     if always and batch and interval:
         if batch > always and interval > always:
             checks.append(check("logstore_relaxed_fsync_faster_than_always", "pass", "batch and interval append throughput are greater than always", {"always": always, "batch": batch, "interval": interval}, "batch > always and interval > always"))
@@ -280,6 +314,7 @@ def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard
     else:
         checks.append(check("logstore_relaxed_fsync_faster_than_always", "warn", "logstore benchmark policy data is missing", policies, "always, batch, interval"))
 
+    # Locality hit-rate comparison is reported as warn on regression because short runs can be noisy.
     locality = benchmark.get("locality_ablation") if isinstance(benchmark, dict) else None
     if isinstance(locality, dict):
         resource_hit = as_number((locality.get("resource_only") or {}).get("cache_hit_rate"))
@@ -292,6 +327,7 @@ def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard
     else:
         checks.append(check("locality_cache_hit_not_worse_than_resource_only", "warn", "locality benchmark did not run"))
 
+    # Checkpoint validation errors are correctness failures; a missing warm hit is weaker evidence and only warns.
     checkpoint_errors = []
     warm_hit = None
     if isinstance(checkpoint, dict):
@@ -304,6 +340,7 @@ def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard
     else:
         checks.append(check("checkpoint_warm_cache_hit", "warn", "warm checkpoint cache-hit proof is missing or false", warm_hit, True))
 
+    # Snapshot replay should trim replay work, but missing ablation data should not hide other run evidence.
     actor = benchmark.get("actor_recovery_snapshot_ablation") if isinstance(benchmark, dict) else None
     snap = (actor or {}).get("snapshot_enabled") or {}
     snapshot_replay = as_number(snap.get("snapshot_replay_commands"))
@@ -314,6 +351,7 @@ def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard
     else:
         checks.append(check("actor_snapshot_replay_less_than_full", "warn", "actor replay ablation data is missing"))
 
+    # The canonical experiment runtime starts three workers; fewer workers means the benchmark topology is wrong.
     workers = None
     if isinstance(dashboard, dict):
         workers = len(dashboard.get("workers") or [])
@@ -324,6 +362,8 @@ def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard
     else:
         checks.append(check("dashboard_has_three_workers", "fail", "dashboard has fewer than three workers", workers, ">= 3"))
 
+    # Replay consistency is a direct correctness check: mismatches fail the run,
+    # while an omitted replay artifact is reported as a warning.
     if isinstance(dashboard_replay, dict) and dashboard_replay:
         consistent = dashboard_replay.get("consistent")
         checked = dashboard_replay.get("checked_count")
@@ -337,6 +377,7 @@ def build_checks(statuses, benchmark, logstore, checkpoint, dashboard, dashboard
     return checks
 
 
+# Collapse check statuses into the report verdict, with fail taking precedence over warn.
 def verdict_from_checks(checks):
     if any(item["status"] == "fail" for item in checks):
         return "fail"
@@ -345,6 +386,7 @@ def verdict_from_checks(checks):
     return "pass"
 
 
+# Write summary.json and summary.md for one experiment run directory.
 def write_summary(run_dir, environment, statuses, benchmark, logstore, fault, dashboard, checkpoint, postgres, dashboard_replay, go_benchmarks):
     benchmark_summary, notes = benchmark_highlights(benchmark)
     logstore_summary = logstore_highlights(logstore)
@@ -354,6 +396,8 @@ def write_summary(run_dir, environment, statuses, benchmark, logstore, fault, da
     dashboard_replay_summary = dashboard_replay_highlights(dashboard_replay)
     checks = build_checks(statuses, benchmark or {}, logstore or {}, checkpoint or {}, dashboard or {}, dashboard_replay or {})
     verdict = verdict_from_checks(checks)
+    # Non-pass summaries are still useful, but downstream reports should inspect
+    # the failed checks before using numbers as evidence.
     if verdict != "pass":
         notes.append("verdict is not pass; inspect checks and failed command logs before using the numbers in a report.")
 
@@ -441,6 +485,8 @@ def write_summary(run_dir, environment, statuses, benchmark, logstore, fault, da
     lines.append("")
     lines.append("## Raw Files")
     lines.append("")
+    # Large runtime directories are intentionally omitted from the raw-file index;
+    # the package manifest still carries top-level artifacts that should be reviewed.
     skip = {"venv", "runtime"}
     for path in sorted(run_dir.iterdir(), key=lambda p: p.name):
         if path.name in skip:
@@ -451,6 +497,7 @@ def write_summary(run_dir, environment, statuses, benchmark, logstore, fault, da
     return summary
 
 
+# Load experiment artifacts from the run directory and generate summary reports.
 def main():
     if len(sys.argv) != 2:
         print("usage: summarize_experiment.py <run-dir>", file=sys.stderr)
@@ -465,6 +512,8 @@ def main():
     checkpoint = read_json(run_dir / "checkpoint_cache_probe.json")
     postgres = read_json(run_dir / "postgres_benchmark_stats.json")
     dashboard_replay = read_json(run_dir / "dashboard_replay_consistency.json")
+    # Go benchmark logs are optional: include only parsed files that contain rows
+    # so absent benchmark runs do not create empty sections in the report.
     go_benchmarks = {
         "scheduler_benchmark.log": parse_go_benchmarks(run_dir / "scheduler_benchmark.log"),
         "metadata_benchmark.log": parse_go_benchmarks(run_dir / "metadata_benchmark.log"),

@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
+# Summarize LogServe console acceptance outputs into JSON and Markdown reports.
 import json
 import sys
 from pathlib import Path
 
 
+# Load a JSON artifact, returning an empty object when optional output is missing or malformed.
 def read_json(path):
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
+    # Optional artifacts may be absent after early failure; callers treat {} as missing evidence.
     except Exception:
         return {}
 
 
+# Read command_status.jsonl records and preserve malformed lines as failed commands.
 def read_statuses(path):
     statuses = []
     if not path.exists():
@@ -20,11 +24,14 @@ def read_statuses(path):
             continue
         try:
             statuses.append(json.loads(line))
+        # Treat corrupt status lines as failed command evidence instead of
+        # silently dropping them from the final verdict.
         except json.JSONDecodeError:
             statuses.append({"name": "malformed_status_line", "exit_code": 1, "duration_sec": 0, "log": ""})
     return statuses
 
 
+# Return whether a command status should be considered failed.
 def status_failed(status):
     try:
         return int(status.get("exit_code", 1)) != 0
@@ -32,6 +39,7 @@ def status_failed(status):
         return True
 
 
+# Return whether a named command exists and completed successfully.
 def status_pass(statuses, name):
     for item in statuses:
         if item.get("name") == name:
@@ -39,6 +47,7 @@ def status_pass(statuses, name):
     return False
 
 
+# Interpret a boolean run_config flag from native bools or common string values.
 def bool_config(config, key, default=False):
     value = config.get(key, default)
     if isinstance(value, bool):
@@ -46,6 +55,8 @@ def bool_config(config, key, default=False):
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
+# Feature groups map product-level console features to HTTP probe check ids.
+# Missing checks are recorded separately so reports distinguish absent probes from explicit failures.
 FEATURE_GROUPS_6_10 = {
     "feature_6_workflow_dag": {
         "title": "Workflow DAG and replay",
@@ -86,6 +97,8 @@ FEATURE_GROUPS_6_10 = {
     },
 }
 
+# These probe checks cover authenticated admin/config flows and function registry
+# views that are not represented by the feature 6-10 grouping above.
 FRONTEND_ADMIN_FUNCTION_CHECKS = (
     "static_admin_route",
     "static_functions_route",
@@ -102,6 +115,7 @@ FRONTEND_ADMIN_FUNCTION_CHECKS = (
     "admin_config_reflects_backpressure_update",
 )
 
+# Aggregate feature 6-10 probe checks into per-feature states and an overall verdict.
 def build_feature_groups_6_10(run_docker, probe_checks):
     features = {}
     states = []
@@ -110,6 +124,8 @@ def build_feature_groups_6_10(run_docker, probe_checks):
         check_results = {name: probe_checks.get(name) is True for name in spec["checks"]}
         missing_checks = [name for name in spec["checks"] if name not in probe_checks]
         failed_checks = [name for name, passed in check_results.items() if not passed]
+        # Without the Docker runtime, probe-backed feature groups are incomplete
+        # rather than failed; local-only acceptance can still summarize cleanly.
         if not run_docker:
             state = "INCOMPLETE"
         elif failed_checks:
@@ -133,6 +149,7 @@ def build_feature_groups_6_10(run_docker, probe_checks):
     return {"verdict": verdict, "features": features}
 
 
+# Aggregate frontend admin and function registry probe checks into one verdict.
 def build_frontend_admin_functions(run_docker, probe_checks):
     probe_checks = probe_checks or {}
     check_results = {name: probe_checks.get(name) is True for name in FRONTEND_ADMIN_FUNCTION_CHECKS}
@@ -152,6 +169,7 @@ def build_frontend_admin_functions(run_docker, probe_checks):
         "failed_checks": failed_checks,
     }
 
+# Build top-level acceptance checks from command statuses, config, and HTTP probe results.
 def build_checks(statuses, config, probe):
     checks = {
         "go_web_tests": status_pass(statuses, "go_test_web"),
@@ -161,6 +179,8 @@ def build_checks(statuses, config, probe):
     }
     if bool_config(config, "run_npm_ci", True):
         checks["web_npm_ci"] = status_pass(statuses, "web_npm_ci")
+    # Docker gates are only required when run_config says the compose runtime was
+    # part of this acceptance run.
     if bool_config(config, "run_docker", True):
         checks["docker_compose_config"] = status_pass(statuses, "docker_compose_config")
         checks["docker_compose_build"] = status_pass(statuses, "docker_compose_build")
@@ -172,6 +192,7 @@ def build_checks(statuses, config, probe):
     return checks
 
 
+# Return generated artifact paths that should be included in the acceptance handoff package.
 def send_back_paths(root):
     names = [
         "acceptance_summary.md",
@@ -187,6 +208,7 @@ def send_back_paths(root):
     return [str(root / name) for name in names if (root / name).exists() or name == "console-acceptance-package.tar.gz"]
 
 
+# Write acceptance_summary.json and return the normalized console acceptance summary.
 def write_summary(root):
     root = Path(root)
     config = read_json(root / "run_config.json")
@@ -199,6 +221,8 @@ def write_summary(root):
     frontend_admin_functions = build_frontend_admin_functions(run_docker, probe_checks)
     failed_commands = [item.get("name") for item in statuses if status_failed(item)]
     failed_checks = [name for name, passed in checks.items() if not passed]
+    # Feature-group failures are promoted into failed_checks so the top-level
+    # verdict agrees with the detailed feature sections.
     if run_docker and features_6_10.get("verdict") == "FAIL":
         failed_checks.append("features_6_10")
     if run_docker and frontend_admin_functions.get("verdict") == "FAIL":
@@ -224,6 +248,7 @@ def write_summary(root):
     return summary
 
 
+# Write the human-readable console acceptance report from the normalized summary.
 def write_markdown(root, summary):
     lines = ["# Ubuntu Console Acceptance Summary", ""]
     lines.append(f"- Verdict: **{summary.get('verdict')}**")
@@ -291,6 +316,7 @@ def write_markdown(root, summary):
     (root / "acceptance_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# Parse the result directory argument, write reports, and use the verdict as the process exit code.
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 1:

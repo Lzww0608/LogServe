@@ -1,4 +1,7 @@
 # Workflow decorators record Python calls as LogServe task, workflow, actor, and LLM metadata.
+#
+# Decorators must preserve ordinary Python execution while recording a DAG only when
+# trace_workflow has pushed a process-local WorkflowTraceContext.
 import functools
 import hashlib
 import inspect
@@ -6,6 +9,8 @@ import json
 
 
 # A simple process-local trace stack; workflow definitions are expected to trace synchronously.
+# It is intentionally not thread-local because SDK tracing is a short-lived build step,
+# not a concurrent workflow execution engine.
 _TRACE_STACK = []
 # Marker key used to serialize StepRef dependencies inside JSON args.
 _REF_KEY = "__step_ref__"
@@ -27,6 +32,7 @@ class WorkflowTraceContext:
     # Track emitted steps and per-name counters for stable duplicate step ids.
     def __init__(self):
         self.steps = []
+        # Counts are per workflow trace, preventing duplicate step ids without global state.
         self._name_counts = {}
 
     # Record one @task invocation as a workflow step instead of executing it.
@@ -42,6 +48,7 @@ class WorkflowTraceContext:
         encoded_kwargs, deps_k = _encode_refs(dict(kwargs))
         deps = sorted(set(deps_a + deps_k))
         original = inspect.unwrap(fn)
+        # Capture the unwrapped function source so worker execution receives user code, not SDK wrappers.
         source = inspect.getsource(original)
         self.steps.append(
             {
@@ -80,6 +87,7 @@ class WorkflowTraceContext:
             self._name_counts[base] = count
             step_id = base if count == 1 else f"{base}_{count}"
 
+        # The prompt itself may depend on prior StepRef outputs, so encode it through the same dependency path.
         encoded_args, deps = _encode_refs([prompt])
         self.steps.append(
             {
@@ -113,10 +121,13 @@ def current_trace_context():
 # Execute a workflow function while collecting task and LLM step references.
 def trace_workflow(fn, *args, **kwargs):
     ctx = WorkflowTraceContext()
+    # A stack supports nested tracing defensively, although normal workflow definitions trace synchronously.
     _TRACE_STACK.append(ctx)
     try:
         result = fn(*args, **kwargs)
     finally:
+        # Always pop on user-code exceptions so a failed trace cannot leak into
+        # later ordinary function calls in the same process.
         _TRACE_STACK.pop()
     return ctx, result
 
@@ -177,6 +188,7 @@ def actor(cls=None, *, snapshot_every=25):
 
 # Encode Python values and StepRef placeholders into JSON-compatible objects.
 def encode_json(value):
+    # Public encoding drops the dependency list; submit paths keep dependencies through WorkflowTraceContext.
     encoded, _ = _encode_refs(value)
     return encoded
 
@@ -198,6 +210,7 @@ def _encode_refs(value):
             out.append(encoded)
             deps.extend(item_deps)
         return out, deps
+    # Dict keys are left unchanged because the workflow JSON contract only rewrites values that reference steps.
     if isinstance(value, dict):
         out = {}
         for key, item in value.items():

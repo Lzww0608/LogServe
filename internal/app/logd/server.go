@@ -14,10 +14,15 @@ import (
 // Server owns the logstore, TCP listener, and gRPC server for one logd process.
 // Call Stop to stop accepting RPCs and close the underlying store.
 type Server struct {
-	addr     string
+	// addr records the effective bind address after net.Listen resolves
+	// wildcards or port 0 into the listener's concrete address.
+	addr string
+	// listener is owned by grpc.Server.Serve and closed during GracefulStop.
 	listener net.Listener
-	grpc     *grpc.Server
-	store    *logstore.Store
+	// grpc accepts LogService RPCs and owns the listener once Serve starts.
+	grpc *grpc.Server
+	// store is the durable log backend and must outlive all in-flight RPCs.
+	store *logstore.Store
 }
 
 // Start opens logd with the repository's default logstore options.
@@ -40,7 +45,11 @@ func StartWithOptions(addr, dataDir string, opts logstore.Options) (*Server, err
 		_ = store.Close()
 		return nil, err
 	}
+	// Authentication is process-wide for logd; StartWithOptions only customizes
+	// the logstore and still reads the shared RPC token from the environment.
 	grpcServer := grpc.NewServer(rpcauth.ServerOptionsFromEnv()...)
+	// Register the service before the serving goroutine starts so callers never
+	// observe a bound listener without the LogService implementation installed.
 	logservepb.RegisterLogServiceServer(grpcServer, logstore.NewService(store))
 	srv := &Server{addr: lis.Addr().String(), listener: lis, grpc: grpcServer, store: store}
 	// Serve returns when Stop gracefully shuts the server down or when the listener
@@ -60,5 +69,7 @@ func (s *Server) Addr() string {
 // Stop drains in-flight RPCs before closing the logstore.
 func (s *Server) Stop() error {
 	s.grpc.GracefulStop()
+	// The store is closed after RPC draining because handlers operate directly on
+	// the shared logstore instance.
 	return s.store.Close()
 }

@@ -1,5 +1,8 @@
 package integration
 
+// This file covers control-plane worker RPC batching: multi-task polling,
+// long-poll wakeups, and batched completion acknowledgements.
+
 import (
 	"context"
 	"testing"
@@ -8,6 +11,8 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// TestPollTaskBatchReturnsUpToMaxTasks verifies one PollTask RPC can return all
+// currently queued tasks up to the requested MaxTasks limit.
 func TestPollTaskBatchReturnsUpToMaxTasks(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -57,6 +62,8 @@ func TestPollTaskBatchReturnsUpToMaxTasks(t *testing.T) {
 	}
 }
 
+// TestPollTaskLongPollWakesBeforeTimeout starts a blocking poll and confirms a
+// later task submission wakes it before the wait timeout expires.
 func TestPollTaskLongPollWakesBeforeTimeout(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -85,6 +92,8 @@ func TestPollTaskLongPollWakesBeforeTimeout(t *testing.T) {
 		resultCh <- poll
 	}()
 
+	// Give the goroutine enough time to enter the long-poll path before submitting
+	// the task that should wake it.
 	time.Sleep(50 * time.Millisecond)
 	submit, err := env.controlClient.SubmitTask(context.Background(), &logservepb.SubmitTaskRequest{
 		TaskName:       "wake",
@@ -112,6 +121,8 @@ func TestPollTaskLongPollWakesBeforeTimeout(t *testing.T) {
 	}
 }
 
+// TestCompleteTasksBatchAcceptsMultipleResults polls several leases and completes
+// them in one CompleteTasks RPC, preserving each task's lease epoch.
 func TestCompleteTasksBatchAcceptsMultipleResults(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -149,6 +160,8 @@ func TestCompleteTasksBatchAcceptsMultipleResults(t *testing.T) {
 		specs = append(specs, poll.GetTask())
 	}
 
+	// Batch completions still carry individual lease epochs; the server must reject
+	// stale items without losing the rest of the batch.
 	completions := make([]*logservepb.CompleteTaskRequest, 0, len(specs))
 	for _, spec := range specs {
 		completions = append(completions, &logservepb.CompleteTaskRequest{

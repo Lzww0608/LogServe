@@ -6,6 +6,7 @@ from unittest import mock
 
 
 SDK_ROOT = Path(__file__).resolve().parents[1]
+# Load the checkout SDK directly so these regression tests do not depend on package installation.
 if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
@@ -51,7 +52,10 @@ class CapturingTransport:
 
     # Emulate the small subset of transport commands needed by these tests.
     def run(self, command, payload=None, **_kwargs):
+        # Capture the SDK-level transport contract before any CLI or gRPC encoding
+        # can obscure idempotency keys or extracted source payloads.
         self.calls.append((command, payload or {}))
+        # Return successful terminal states because these tests focus on emitted payloads, not polling behavior.
         if command == "submit":
             return {"task_id": "task-1", "status": "SUCCEEDED", "result": 3}
         if command == "workflow-submit":
@@ -101,6 +105,7 @@ class ClientIdempotencyTests(unittest.TestCase):
 
         sdk.submit_workflow(echo_workflow, "hello")
 
+        # Source extraction should stop at the decorated callable and avoid capturing this test module prologue.
         definition = transport.calls[0][1]["definition"]
         step = definition["steps"][0]
         step_source = step["function_source"]
@@ -124,6 +129,8 @@ class ClientIdempotencyTests(unittest.TestCase):
     # Verify module-level helpers delegate through the default client path.
     def test_module_level_submit_uses_default_client_transport(self):
         transport = CapturingTransport()
+        # Patch the factory rather than module globals so the test matches the real
+        # module-level helper path without depending on a singleton client.
         with mock.patch.object(client, "_default_client", return_value=client.LogServeClient(transport=transport)):
             self.assertEqual(client.submit(add, 1, 2, idempotency_key="key-1"), 3)
 

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# Runs the experiment harness twice, once with sync PostgreSQL persistence and
+# once with async persistence, then summarizes the comparison. The script keeps
+# going after a mode failure so the final summary can explain partial results.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/naming_guard.sh"
+# Comparison output names are guarded to keep report directories stable and to
+# avoid date-stamped paths that are hard to reference from project docs.
 RUN_ID="${LOGSERVE_POSTGRES_COMPARE_ID:-latest}"
 logserve_reject_dated_name "$RUN_ID" "LOGSERVE_POSTGRES_COMPARE_ID"
 COMPARE_DIR="${LOGSERVE_POSTGRES_COMPARE_DIR:-"$ROOT/reports/postgres-async-compare-$RUN_ID"}"
@@ -12,11 +17,15 @@ WORKFLOWS="${LOGSERVE_COMPARE_BENCH_WORKFLOWS:-3}"
 LLM_REQUESTS="${LOGSERVE_COMPARE_BENCH_LLM_REQUESTS:-6}"
 ACTOR_COMMANDS="${LOGSERVE_COMPARE_BENCH_ACTOR_COMMANDS:-20}"
 PYTHON_BOOTSTRAP="${PYTHON:-python3}"
+# ANY_FAIL accumulates mode and summary failures; run_mode returns success so
+# both sync and async modes are attempted before the wrapper exits.
 ANY_FAIL=0
 
 mkdir -p "$COMPARE_DIR"
 cd "$ROOT" || exit 1
 
+# run_mode invokes run_experiment.sh with only the benchmark suite enabled,
+# writing each persistence mode into its own subdirectory for comparison.
 run_mode() {
   local mode="$1"
   local dir="$COMPARE_DIR/$mode"
@@ -45,6 +54,8 @@ run_mode() {
 run_mode sync
 run_mode async
 
+# The summarizer performs the pass/fail comparison after both directories have
+# been attempted, even if one experiment mode failed earlier.
 "$PYTHON_BOOTSTRAP" scripts/summarize_postgres_async_compare.py "$COMPARE_DIR"
 COMPARE_CODE=$?
 if [ "$COMPARE_CODE" -ne 0 ]; then

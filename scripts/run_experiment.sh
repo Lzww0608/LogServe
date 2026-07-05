@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Run the full LogServe experiment pipeline and package the generated evidence.
+#
+# The script intentionally does not enable `set -e`: every gated command is
+# routed through run_step/run_json_step so later diagnostics still run after an
+# earlier failure and the final status file contains the complete attempt.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,6 +24,8 @@ COMPOSE_PROJECT="logserve-exp-$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:
 SCHEDULER_V2="${LOGSERVE_SCHEDULER_V2:-1}"
 POSTGRES_MODE="${LOGSERVE_POSTGRES_MODE:-sync}"
 
+# Reserve ephemeral ports in one Python process so the compose/native runtime
+# gets a collision-resistant set of ports without hard-coding host defaults.
 PORTS="$("$PYTHON_BOOTSTRAP" - <<'PY'
 import socket
 
@@ -67,6 +74,7 @@ COMPOSE_STARTED=0
 COMPOSE_AVAILABLE=0
 COMPOSE_CMD=()
 
+# Escape shell strings for JSONL status output without depending on jq.
 json_escape() {
   "$PYTHON_BOOTSTRAP" - "$1" <<'PY'
 import json
@@ -75,6 +83,7 @@ print(json.dumps(sys.argv[1])[1:-1])
 PY
 }
 
+# Append one command result to the status stream and remember whether any step failed.
 record_status() {
   local name="$1"
   local code="$2"
@@ -90,6 +99,7 @@ record_status() {
   fi
 }
 
+# Run a command, capture stdout/stderr together, and continue the experiment after failures.
 run_step() {
   local name="$1"
   local log="$2"
@@ -110,6 +120,7 @@ run_step() {
   return 0
 }
 
+# Run a command whose stdout is a JSON artifact while stderr remains a diagnostic log.
 run_json_step() {
   local name="$1"
   local json_out="$2"
@@ -131,6 +142,7 @@ run_json_step() {
   return 0
 }
 
+# Start a long-running process, record its PID globally, and place logs in RUN_DIR.
 start_bg() {
   local name="$1"
   shift
@@ -142,6 +154,7 @@ start_bg() {
   echo "    pid $LAST_BG_PID log $log"
 }
 
+# Verify a background process is still alive and print its tail when startup failed.
 ensure_bg_alive() {
   local name="$1"
   local pid="$2"
@@ -153,6 +166,7 @@ ensure_bg_alive() {
   return 1
 }
 
+# Detect the supported Docker Compose frontend and store the command as an array.
 detect_compose() {
   if docker compose version >/dev/null 2>&1; then
     COMPOSE_CMD=(docker compose)
@@ -168,6 +182,7 @@ detect_compose() {
   return 1
 }
 
+# Invoke Docker Compose with the generated env file, project name, and experiment overlay.
 compose() {
   "${COMPOSE_CMD[@]}" \
     --env-file "$COMPOSE_ENV" \
@@ -177,6 +192,7 @@ compose() {
     "$@"
 }
 
+# Tear down runtime resources on exit, preserving logs before containers disappear.
 cleanup() {
   if [ "$COMPOSE_STARTED" -eq 1 ] && [ "$COMPOSE_AVAILABLE" -eq 1 ]; then
     compose logs --no-color > "$RUN_DIR/compose.log" 2>&1 || true
@@ -193,6 +209,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Wait for a TCP listener using Python sockets instead of bash /dev/tcp portability.
 wait_tcp() {
   local host="$1"
   local port="$2"
@@ -217,6 +234,7 @@ sys.exit(1)
 PY
 }
 
+# Create deterministic local checkpoint fixtures for workers that exercise cache paths.
 prepare_checkpoints() {
   local size_mb="${LOGSERVE_CHECKPOINT_MB:-1}"
   local model
@@ -229,12 +247,14 @@ prepare_checkpoints() {
   done
 }
 
+# Prepare host-mounted runtime directories and make them writable by container users.
 prepare_runtime_dirs() {
   mkdir -p "$DATA_DIR/logstore" "$DATA_DIR/model-cache" "$CHECKPOINT_SOURCE_DIR"
   prepare_checkpoints
   chmod -R a+rwX "$DATA_DIR" 2>/dev/null || true
 }
 
+# Write the compose env file consumed by both base and experiment compose overlays.
 write_compose_env() {
   cat > "$COMPOSE_ENV" <<EOF
 LOGSERVE_API_TOKEN=$API_TOKEN
@@ -266,6 +286,7 @@ LOGSERVE_EXPERIMENT_LOGSTORE_DIR=$DATA_DIR/logstore
 EOF
 }
 
+# Capture reproducibility metadata for the run before tests or runtime startup mutate state.
 write_environment() {
   {
     echo "run_id=$RUN_ID"
@@ -298,6 +319,7 @@ write_environment() {
   } > "$RUN_DIR/environment.txt"
 }
 
+# Ensure a worker materialized the expected checkpoint into the local model cache.
 verify_checkpoint_cache_artifact() {
   local model="${LOGSERVE_CHECKPOINT_MODEL:-model-D}"
   local version="${LOGSERVE_CHECKPOINT_VERSION:-v1}"
@@ -315,6 +337,7 @@ verify_checkpoint_cache_artifact() {
   return 0
 }
 
+# Poll dashboard snapshots until the expected number of workers appears.
 wait_dashboard_workers() {
   local want="${1:-3}"
   local timeout_sec="${2:-90}"
@@ -351,6 +374,7 @@ PY
   done
 }
 
+# Return a PostgreSQL stats snapshot as JSON, or an unavailable marker outside compose mode.
 postgres_stats_json() {
   if [ "$EXPERIMENT_MODE" != "compose" ] || [ "$COMPOSE_STARTED" -ne 1 ] || [ "$COMPOSE_AVAILABLE" -ne 1 ]; then
     printf '{"available":false,"reason":"postgres stats require compose runtime","mode":"%s"}\n' "$POSTGRES_MODE"
@@ -359,6 +383,7 @@ postgres_stats_json() {
   compose exec -T postgres env PGPASSWORD="$POSTGRES_PASSWORD" psql -U logserve -d logserve -tAc "select json_build_object('available', true, 'mode', '$POSTGRES_MODE', 'captured_at_ms', floor(extract(epoch from clock_timestamp()) * 1000)::bigint, 'datname', datname, 'xact_commit', xact_commit, 'xact_rollback', xact_rollback, 'tup_inserted', tup_inserted, 'tup_updated', tup_updated, 'tup_deleted', tup_deleted, 'tup_returned', tup_returned, 'tup_fetched', tup_fetched) from pg_stat_database where datname = current_database();"
 }
 
+# Compare before/after PostgreSQL snapshots and emit benchmark-period throughput deltas.
 postgres_benchmark_delta_json() {
   "$PYTHON_BOOTSTRAP" - "$RUN_DIR/postgres_before_benchmark.json" "$RUN_DIR/postgres_after_benchmark.json" <<'PY'
 import json
@@ -371,10 +396,14 @@ if not before.get("available") or not after.get("available"):
     print(json.dumps({"available": False, "reason": "postgres stats unavailable", "before": before, "after": after}, indent=2))
     sys.exit(0)
 
+# Normalize missing/null pg_stat fields to numbers so the delta report survives
+# partially populated snapshots from unsupported PostgreSQL modes.
 def num(data, key):
     value = data.get(key, 0)
     return float(value or 0)
 
+# Clamp elapsed time to at least 1ms to avoid division by zero on very fast runs
+# or coarse timestamp resolution.
 elapsed_ms = max(1.0, num(after, "captured_at_ms") - num(before, "captured_at_ms"))
 elapsed_sec = elapsed_ms / 1000.0
 xact_delta = (num(after, "xact_commit") + num(after, "xact_rollback")) - (num(before, "xact_commit") + num(before, "xact_rollback"))
@@ -393,6 +422,7 @@ print(json.dumps({
 PY
 }
 
+# Replay workflow and actor ids from the dashboard and verify replay agrees with metadata.
 verify_dashboard_replay_consistency() {
   "$PYTHON_BOOTSTRAP" - "$CLI_BIN" "$CONTROL_ADDR" "$RUN_DIR/dashboard_snapshot.json" <<'PY'
 import json
@@ -407,9 +437,13 @@ failures = []
 workflow_count = 0
 actor_count = 0
 
+# Accept both snake_case and camelCase dashboard fields so the check is stable
+# across JSON tag changes in CLI/web surfaces.
 def pick(data, snake, camel):
     return data.get(snake) if snake in data else data.get(camel)
 
+# Run a CLI command expected to return JSON and convert process/parse failures
+# into structured error strings for the final consistency report.
 def run_json(args):
     proc = subprocess.run(args, text=True, capture_output=True, env=os.environ)
     if proc.returncode != 0:
@@ -448,6 +482,7 @@ print(json.dumps(out, indent=2))
 sys.exit(0 if not failures else 1)
 PY
 }
+# Start logd, control, and three workers directly on the host for native-mode runs.
 start_native_runtime() {
   prepare_runtime_dirs
   start_bg logd env LOGSERVE_API_TOKEN="$API_TOKEN" go run ./cmd/logserve-logd --addr "$LOG_ADDR" --data-dir "$DATA_DIR/logstore" --segment-size-bytes 67108864 --fsync-policy always
@@ -458,6 +493,7 @@ start_native_runtime() {
   fi
   record_status runtime_logd_start 0 0 logd.log
 
+  # Only pass a pprof address when configured; an empty flag value would make control fail to bind.
   local control_pprof_args=()
   if [ -n "${LOGSERVE_CONTROL_PPROF_ADDR:-}" ]; then
     control_pprof_args=(--pprof-addr "$LOGSERVE_CONTROL_PPROF_ADDR")
@@ -470,6 +506,8 @@ start_native_runtime() {
   fi
   record_status runtime_control_start 0 0 control.log
 
+  # Workers use separate model-cache directories so cache validation proves
+  # materialization per worker instead of sharing one path.
   start_bg worker_a env LOGSERVE_API_TOKEN="$API_TOKEN" go run ./cmd/logserve-worker --worker-id worker-a --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-A:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-a" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
   local worker_a_pid="$LAST_BG_PID"
   start_bg worker_b env LOGSERVE_API_TOKEN="$API_TOKEN" go run ./cmd/logserve-worker --worker-id worker-b --control-addr "$CONTROL_ADDR" --log-addr "$LOG_ADDR" --executor "$ROOT/executor/python/server.py" --models model-B:v1 --capacity "$WORKER_CAPACITY" --task-pool-size "$TASK_POOL_SIZE" --llm-pool-size "$LLM_POOL_SIZE" --actor-pool-size "$ACTOR_POOL_SIZE" --model-source-dir "$CHECKPOINT_SOURCE_DIR" --model-cache-dir "$DATA_DIR/model-cache/worker-b" --model-cache-capacity-bytes "$CHECKPOINT_CACHE_BYTES"
@@ -485,6 +523,7 @@ start_native_runtime() {
   return "$worker_start_code"
 }
 
+# Build and start the compose runtime, then wait for logd, control, and workers.
 start_compose_runtime() {
   prepare_runtime_dirs
   write_compose_env
@@ -527,6 +566,7 @@ start_compose_runtime() {
   return 1
 }
 
+# Dispatch runtime startup based on LOGSERVE_EXPERIMENT_MODE.
 start_runtime() {
   case "$EXPERIMENT_MODE" in
     compose)
@@ -543,6 +583,7 @@ start_runtime() {
   esac
 }
 
+# Derive a compact fault-injection summary from command_status.jsonl.
 write_fault_report() {
   "$PYTHON_BOOTSTRAP" - "$RUN_DIR" <<'PY'
 import json
@@ -555,6 +596,7 @@ status_path = run_dir / "command_status.jsonl"
 if status_path.exists():
     statuses = [json.loads(line) for line in status_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
+# Convert command status rows into human-readable fault categories used by reports.
 def status(name):
     for item in statuses:
         if item["name"] == name:
@@ -572,6 +614,7 @@ report = {
 PY
 }
 
+# Create and populate an isolated Python venv unless disabled by LOGSERVE_USE_VENV.
 setup_python() {
   if [ "${LOGSERVE_USE_VENV:-1}" != "1" ]; then
     PYTHON="$PYTHON_BOOTSTRAP"
@@ -587,12 +630,15 @@ setup_python() {
   return 0
 }
 
+# Package run artifacts atomically, optionally excluding bulky runtime state.
 package_results() {
   local tar_excludes=(--exclude ./experiment-package.tar.gz --exclude ./venv)
   local tmp_package="$RUN_DIR/../.$(basename "$RUN_DIR").package.tmp.tar.gz"
   if [ "${LOGSERVE_EXPERIMENT_KEEP_RUNTIME:-0}" != "1" ]; then
     tar_excludes+=(--exclude ./runtime)
   fi
+  # Write to a sibling temp package first so interrupted packaging does not
+  # leave a corrupt file at the advertised PACKAGE_PATH.
   rm -f "$tmp_package" "$PACKAGE_PATH"
   tar "${tar_excludes[@]}" -czf "$tmp_package" -C "$RUN_DIR" . > "$RUN_DIR/package.log" 2>&1
   local code=$?
@@ -609,6 +655,7 @@ package_results() {
 write_environment
 : > "$STATUS_FILE"
 setup_python
+# Clear runtime-only env vars for host-side tests so experiment credentials do not mask defaults.
 HOST_GO_ENV=(env -u LOGSERVE_API_TOKEN -u LOGSERVE_SCHEDULER_V2)
 
 if [ "${LOGSERVE_RUN_FULL_TESTS:-1}" = "1" ]; then
@@ -643,6 +690,7 @@ if [ "${LOGSERVE_RUN_FAULT:-1}" = "1" ]; then
   write_fault_report
 fi
 
+# Runtime benchmarks are gated separately because they start long-lived services and optional containers.
 if [ "${LOGSERVE_RUN_BENCHMARK:-1}" = "1" ]; then
   export LOGSERVE_API_TOKEN="$API_TOKEN"
   export LOGSERVE_SCHEDULER_V2="$SCHEDULER_V2"
@@ -655,6 +703,7 @@ if [ "${LOGSERVE_RUN_BENCHMARK:-1}" = "1" ]; then
     run_json_step checkpoint_cache_probe "$RUN_DIR/checkpoint_cache_probe.json" "$RUN_DIR/checkpoint_cache_probe.stderr.log" "$PYTHON" examples/evaluation/checkpoint_cache.py
     run_json_step checkpoint_cache_bench "$RUN_DIR/checkpoint_cache_bench.json" "$RUN_DIR/checkpoint_cache_bench.stderr.log" "$PYTHON" examples/evaluation/checkpoint_cache_bench.py
     run_json_step executor_bench "$RUN_DIR/executor_bench.json" "$RUN_DIR/executor_bench.stderr.log" "$PYTHON" examples/evaluation/executor_bench.py
+    # Collect pprof only when a control pprof endpoint was explicitly exposed.
     if [ -n "${LOGSERVE_PPROF_ADDR:-${LOGSERVE_CONTROL_PPROF_ADDR:-}}" ]; then
       run_step collect_pprof "$RUN_DIR/collect_pprof.log" env LOGSERVE_PPROF_OUT="$RUN_DIR/profiles" bash scripts/collect_pprof.sh "${LOGSERVE_PPROF_ADDR:-$LOGSERVE_CONTROL_PPROF_ADDR}"
     fi

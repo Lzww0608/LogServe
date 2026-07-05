@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# Runs the Ubuntu PostgreSQL async-materializer acceptance flow and packages the
+# sync-vs-async comparison artifacts. Commands continue after failures so the final
+# report can explain partial evidence instead of stopping at the first error.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/naming_guard.sh"
 RUN_ID="${LOGSERVE_UBUNTU_ACCEPTANCE_ID:-latest}"
@@ -19,6 +22,7 @@ mkdir -p "$RESULT_DIR"
 : > "$STATUS_FILE"
 cd "$ROOT" || exit 1
 
+# json_escape emits one shell argument as a JSON string fragment for status JSONL.
 json_escape() {
   "$PYTHON_BOOTSTRAP" - "$1" <<'PY'
 import json
@@ -27,6 +31,7 @@ print(json.dumps(sys.argv[1])[1:-1])
 PY
 }
 
+# record_status appends one command result and updates ANY_FAIL without aborting remaining collection steps.
 record_status() {
   local name="$1"
   local code="$2"
@@ -42,6 +47,7 @@ record_status() {
   fi
 }
 
+# run_step executes a command into a log file, records duration and exit code, and returns success to keep later comparison/package steps reachable.
 run_step() {
   local name="$1"
   local log="$2"
@@ -61,6 +67,7 @@ run_step() {
   return 0
 }
 
+# detect_compose accepts either the Docker Compose v2 plugin or the legacy docker-compose binary.
 detect_compose() {
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     return 0
@@ -71,6 +78,7 @@ detect_compose() {
   return 1
 }
 
+# check_prerequisites requires Docker because the sync/async comparison is compose-backed rather than an in-memory harness.
 check_prerequisites() {
   local missing=0
   for cmd in bash git go tar "$PYTHON_BOOTSTRAP"; do
@@ -79,6 +87,8 @@ check_prerequisites() {
       missing=1
     fi
   done
+  # Unlike checkpoint acceptance, this comparison is compose-backed: both sync
+  # and async modes need Docker services for PostgreSQL, NATS, MinIO, and LogServe.
   if ! command -v docker >/dev/null 2>&1; then
     echo "missing required command: docker"
     missing=1
@@ -93,6 +103,7 @@ check_prerequisites() {
   return "$missing"
 }
 
+# write_server_environment captures host, toolchain, Docker, git, and working-tree context for later review.
 write_server_environment() {
   {
     echo "run_id=$RUN_ID"
@@ -115,6 +126,7 @@ write_server_environment() {
   } > "$RESULT_DIR/server_environment.txt"
 }
 
+# write_acceptance_summary combines wrapper command status with comparison.json and writes top-level handoff files.
 write_acceptance_summary() {
   "$PYTHON_BOOTSTRAP" - "$RESULT_DIR" "$COMPARE_DIR" "$PACKAGE_PATH" <<'PY'
 import json
@@ -132,11 +144,15 @@ if status_path.exists():
             continue
         try:
             statuses.append(json.loads(line))
+        # A malformed status line means the evidence stream itself is damaged;
+        # keep it as an explicit failed command instead of hiding it.
         except json.JSONDecodeError:
             statuses.append({"name": "malformed_status_line", "exit_code": 1, "duration_sec": 0, "log": ""})
 
 comparison = {}
 comparison_path = compare_dir / "comparison.json"
+# The nested comparison artifact is optional evidence; missing or malformed JSON
+# becomes a failed top-level verdict rather than aborting summary generation.
 if comparison_path.exists():
     try:
         comparison = json.loads(comparison_path.read_text(encoding="utf-8-sig"))
@@ -145,6 +161,8 @@ if comparison_path.exists():
 
 failed = [item for item in statuses if int(item.get("exit_code", 1)) != 0]
 comparison_acceptance = ((comparison.get("acceptance") or {}).get("pass") is True)
+# The wrapper is strict: shell command execution and nested sync/async
+# acceptance checks must both pass before the handoff package is marked pass.
 verdict = "pass" if not failed and comparison_acceptance else "fail"
 summary = {
     "verdict": verdict,
@@ -154,6 +172,8 @@ summary = {
     "failed_commands": [item.get("name") for item in failed],
     "commands": statuses,
     "comparison": comparison,
+    # Include top-level and nested comparison artifacts so reviewers can connect
+    # wrapper command status with the detailed sync/async threshold checks.
     "send_back": [
         str(result_dir / "acceptance_summary.md"),
         str(result_dir / "acceptance_summary.json"),
@@ -194,6 +214,7 @@ print(result_dir / "acceptance_summary.md")
 PY
 }
 
+# setup_python optionally creates a result-local virtualenv so SDK dependencies do not leak into the host interpreter.
 setup_python() {
   if [ "${LOGSERVE_USE_VENV:-1}" != "1" ]; then
     PYTHON_RUN="$PYTHON_BOOTSTRAP"
@@ -202,12 +223,15 @@ setup_python() {
   run_step python_venv_create "$RESULT_DIR/python_venv_create.log" "$PYTHON_BOOTSTRAP" -m venv "$RESULT_DIR/venv"
   PYTHON_RUN="$RESULT_DIR/venv/bin/python"
   if [ ! -x "$PYTHON_RUN" ]; then
+    # Fall back for diagnostics, but return failure so later steps know the
+    # isolated interpreter could not be prepared.
     PYTHON_RUN="$PYTHON_BOOTSTRAP"
     return 1
   fi
   run_step python_pip_install "$RESULT_DIR/python_pip_install.log" "$PYTHON_RUN" -m pip install -r sdk/python/requirements.txt
   return 0
 }
+# print_failure_context prints the top-level summary or comparison tail when any recorded step failed.
 print_failure_context() {
   if [ "$ANY_FAIL" -eq 0 ]; then
     return 0
@@ -225,8 +249,11 @@ print_failure_context() {
     tail -120 "$RESULT_DIR/postgres_async_compare.log" || true
   fi
 }
+# package_results archives the result directory after excluding runtime, venv, and the package being written.
 package_results() {
   local tmp_package="$RESULT_DIR/../.$(basename "$RESULT_DIR").tmp.tar.gz"
+  # Write through a sibling temp archive so an interrupted tar run never leaves
+  # a corrupt file at PACKAGE_PATH.
   rm -f "$tmp_package" "$PACKAGE_PATH"
   tar \
     --exclude '*/runtime' \
@@ -244,11 +271,13 @@ package_results() {
   return "$code"
 }
 
+# Capture environment before running checks so prereq failures still leave host context.
 write_server_environment
 run_step prerequisite_check "$RESULT_DIR/prerequisite_check.log" check_prerequisites
 if [ "$ANY_FAIL" -ne 0 ]; then
   PREREQ_OK=0
 fi
+# Python setup is gated by prerequisites because later comparison scripts depend on the selected interpreter.
 if [ "$PREREQ_OK" -eq 1 ]; then
   if ! setup_python; then
     PREREQ_OK=0
@@ -258,13 +287,17 @@ if [ "$PREREQ_OK" -eq 1 ]; then
   fi
 fi
 
+# Baseline tests are optional so comparison reruns can focus on previously prepared Docker evidence.
 if [ "${LOGSERVE_SERVER_SKIP_BASELINE:-0}" != "1" ]; then
+  # Clear runtime-only env vars so baseline tests use repository defaults rather
+  # than credentials or scheduler toggles from this wrapper.
   run_step go_test_all "$RESULT_DIR/go_test_all.log" env -u LOGSERVE_API_TOKEN -u LOGSERVE_SCHEDULER_V2 go test -count=1 ./...
   run_step go_race_metadata_control "$RESULT_DIR/go_race_metadata_control.log" env -u LOGSERVE_API_TOKEN -u LOGSERVE_SCHEDULER_V2 go test -race -count=1 ./internal/metadata ./internal/control
   run_step python_unittest "$RESULT_DIR/python_unittest.log" "$PYTHON_RUN" -m unittest discover sdk/python/tests
   run_step python_compileall "$RESULT_DIR/python_compileall.log" "$PYTHON_RUN" -m compileall -q sdk/python/logserve scripts
 fi
 
+# The nested comparison runner receives workload sizing and acceptance thresholds through environment variables for reproducible reruns.
 if [ "$PREREQ_OK" -eq 1 ]; then
   run_step postgres_async_compare "$RESULT_DIR/postgres_async_compare.log" env \
     LOGSERVE_POSTGRES_COMPARE_DIR="$COMPARE_DIR" \
@@ -282,9 +315,13 @@ if [ "$PREREQ_OK" -eq 1 ]; then
     bash scripts/postgres_async_compare.sh
 else
   echo "Skipping postgres_async_compare because prerequisite_check failed" > "$RESULT_DIR/postgres_async_compare.log"
+  # Record the skipped nested comparison as a failed command so the top-level
+  # summary explains why comparison evidence is missing.
   record_status postgres_async_compare 1 0 postgres_async_compare.log
 fi
 
+# Write a pre-package summary, add package_results to command_status.jsonl, then
+# rewrite the summary so the final report includes packaging evidence.
 write_acceptance_summary
 package_results
 write_acceptance_summary >> "$RESULT_DIR/acceptance_summary.log" 2>&1 || true

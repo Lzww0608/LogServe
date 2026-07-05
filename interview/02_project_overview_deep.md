@@ -52,7 +52,7 @@ LLM stats 也类似。`LLMCompleted` 事件已经在 `llm:<task_id>` stream 中�
 
 这个情况比 Q023 严重得多。metadata 已经显示状态变化，但 shared log 没有对应事件。重启后 replay 会丢掉这次状态变化，metadata 和 log 的事实记录就分叉了。
 
-举个例子，如果 `CreateWorkflow()` 先写 metadata，之后 `WorkflowStarted` append 失败，那么当前 control 可能能查到 workflow，但重启后从 log 里 replay 不出来。更糟的是，worker 可能已经执行了这个 workflow 的 step，而日志里没有完整起点。后续恢复、去重、dashboard 对比都会乱。
+举个例子，如果 `CreateWorkflow()` 先写 metadata，之后 `WorkflowStarted` append 失败，那么当前 control 可能查到 workflow，但重启后从 log 里 replay 不出来。更糟的是，worker 可能已经执行了这个 workflow 的 step，而日志里没有完整起点。后续恢复、去重、dashboard 对比都会乱。
 
 当前实现通过代码顺序避免这个问题。`log_first_test.go` 里专门测了几条路径：
 

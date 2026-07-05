@@ -72,28 +72,45 @@ type materializerFlushRequest struct {
 // Materializer coalesces high-frequency metadata updates and flushes them to the
 // durable backend on size, time, explicit Flush, or Close triggers.
 type Materializer struct {
-	queue         chan metadataDelta
-	batchMax      int
+	// queue is the bounded fast path; when it is full, Enqueue coalesces by key in overflow.
+	queue chan metadataDelta
+	// batchMax caps one durable flush so a large burst does not monopolize the goroutine.
+	batchMax int
+	// flushInterval bounds eventual-consistency lag when traffic stays below batchMax.
 	flushInterval time.Duration
 	db            *sql.DB
 
-	flush  materializerFlush
-	onErr  func(error)
-	done   chan struct{}
+	// flush performs the durable write; only the run goroutine calls it.
+	flush materializerFlush
+	// onErr reports both failed and recovered flush attempts to the owning store.
+	onErr func(error)
+	// done is closed once to stop accepting work and request final draining.
+	done chan struct{}
+	// closed is closed by run after the final drain sets closeErr.
 	closed chan struct{}
 
-	overflowMu     sync.Mutex
-	overflow       map[string]metadataDelta
+	// overflowMu protects overflow because producers write it outside the run goroutine.
+	overflowMu sync.Mutex
+	// overflow stores the newest dropped-queue delta per logical key.
+	overflow map[string]metadataDelta
+	// overflowSignal is size one so many overflow writes collapse into one wake-up.
 	overflowSignal chan struct{}
-	flushRequests  chan materializerFlushRequest
-	closeOnce      sync.Once
+	// flushRequests hands synchronous Flush calls to the run goroutine that owns pending.
+	flushRequests chan materializerFlushRequest
+	// closeOnce guarantees done is closed exactly once across concurrent Close calls.
+	closeOnce sync.Once
 
-	pendingCount         atomic.Int64
-	pendingKeys          atomic.Int64
+	// pendingCount tracks queued channel entries because len(queue) is only a snapshot.
+	pendingCount atomic.Int64
+	// pendingKeys exposes the goroutine-owned pending map size without taking its ownership.
+	pendingKeys atomic.Int64
+	// firstPendingUnixNano anchors lag estimates until all queue/overflow/pending state drains.
 	firstPendingUnixNano atomic.Int64
-	flushCount           atomic.Uint64
-	errorCount           atomic.Uint64
+	// flushCount and errorCount are monotonic counters read by Stats without statsMu.
+	flushCount atomic.Uint64
+	errorCount atomic.Uint64
 
+	// statsMu protects the last-* fields that are updated as one flush observation.
 	statsMu           sync.Mutex
 	lastFlushAt       time.Time
 	lastSuccessAt     time.Time
@@ -170,6 +187,8 @@ func (m *Materializer) Flush(ctx context.Context) error {
 	}
 	reply := make(chan error, 1)
 	req := materializerFlushRequest{ctx: ctx, reply: reply}
+	// Flush must rendezvous with run because only that goroutine has a complete
+	// view of the coalesced pending map.
 	select {
 	case m.flushRequests <- req:
 	case <-m.closed:
@@ -199,6 +218,8 @@ func (m *Materializer) Close(ctx context.Context) error {
 	m.closeOnce.Do(func() {
 		close(m.done)
 	})
+	// Close observes the final drain result through closed/closeErr instead of
+	// flushing directly from the caller goroutine.
 	select {
 	case <-m.closed:
 		return m.closeErr
@@ -254,6 +275,8 @@ func (m *Materializer) run() {
 		select {
 		case delta := <-m.queue:
 			m.pendingCount.Add(-1)
+			// One received delta is enough to wake the owner goroutine; drainQueue
+			// then folds the rest of the current burst into the same pending map.
 			mergeDelta(pending, delta)
 			m.drainQueue(pending)
 			m.drainOverflow(pending)

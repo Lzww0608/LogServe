@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
+# Summarize checkpoint acceptance artifacts into JSON and Markdown reports.
 import json
 import sys
 from pathlib import Path
 
 
+# Load a UTF-8 JSON artifact, returning an empty object when evidence is missing or malformed.
 def read_json(path):
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
+    # Acceptance runs may omit optional artifacts after early failure; callers
+    # treat an empty object as missing evidence rather than raising here.
     except Exception:
         return {}
 
 
+# Read command_status.jsonl, preserving malformed lines as failed command entries.
 def read_statuses(path):
     statuses = []
     if not path.exists():
@@ -20,11 +25,14 @@ def read_statuses(path):
             continue
         try:
             statuses.append(json.loads(line))
+        # Preserve malformed status lines so the final verdict surfaces log
+        # corruption instead of silently dropping it.
         except json.JSONDecodeError:
             statuses.append({"name": "malformed_status_line", "exit_code": 1, "duration_sec": 0, "log": ""})
     return statuses
 
 
+# Return whether a command status failed, treating invalid exit codes as failures.
 def status_failed(status):
     try:
         return int(status.get("exit_code", 1)) != 0
@@ -32,10 +40,12 @@ def status_failed(status):
         return True
 
 
+# Render boolean checks using the lowercase pass/fail labels expected in Markdown tables.
 def pass_text(value):
     return "pass" if value else "fail"
 
 
+# Build summary.json from checkpoint acceptance outputs and return the normalized summary.
 def write_summary(root):
     root = Path(root)
     acceptance = read_json(root / "checkpoint_acceptance.json")
@@ -44,6 +54,8 @@ def write_summary(root):
     checks = acceptance.get("checks") or {}
     failed_checks = sorted(name for name, passed in checks.items() if not passed)
     acceptance_pass = str(acceptance.get("verdict", "")).upper() == "PASS" and not failed_checks
+    # Both semantic checkpoint checks and recorded commands must pass;
+    # either failure source marks the package as failed.
     verdict = "PASS" if acceptance_pass and not failed_commands else "FAIL"
     summary = {
         "verdict": verdict,
@@ -63,6 +75,7 @@ def write_summary(root):
     return summary
 
 
+# Write the human-readable checkpoint acceptance report from the normalized summary object.
 def write_markdown(root, summary):
     acceptance = summary.get("acceptance") or {}
     workload = acceptance.get("workload") or {}
@@ -126,6 +139,7 @@ def write_markdown(root, summary):
     (root / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# Parse the result directory argument, write reports, and exit from the verdict.
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 1:

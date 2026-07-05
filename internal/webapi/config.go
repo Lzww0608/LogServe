@@ -14,15 +14,24 @@ import (
 // Config contains the HTTP listen settings, backend addresses, auth tokens,
 // static asset path, CORS mode, and per-request backend timeout for webapi.
 type Config struct {
-	Addr                 string
-	ControlAddr          string
-	LogAddr              string
-	APIToken             string
-	RoleTokens           map[role]string
-	StaticDir            string
-	DevCORS              bool
+	// Addr is the HTTP listen address for the web API process.
+	Addr string
+	// ControlAddr is the control-plane gRPC target used by HTTP handlers.
+	ControlAddr string
+	// LogAddr is the log-service gRPC target used by log explorer, audit, and registry reads.
+	LogAddr string
+	// APIToken authenticates backend gRPC calls and also acts as the legacy admin token.
+	APIToken string
+	// RoleTokens maps viewer/operator/admin web tokens to frontend permissions.
+	RoleTokens map[role]string
+	// StaticDir points to built frontend assets served by handleStatic.
+	StaticDir string
+	// DevCORS enables permissive local-development CORS handling.
+	DevCORS bool
+	// AllowUnauthenticated grants admin-equivalent access for local development only.
 	AllowUnauthenticated bool
-	RequestTimeout       time.Duration
+	// RequestTimeout bounds individual backend gRPC calls made while handling HTTP requests.
+	RequestTimeout time.Duration
 }
 
 // DefaultConfig reads LOGSERVE_WEB_* and backend address environment variables
@@ -55,6 +64,8 @@ func normalizeAuthConfig(cfg *Config) {
 	for _, roleName := range []role{roleViewer, roleOperator, roleAdmin} {
 		cfg.RoleTokens[roleName] = strings.TrimSpace(cfg.RoleTokens[roleName])
 	}
+	// Keep the newer admin role token and the older backend APIToken alias aligned
+	// so existing single-token deployments continue to authenticate both layers.
 	if cfg.APIToken == "" && cfg.RoleTokens[roleAdmin] != "" {
 		cfg.APIToken = cfg.RoleTokens[roleAdmin]
 	}
@@ -72,6 +83,8 @@ func hasConfiguredToken(cfg Config) bool {
 // validateAuthConfig rejects duplicate role tokens so one presented bearer value
 // cannot ambiguously map to multiple roles.
 func validateAuthConfig(cfg Config) error {
+	// Detect duplicates after trimming so a token never grants a role that depends
+	// on iteration order through the candidate list.
 	seen := make(map[string]role)
 	for _, roleName := range []role{roleViewer, roleOperator, roleAdmin} {
 		token := strings.TrimSpace(cfg.RoleTokens[roleName])

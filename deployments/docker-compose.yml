@@ -1,4 +1,8 @@
+# Base local Compose topology for the full LogServe stack. Host ports bind to
+# 127.0.0.1 so the deployment is reachable from the developer machine without
+# exposing service ports on every host interface.
 services:
+  # PostgreSQL stores control-plane metadata when LOGSERVE_METADATA_STORE=postgres.
   postgres:
     image: postgres:16
     environment:
@@ -12,6 +16,8 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # NATS runs with JetStream enabled for deployments that exercise queue-backed
+  # integration paths; read-only rootfs and dropped caps keep it constrained.
   nats:
     image: nats:2.10
     command: ["-js"]
@@ -25,6 +31,7 @@ services:
     cap_drop:
       - ALL
 
+  # MinIO is the local S3-compatible result store used by control and workers.
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: ["server", "/data", "--console-address", ":9001"]
@@ -39,6 +46,8 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # logd owns the append-only shared log; its data directory is the only service
+  # state persisted through the logstore-data volume.
   logd:
     build:
       context: ..
@@ -48,6 +57,8 @@ services:
         GOSUMDB: ${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
     command: ["logserve-logd", "--addr", "0.0.0.0:50051", "--data-dir", "/var/lib/logserve/logstore"]
     environment:
+      # Compose expansion fails fast when the shared API token is absent, making
+      # accidental unauthenticated local stacks explicit.
       LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
     ports:
       - "127.0.0.1:${LOGSERVE_LOGD_PORT:-50051}:50051"
@@ -63,6 +74,8 @@ services:
     mem_limit: 512m
     cpus: 1.0
 
+  # control materializes workflow/task/actor state from logd and persists query
+  # metadata to PostgreSQL while writing task results to MinIO.
   control:
     build:
       context: ..
@@ -75,6 +88,8 @@ services:
       LOGSERVE_API_TOKEN: ${LOGSERVE_API_TOKEN:?set LOGSERVE_API_TOKEN}
       LOGSERVE_METADATA_STORE: postgres
       LOGSERVE_POSTGRES_MODE: ${LOGSERVE_POSTGRES_MODE:-sync}
+      # The DSN is built from the same Compose environment used to create the
+      # postgres container so credentials and database name stay in lockstep.
       LOGSERVE_POSTGRES_DSN: postgres://${LOGSERVE_POSTGRES_USER:-logserve}:${LOGSERVE_POSTGRES_PASSWORD:?set LOGSERVE_POSTGRES_PASSWORD}@postgres:5432/${LOGSERVE_POSTGRES_DB:-logserve}?sslmode=${LOGSERVE_POSTGRES_SSLMODE:-disable}
       LOGSERVE_RESULT_STORE: minio
       LOGSERVE_S3_ENDPOINT: http://minio:9000
@@ -99,6 +114,8 @@ services:
     mem_limit: 512m
     cpus: 1.0
 
+  # web serves the console and talks to control/logd over the internal Compose
+  # network; only the browser-facing HTTP port is published to localhost.
   web:
     build:
       context: ..
@@ -124,6 +141,8 @@ services:
     mem_limit: 256m
     cpus: 0.5
 
+  # The default worker handles ordinary Python executor work and shares the same
+  # MinIO result-store configuration as the control plane.
   worker:
     build:
       context: ..
@@ -153,6 +172,8 @@ services:
     cpus: 1.0
     pids_limit: 256
 
+# Named volumes make the local stack restartable without binding host paths into
+# the default developer deployment.
 volumes:
   postgres-data:
   minio-data:

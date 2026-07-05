@@ -18,12 +18,14 @@ import { roleAtLeast } from "../utils/roles";
 
 // Render actor inventory and the create-actor form for operator sessions.
 export function ActorsPage({ session }: { session?: ConsoleSession | null }) {
+  // Poll the registry because actor ownership and command counts can change after method calls.
   const state = usePolling(() => api.actors(), 1000);
   const [className, setClassName] = useState("Counter");
   const [classSource, setClassSource] = useState(counterSource);
   const [initArgs, setInitArgs] = useState("[0]");
   const [idempotencyKey, setIdempotencyKey] = useState(defaultID("ui-actor"));
   const [message, setMessage] = useState("");
+  // The UI mirrors the server-side role check to avoid offering an action that will be rejected.
   const canCreate = roleAtLeast(session, "operator");
 
   const validation = useMemo(() => validateActorCreateForm(className, classSource, initArgs), [className, classSource, initArgs]);
@@ -47,6 +49,7 @@ export function ActorsPage({ session }: { session?: ConsoleSession | null }) {
         init_args: validation.parsedArgs ?? [],
         init_kwargs: {},
         idempotency_key: idempotencyKey,
+        // Keep UI-created actors checkpointed often enough for short demo sessions.
         snapshot_every: 25
       });
       navigate(`/actors/${actor.actor_id}`);

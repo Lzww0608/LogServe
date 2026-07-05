@@ -1,3 +1,5 @@
+# Namespace and demo secret used by the kustomize bundle. Replace the token
+# before using this outside a disposable local cluster.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -10,4 +12,6 @@ metadata:
   namespace: logserve
 type: Opaque
 stringData:
+  # stringData is convenient for local manifests; Kubernetes stores it as a
+  # Secret value, not as a long-term credential management mechanism.
   api-token: "replace-with-a-random-token"

@@ -2,6 +2,7 @@ package objectstore
 
 // This file tests local and S3-compatible object-store behavior without
 // requiring an external object-store service.
+
 import (
 	"bytes"
 	"context"
@@ -85,6 +86,8 @@ func TestS3PutEnsuresBucketOnceAndSendsChecksumMetadata(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPut && r.URL.Path == "/logserve-results":
+			// The fake server counts bucket creation separately so the test can verify
+			// the store's sync.Once gate instead of only observing object writes.
 			atomic.AddInt32(&bucketCreates, 1)
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/logserve-results/functions/"):
@@ -153,6 +156,8 @@ func TestS3PutEnsuresBucketOnceAndSendsChecksumMetadata(t *testing.T) {
 // upload, per-part checksums, and final completion XML.
 func TestS3MultipartUploadUsesParts(t *testing.T) {
 	ctx := context.Background()
+	// 6 MiB with a 5 MiB part size forces exactly two parts and exercises the S3
+	// rule that only the final part may be smaller than 5 MiB.
 	payload := bytes.Repeat([]byte("x"), 6<<20)
 	expectedHash := sha256Hex(payload)
 	var mu sync.Mutex
@@ -163,6 +168,8 @@ func TestS3MultipartUploadUsesParts(t *testing.T) {
 		query := r.URL.Query()
 		switch {
 		case r.Method == http.MethodPost && query.Has("uploads"):
+			// Initiation receives whole-object metadata even though data is uploaded
+			// through later part requests.
 			if got := r.Header.Get("x-amz-meta-sha256"); got != expectedHash {
 				t.Errorf("init metadata hash = %q, want %q", got, expectedHash)
 			}

@@ -5,6 +5,7 @@ import test from "node:test";
 import { consumeEventStream, createEventStreamURL, parseSSEChunk } from "../.tmp-event-tests/src/api/events.js";
 import { applyLogRecordsEvent, applyTaskEvent, applyWorkflowEvent } from "../.tmp-event-tests/src/utils/eventState.js";
 
+// Imports target compiled .tmp-event-tests files so Node can execute the browser-oriented TypeScript helpers.
 // Verifies parseSSEChunk buffers partial messages and emits completed events.
 test("parseSSEChunk buffers partial messages and emits completed events", () => {
   let parsed = parseSSEChunk("", "event: task\ndata: {\"task\":{\"task_id\":\"task-");
@@ -87,10 +88,12 @@ test("applyLogRecordsEvent appends new records once by sequence", () => {
 test("consumeEventStream rejects backend error events", async () => {
   const previousFetch = globalThis.fetch;
   const previousSessionStorage = globalThis.sessionStorage;
+  // Node tests do not provide browser storage, so install a minimal shim and restore it afterward.
   Object.defineProperty(globalThis, "sessionStorage", {
     configurable: true,
     value: { getItem: () => "", setItem: () => {}, removeItem: () => {} }
   });
+  // Feed consumeEventStream a one-message ReadableStream to exercise error-event rejection.
   globalThis.fetch = async () => new Response(new ReadableStream({
     start(controller) {
       controller.enqueue(new TextEncoder().encode('event: error\ndata: {"message":"backend stream failed"}\n\n'));

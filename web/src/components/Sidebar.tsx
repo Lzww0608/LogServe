@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import type { ConsoleRole, ConsoleSession } from "../types/logserve";
 import { roleAtLeast } from "../utils/roles";
 
+// navItems is ordered by the primary console workflow and filtered by minimum role.
 const navItems: Array<{ href: string; label: string; minRole?: ConsoleRole }> = [
   { href: "/", label: "Overview", minRole: "viewer" },
   { href: "/submit/task", label: "Submit Task", minRole: "operator" },
@@ -26,6 +27,7 @@ export function Sidebar({ path, session }: { path: string; session?: ConsoleSess
     <aside className="sidebar">
       <div className="brand">LogServe</div>
       <nav>
+        {/* Settings stays visible without a role so users can enter or clear tokens while signed out. */}
         {navItems.filter((item) => !item.minRole || roleAtLeast(session, item.minRole)).map((item) => (
           <NavLink key={item.href} path={item.href} current={path}>{item.label}</NavLink>
         ))}
@@ -36,6 +38,7 @@ export function Sidebar({ path, session }: { path: string; session?: ConsoleSess
 
 // Mark a route link active while keeping /workflows/new distinct from workflow details.
 function NavLink({ path, current, children }: { path: string; current: string; children: ReactNode }) {
+  // Exact matching keeps the workflow builder from also activating the workflow list route.
   const exact = path === "/" || path === "/workflows/new";
   const excludedChild = path === "/workflows" && current === "/workflows/new";
   const active = exact ? current === path : current === path || (!excludedChild && current.startsWith(path + "/"));

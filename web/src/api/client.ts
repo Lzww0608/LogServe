@@ -2,10 +2,12 @@
 
 import type { Actor, AdminConfig, BackpressureConfig, ConsoleSession, Dashboard, FunctionRegistryEntry, LLMTrace, LogStreamDetail, LogStreamsResponse, ModelInfo, Task, TaskListResponse, TemplateInfo, TemplateListResponse, TemplateRunResponse, Worker, Workflow, WorkflowListResponse } from "../types/logserve";
 
+// APIError is the console-wide typed error shape for failed backend calls.
 export class APIError extends Error {
   code: string;
   status: number;
 
+  // Preserve HTTP status and backend code while keeping Error.message usable in UI components.
   constructor(status: number, code: string, message: string) {
     super(message);
     this.status = status;
@@ -13,10 +15,13 @@ export class APIError extends Error {
   }
 }
 
+// FetchInit adds a json shortcut that apiFetch serializes after auth headers are prepared.
 type FetchInit = RequestInit & { json?: unknown };
 
+// QueryValue captures the filter types accepted by URLSearchParams builders.
 type QueryValue = string | number | undefined;
 
+// TaskListQuery mirrors backend task-list query parameters with UI-friendly field names.
 export type TaskListQuery = {
   q?: string;
   status?: string;
@@ -26,12 +31,14 @@ export type TaskListQuery = {
   pageToken?: string;
 };
 
+// WorkflowListQuery mirrors backend workflow-list query parameters with UI-friendly field names.
 export type WorkflowListQuery = {
   status?: string;
   limit?: number;
   pageToken?: string;
 };
 
+// tokenKey is session-scoped so browser tabs can hold independent console tokens.
 const tokenKey = "logserve.console.token";
 
 // Read the browser session token used for console API authorization.
@@ -41,6 +48,7 @@ export function getStoredToken(): string {
 
 // Persist or clear the console token and notify session/SSE consumers to reconnect.
 export function setStoredToken(token: string): void {
+  // Trim before storage so accidental whitespace does not create an unusable bearer token.
   const trimmed = token.trim();
   if (trimmed) {
     sessionStorage.setItem(tokenKey, trimmed);
@@ -48,18 +56,21 @@ export function setStoredToken(token: string): void {
     sessionStorage.removeItem(tokenKey);
   }
   if (typeof window !== "undefined") {
+    // Hooks that own SSE connections listen for this event and reconnect with the new token.
     window.dispatchEvent(new Event("logserve:token-change"));
   }
 }
 
 // Send one JSON-aware API request with bearer auth, request-id propagation, and APIError normalization.
 async function apiFetch<T>(path: string, init: FetchInit = {}): Promise<T> {
+  // Clone caller headers first so apiFetch can add auth and request metadata without mutating init.
   const headers = new Headers(init.headers);
   const token = getStoredToken();
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
   let body = init.body;
+  // The json shortcut is mutually exclusive with a caller-supplied raw body in normal use.
   if (init.json !== undefined) {
     headers.set("Content-Type", "application/json");
     body = JSON.stringify(init.json);
@@ -69,10 +80,12 @@ async function apiFetch<T>(path: string, init: FetchInit = {}): Promise<T> {
     headers.set("X-Request-ID", requestID());
   }
   const response = await fetch(path, { ...init, headers, body });
+  // Read text first so empty success bodies and structured error bodies follow one decode path.
   const text = await response.text();
   let payload: unknown;
   try {
     payload = text ? JSON.parse(text) : undefined;
+    // Non-JSON success bodies are treated as undefined; callers type endpoints that return JSON.
   } catch {
     payload = undefined;
   }
@@ -83,6 +96,7 @@ async function apiFetch<T>(path: string, init: FetchInit = {}): Promise<T> {
   return payload as T;
 }
 
+// TaskOperation is constrained to backend task operation route suffixes.
 export type TaskOperation = "retry" | "cancel" | "resubmit";
 
 // Build the encoded endpoint for a task operation such as retry or resubmit.
@@ -92,6 +106,7 @@ export function taskActionURL(taskID: string, action: TaskOperation): string {
 
 // Build the task-list URL from either a raw query string or typed filters.
 export function tasksURL(query: TaskListQuery | string = ""): string {
+  // Raw query strings are accepted for call sites that already own encoding and leading ?.
   if (typeof query === "string") return `/api/tasks${query}`;
   return `/api/tasks${queryString({
     q: query.q,
@@ -125,6 +140,7 @@ export function templateRunURL(templateID: string, wait = false): string {
 
 // Create a request id for audit correlation, falling back when crypto.randomUUID is unavailable.
 export function requestID(): string {
+  // Bind randomUUID because some browser implementations require the crypto receiver.
   const randomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto);
   if (randomUUID) return randomUUID();
   return `ui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -134,6 +150,7 @@ export function requestID(): string {
 function queryString(values: Record<string, QueryValue>): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(values)) {
+    // Undefined means omit the filter; empty strings are also skipped after trimming.
     if (value === undefined) continue;
     const text = String(value).trim();
     if (!text) continue;
@@ -144,9 +161,11 @@ function queryString(values: Record<string, QueryValue>): string {
 }
 // Recognize the backend error envelope before throwing a typed APIError.
 function isAPIErrorPayload(value: unknown): value is { error: { code?: string; message?: string } } {
+  // The guard is intentionally loose: apiFetch still tolerates missing code/message fields.
   return typeof value === "object" && value !== null && "error" in value;
 }
 
+// api is the stable frontend facade; pages should use these helpers rather than hard-coding paths.
 export const api = {
   // Call the health-check endpoint used by smoke and proxy checks.
   health: () => apiFetch<{ status: string }>("/api/healthz"),
@@ -206,6 +225,7 @@ export const api = {
   functionByHash: (functionHash: string) => apiFetch<FunctionRegistryEntry>(`/api/functions/${encodeURIComponent(functionHash)}`),
   // List log streams, optionally filtered by stream id prefix.
   logStreams: (prefix = "") => {
+    // Prefix is the only log-stream filter here; detailed pagination belongs to logStreamURL.
     const query = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
     return apiFetch<LogStreamsResponse>(`/api/logs/streams${query}`);
   },

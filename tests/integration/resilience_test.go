@@ -1,5 +1,9 @@
 package integration
 
+// This file covers resilience behavior that depends on durable task logs,
+// worker leases, backpressure gates, dashboard materialization, and restart
+// bootstrap paths.
+
 import (
 	"context"
 	"encoding/json"
@@ -10,6 +14,9 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// TestRunningTaskIsRedeliveredAfterWorkerLeaseExpires verifies a started task is
+// offered to another worker after its lease exceeds the configured redelivery
+// timeout.
 func TestRunningTaskIsRedeliveredAfterWorkerLeaseExpires(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -34,6 +41,8 @@ func TestRunningTaskIsRedeliveredAfterWorkerLeaseExpires(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Sleep past the 100ms redelivery timeout configured for this test so the next
+	// poll is allowed to claim the abandoned lease.
 	time.Sleep(180 * time.Millisecond)
 	secondPoll, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: "redelivery-worker-2"})
 	if err != nil {
@@ -44,6 +53,8 @@ func TestRunningTaskIsRedeliveredAfterWorkerLeaseExpires(t *testing.T) {
 	}
 }
 
+// TestPolledTaskIsRedeliveredWhenWorkerDiesBeforeStart verifies a task that was
+// polled but never started also becomes eligible for redelivery.
 func TestPolledTaskIsRedeliveredWhenWorkerDiesBeforeStart(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -61,6 +72,8 @@ func TestPolledTaskIsRedeliveredWhenWorkerDiesBeforeStart(t *testing.T) {
 		t.Fatalf("first poll = %v, want task %s", firstPoll, submitted.GetTaskId())
 	}
 
+	// Sleep past the 100ms redelivery timeout configured for this test so the next
+	// poll is allowed to claim the abandoned lease.
 	time.Sleep(180 * time.Millisecond)
 	secondPoll, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: "poll-worker-2"})
 	if err != nil {
@@ -71,6 +84,8 @@ func TestPolledTaskIsRedeliveredWhenWorkerDiesBeforeStart(t *testing.T) {
 	}
 }
 
+// TestStaleTaskCompletionRejectedAfterRedelivery confirms completions carrying an
+// old task lease epoch are rejected after another worker has claimed the task.
 func TestStaleTaskCompletionRejectedAfterRedelivery(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -99,6 +114,8 @@ func TestStaleTaskCompletionRejectedAfterRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Sleep past the 100ms redelivery timeout configured for this test so the next
+	// poll is allowed to claim the abandoned lease.
 	time.Sleep(180 * time.Millisecond)
 	secondPoll, err := env.controlClient.PollTask(context.Background(), &logservepb.PollTaskRequest{WorkerId: "stale-worker-2"})
 	if err != nil {
@@ -118,6 +135,8 @@ func TestStaleTaskCompletionRejectedAfterRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Complete with the first lease epoch while naming the second worker; this
+	// isolates epoch validation from worker identity checks.
 	_, err = env.controlClient.CompleteTask(context.Background(), &logservepb.CompleteTaskRequest{
 		TaskId:         submitted.GetTaskId(),
 		WorkerId:       "stale-worker-2",
@@ -130,6 +149,9 @@ func TestStaleTaskCompletionRejectedAfterRedelivery(t *testing.T) {
 	}
 }
 
+// TestOrdinaryTaskSurvivesControlRestartFromTaskSpecLog submits a task before a
+// control-plane restart and verifies the restarted server can rebuild the queued
+// task from log records.
 func TestOrdinaryTaskSurvivesControlRestartFromTaskSpecLog(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -147,6 +169,8 @@ func TestOrdinaryTaskSurvivesControlRestartFromTaskSpecLog(t *testing.T) {
 	}
 }
 
+// TestBackpressureRejectsNewTaskWhenQueueBacklogExceedsWatermark checks the queue
+// high-watermark gate rejects a new non-idempotent task while backlog is full.
 func TestBackpressureRejectsNewTaskWhenQueueBacklogExceedsWatermark(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -167,6 +191,9 @@ func TestBackpressureRejectsNewTaskWhenQueueBacklogExceedsWatermark(t *testing.T
 	}
 }
 
+// TestBackpressureAllowsIdempotentDuplicateWhenQueueIsFull ensures a duplicate
+// idempotency key can return the existing task even when new submissions are
+// blocked by backlog pressure.
 func TestBackpressureAllowsIdempotentDuplicateWhenQueueIsFull(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -192,10 +219,14 @@ func TestBackpressureAllowsIdempotentDuplicateWhenQueueIsFull(t *testing.T) {
 	}
 }
 
+// TestLogAppendSlowBackpressureRejectsNewTask lowers the log-append latency
+// threshold enough to force the slow-log backpressure branch for a new task.
 func TestLogAppendSlowBackpressureRejectsNewTask(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
 
+	// A 1ms threshold is intentionally below normal append latency, making this a
+	// deterministic exercise of the slow-log rejection path.
 	_, err := env.controlClient.SetBackpressure(context.Background(), &logservepb.SetBackpressureRequest{
 		QueueHighWatermark:  10,
 		RedeliveryTimeoutMs: 1000,
@@ -215,6 +246,9 @@ func TestLogAppendSlowBackpressureRejectsNewTask(t *testing.T) {
 	}
 }
 
+// TestDashboardSnapshotShowsWorkflowTaskActorAndModelCache verifies one dashboard
+// snapshot includes queued workflow/task state, actors, workers, and model cache
+// metadata.
 func TestDashboardSnapshotShowsWorkflowTaskActorAndModelCache(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -253,6 +287,9 @@ func TestDashboardSnapshotShowsWorkflowTaskActorAndModelCache(t *testing.T) {
 	}
 }
 
+// TestControlRestartBootstrapsWorkflowAndModelStateFromLog restarts the control
+// plane and checks workflow state plus model registry entries are rebuilt from
+// durable log streams.
 func TestControlRestartBootstrapsWorkflowAndModelStateFromLog(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -281,6 +318,8 @@ func TestControlRestartBootstrapsWorkflowAndModelStateFromLog(t *testing.T) {
 	}
 }
 
+// TestControlRestartBootstrapsWorkerCacheFromLog verifies cached-model metadata
+// registered by workers survives a control-plane restart via log bootstrap.
 func TestControlRestartBootstrapsWorkerCacheFromLog(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -301,6 +340,8 @@ func TestControlRestartBootstrapsWorkerCacheFromLog(t *testing.T) {
 	}
 }
 
+// configureBackpressure applies queue and redelivery settings used by resilience
+// tests to force specific branches without waiting for production defaults.
 func configureBackpressure(t *testing.T, client logservepb.ControlServiceClient, queueHighWatermark uint32, redeliveryTimeoutMs int64) {
 	t.Helper()
 	_, err := client.SetBackpressure(context.Background(), &logservepb.SetBackpressureRequest{
@@ -312,6 +353,8 @@ func configureBackpressure(t *testing.T, client logservepb.ControlServiceClient,
 	}
 }
 
+// registerBasicWorker registers a one-slot worker directly with the control plane
+// so lease and redelivery tests can drive PollTask manually.
 func registerBasicWorker(t *testing.T, client logservepb.ControlServiceClient, workerID string) {
 	t.Helper()
 	if _, err := client.RegisterWorker(context.Background(), &logservepb.RegisterWorkerRequest{WorkerId: workerID, Capacity: 1}); err != nil {
@@ -319,6 +362,8 @@ func registerBasicWorker(t *testing.T, client logservepb.ControlServiceClient, w
 	}
 }
 
+// submitPlainTask submits a deterministic Python function whose output encodes
+// the task name, using a time-derived idempotency key to avoid cross-test reuse.
 func submitPlainTask(t *testing.T, client logservepb.ControlServiceClient, name string) *logservepb.SubmitTaskResponse {
 	t.Helper()
 	resp, err := client.SubmitTask(context.Background(), &logservepb.SubmitTaskRequest{
@@ -334,11 +379,14 @@ func submitPlainTask(t *testing.T, client logservepb.ControlServiceClient, name 
 	return resp
 }
 
+// plainTaskSource builds a tiny Python function and JSON-escapes the returned
+// string so arbitrary task names remain valid Python literals.
 func plainTaskSource(name string) string {
 	data, _ := json.Marshal(name + "-ok")
 	return "def " + name + "():\n    return " + string(data) + "\n"
 }
 
+// dashboardWorkflow finds one workflow entry in a materialized dashboard snapshot.
 func dashboardWorkflow(snapshot *logservepb.DashboardSnapshot, workflowID string) *logservepb.DashboardWorkflow {
 	for _, workflow := range snapshot.GetWorkflows() {
 		if workflow.GetWorkflowId() == workflowID {
@@ -348,6 +396,7 @@ func dashboardWorkflow(snapshot *logservepb.DashboardSnapshot, workflowID string
 	return nil
 }
 
+// dashboardTask finds one task entry in a materialized dashboard snapshot.
 func dashboardTask(snapshot *logservepb.DashboardSnapshot, taskID string) *logservepb.DashboardTask {
 	for _, task := range snapshot.GetTasks() {
 		if task.GetTaskId() == taskID {
@@ -357,6 +406,7 @@ func dashboardTask(snapshot *logservepb.DashboardSnapshot, taskID string) *logse
 	return nil
 }
 
+// dashboardActor finds one actor status entry in a materialized dashboard snapshot.
 func dashboardActor(snapshot *logservepb.DashboardSnapshot, actorID string) *logservepb.GetActorStatusResponse {
 	for _, actor := range snapshot.GetActors() {
 		if actor.GetActorId() == actorID {
@@ -366,6 +416,7 @@ func dashboardActor(snapshot *logservepb.DashboardSnapshot, actorID string) *log
 	return nil
 }
 
+// dashboardWorker finds one worker entry in a materialized dashboard snapshot.
 func dashboardWorker(snapshot *logservepb.DashboardSnapshot, workerID string) *logservepb.DashboardWorker {
 	for _, worker := range snapshot.GetWorkers() {
 		if worker.GetWorkerId() == workerID {

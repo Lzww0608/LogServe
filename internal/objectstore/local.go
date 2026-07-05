@@ -2,6 +2,7 @@ package objectstore
 
 // This file implements the local filesystem object store. Objects are
 // content-addressed by SHA-256 and published with rename after a temp-file write.
+
 import (
 	"context"
 	"crypto/rand"
@@ -28,6 +29,7 @@ var copyBufferPool = sync.Pool{
 
 // LocalStore stores immutable objects under a single absolute root directory.
 type LocalStore struct {
+	// dir is absolute so later ref validation can compare cleaned absolute paths.
 	dir string
 }
 
@@ -44,7 +46,7 @@ func OpenLocal(dir string) (*LocalStore, error) {
 }
 
 // Put writes an object into a cleaned namespace, verifies the optional size, and
-// returns a local:// content-addressed ref.
+// produces a local:// content-addressed ref.
 func (s *LocalStore) Put(ctx context.Context, namespace string, r io.Reader, size int64) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -79,6 +81,8 @@ func (s *LocalStore) Put(ctx context.Context, namespace string, r io.Reader, siz
 		_ = tmpFile.Close()
 		return "", fmt.Errorf("object size mismatch: wrote %d bytes, expected %d", written, size)
 	}
+	// Flush and close the temp file before rename so readers never observe a
+	// content-addressed path whose file data is still buffered in this process.
 	if err := errors.Join(tmpFile.Sync(), tmpFile.Close()); err != nil {
 		return "", err
 	}
@@ -164,6 +168,8 @@ func (s *LocalStore) pathForRef(ref string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	// Compare absolute cleaned paths after joining with the root; this catches
+	// refs such as local://namespace/../../outside even when separators differ.
 	if cleanPath != cleanDir && !strings.HasPrefix(cleanPath, cleanDir+string(os.PathSeparator)) {
 		return "", "", errors.New("object ref escapes store")
 	}
@@ -184,6 +190,8 @@ func cleanNamespace(namespace string) string {
 		cleaned = append(cleaned, part)
 	}
 	if len(cleaned) == 0 {
+		// Keep the empty namespace usable while avoiding writes directly at the
+		// object-store root.
 		return "default"
 	}
 	return filepath.Join(cleaned...)
@@ -233,6 +241,8 @@ func fileSHA256Matches(ctx context.Context, path, wantHex string) (bool, error) 
 	if _, err := copyWithContext(ctx, h, file); err != nil {
 		return false, err
 	}
+	// Re-hashing is slower than trusting the filename, but it makes rename races
+	// safe when another process has already published the content-addressed path.
 	return hex.EncodeToString(h.Sum(nil)) == wantHex, nil
 }
 

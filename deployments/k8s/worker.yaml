@@ -1,9 +1,13 @@
+# Worker deployments use the shared runtime image and differ only by worker id
+# and advertised model id, matching the local experiment topology.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: logserve-worker-a
   namespace: logserve
 spec:
+  # Keep one pod per worker id so scheduler state can map assignments back to a
+  # stable logical worker during demos and smoke deployments.
   replicas: 1
   selector:
     matchLabels:
@@ -25,6 +29,8 @@ spec:
         - name: worker
           image: logserve:local
           imagePullPolicy: IfNotPresent
+          # worker-a advertises model-A:v1 so model-aware routing can choose it
+          # independently from worker-b.
           args:
             - logserve-worker
             - --worker-id
@@ -50,6 +56,8 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+          # Executor scratch writes go to /tmp; the container root filesystem is
+          # otherwise read-only and all Linux capabilities are dropped.
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -62,12 +70,16 @@ spec:
         - name: tmp
           emptyDir: {}
 ---
+# worker-b mirrors worker-a but advertises model-B:v1, giving the scheduler two
+# model-specific pools inside the same namespace.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: logserve-worker-b
   namespace: logserve
 spec:
+  # Keep one pod per worker id so scheduler state can map assignments back to a
+  # stable logical worker during demos and smoke deployments.
   replicas: 1
   selector:
     matchLabels:
@@ -89,6 +101,8 @@ spec:
         - name: worker
           image: logserve:local
           imagePullPolicy: IfNotPresent
+          # worker-b keeps the same executor path and control/log addresses but
+          # publishes a different model capability.
           args:
             - logserve-worker
             - --worker-id

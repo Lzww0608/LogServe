@@ -2,20 +2,24 @@
 
 import type { ReactNode } from "react";
 
+// Column describes how one typed row field is rendered into a table cell.
 export type Column<T> = {
   label: string;
   render: (row: T) => ReactNode;
   className?: string;
 };
 
+// TablePagination is UI state supplied by pages that own cursor or offset pagination.
 export type TablePagination = {
   label: string;
   pageSize: number;
   pageSizeOptions?: number[];
   canPrevious: boolean;
   canNext: boolean;
+  // Navigation callbacks are supplied by the page so cursor and offset pagination both fit this primitive.
   onPrevious: () => void;
   onNext: () => void;
+  // Page-size changes reset or reload data in the owning page; the table only emits the selected size.
   onPageSizeChange: (pageSize: number) => void;
 };
 
@@ -31,6 +35,7 @@ export function Table<T>({ rows, columns, empty, pagination }: { rows: T[]; colu
             </thead>
             <tbody>
               {rows.map((row, index) => (
+                // Rows do not require ids because callers pass already-windowed lists and cells are read-only.
                 <tr key={index}>{columns.map((column) => <td key={column.label} className={column.className}>{column.render(row)}</td>)}</tr>
               ))}
             </tbody>
@@ -46,6 +51,7 @@ export function Table<T>({ rows, columns, empty, pagination }: { rows: T[]; colu
 
 // Render page-size and previous/next controls for token or offset pagination.
 function PaginationFooter({ pagination }: { pagination: TablePagination }) {
+  // Default page sizes match the backend list limits used by console pages.
   const options = pagination.pageSizeOptions ?? [25, 50, 100];
   return (
     <div className="table-footer">

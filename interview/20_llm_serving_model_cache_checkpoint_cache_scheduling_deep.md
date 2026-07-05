@@ -72,7 +72,7 @@
 
 因为那会把调度路径做成 O(历史事件数)。
 
-LLM task 每次调度都去扫描所有 `llm:*` stream，早期 demo 可能能跑，但请求一多，调度器会被 replay 拖慢。更糟的是，调度本身发生在高频路径上，慢一次就会影响所有排队任务。
+LLM task 每次调度都去扫描所有 `llm:*` stream，早期 demo 也许能跑，但请求一多，调度器会被 replay 拖慢。更糟的是，调度本身发生在高频路径上，慢一次就会影响所有排队任务。
 
 当前实现把历史事件提前物化成 LLM stats。worker 完成一次 LLM 请求后，`LLMCompleted` 事件会更新对应的统计项。调度时只需要按候选 worker 查这份 materialized stats，复杂度接近 O(worker 数)。
 

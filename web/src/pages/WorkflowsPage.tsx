@@ -9,6 +9,7 @@ import { usePolling } from "../hooks/usePolling";
 import type { ConsoleSession } from "../types/logserve";
 import { roleAtLeast } from "../utils/roles";
 
+// Match the backend-friendly default while still allowing user-selected page sizes.
 const defaultPageSize = 50;
 
 // Render workflow filters and token-based list pagination.
@@ -20,11 +21,13 @@ export function WorkflowsPage({ session }: { session?: ConsoleSession | null }) 
   const [pageTokens, setPageTokens] = useState<string[]>([""]);
   const currentPageToken = pageTokens[pageIndex] ?? "";
 
+  // Status and page-size changes invalidate previously returned opaque page tokens.
   useEffect(() => {
     setPageIndex(0);
     setPageTokens([""]);
   }, [status, pageSize]);
 
+  // Memoize the API query object so polling follows the current page token instead of stale list state.
   const query = useMemo<WorkflowListQuery>(() => ({
     status,
     limit: pageSize,
@@ -57,6 +60,7 @@ export function WorkflowsPage({ session }: { session?: ConsoleSession | null }) 
         onPrevious: () => setPageIndex((current) => Math.max(0, current - 1)),
         onNext: () => {
           if (!nextToken) return;
+          // Drop forward-history tokens before storing the next token for this filter set.
           setPageTokens((current) => [...current.slice(0, pageIndex + 1), nextToken]);
           setPageIndex((current) => current + 1);
         },

@@ -39,6 +39,8 @@ func TestMemoryStoreV2TaskIndexesFollowStatusTransitions(t *testing.T) {
 	if running := store.ListTasksByStatus(logservepb.TaskStatus_TASK_STATUS_RUNNING); len(running) != 1 || running[0].TaskID != created.TaskID {
 		t.Fatalf("running index = %#v, want leased task", running)
 	}
+	// Read the internal worker index directly because the Store interface exposes
+	// status snapshots, not the diagnostic running-task index.
 	store.tasks.indexMu.RLock()
 	_, workerIndexed := store.tasks.byWorker["worker-1"][created.TaskID]
 	store.tasks.indexMu.RUnlock()
@@ -55,6 +57,7 @@ func TestMemoryStoreV2TaskIndexesFollowStatusTransitions(t *testing.T) {
 	if succeeded := store.ListTasksByStatus(logservepb.TaskStatus_TASK_STATUS_SUCCEEDED); len(succeeded) != 1 || succeeded[0].TaskID != created.TaskID {
 		t.Fatalf("succeeded index = %#v, want completed task", succeeded)
 	}
+	// Recheck the same internal index after terminal transition to verify cleanup.
 	store.tasks.indexMu.RLock()
 	_, workerIndexed = store.tasks.byWorker["worker-1"][created.TaskID]
 	store.tasks.indexMu.RUnlock()
@@ -77,6 +80,8 @@ func TestMemoryStoreV2DeadlineHeapRequeuesOnlyExpiredRunningTasks(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Move only the old lease timestamp so the deadline heap has one expired
+	// candidate and one fresh running task to preserve.
 	expireLeaseForTest(t, store, oldLease.TaskID, oldLease.TaskLeaseEpoch, time.Minute)
 
 	requeued := store.RequeueExpiredRunningTasks(time.Second)
@@ -185,6 +190,8 @@ func TestMemoryStoreV2ConcurrentHeartbeatLeaseComplete(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+	// The mixed goroutines are intentionally simple; the race detector is the main
+	// oracle for lock and atomic correctness while final counts check lost updates.
 	for i := 0; i < 8; i++ {
 		workerID := benchmarkWorkerIDs(8)[i]
 		wg.Add(1)
@@ -236,11 +243,15 @@ func expireLeaseForTest(t *testing.T, store *MemoryStoreV2, taskID string, lease
 	task.UpdatedAtMs = time.Now().Add(-age).UnixMilli()
 	expired := cloneTask(*task)
 	shard.mu.Unlock()
+	// Refresh the heap after releasing the shard lock to match production index
+	// maintenance and avoid creating a test-only lock ordering.
 	store.tasks.trackRunning(expired)
 }
 
 // benchmarkTaskID returns deterministic task IDs that still spread across worker
 // IDs for concurrency tests.
 func benchmarkTaskID(i int) string {
+	// Include a short letter component and a worker-shaped suffix so task IDs are
+	// deterministic while still distributing across the fixed task shards.
 	return "concurrent-task-" + string(rune('a'+(i%26))) + "-" + benchmarkWorkerIDs(256)[i]
 }

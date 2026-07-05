@@ -20,12 +20,14 @@ import { WorkflowsPage } from "./pages/WorkflowsPage";
 import type { ConsoleSession } from "./types/logserve";
 
 // Map the current path to the matching route component and pass session context where needed.
+// routeKey includes query/hash from App so pages with URL-derived defaults remount on navigation.
 export function renderRoute(path: string, routeKey = path, session?: ConsoleSession | null, onSessionChange?: () => void) {
   if (path === "/") return <OverviewPage key={routeKey} session={session} />;
   if (path === "/submit/task") return <SubmitTaskPage key={routeKey} session={session} />;
   if (path === "/templates") return <TemplatesPage key={routeKey} session={session} />;
   if (path === "/tasks") return <TasksPage key={routeKey} session={session} />;
   if (path === "/functions") return <FunctionsPage key={routeKey} />;
+  // Detail routes decode the second path segment because ids can contain URL-escaped characters.
   if (path.startsWith("/tasks/")) return <TaskDetailPage key={routeKey} taskID={decodeURIComponent(path.split("/")[2] ?? "")} session={session} />;
   if (path === "/workflows") return <WorkflowsPage key={routeKey} session={session} />;
   if (path === "/workflows/new") return <WorkflowBuilderPage key={routeKey} session={session} />;
@@ -50,5 +52,6 @@ export function pathTitle(path: string) {
   if (path === "/llm") return "LLM";
   if (path.startsWith("/actors/")) return "Actor Detail";
   if (path === "/submit/task") return "Submit Task";
+  // Unknown static paths still get a readable title before NotFoundPage renders.
   return path.slice(1).split("/").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
 }

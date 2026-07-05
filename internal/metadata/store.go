@@ -1,3 +1,7 @@
+// Package metadata defines the control-plane state boundary for tasks, workers,
+// workflows, actors, and model registry entries. Implementations keep an
+// in-memory scheduling view and may additionally mirror that view to durable
+// storage such as Postgres.
 package metadata
 
 // This file defines the metadata Store contract shared by the control plane,
@@ -14,7 +18,8 @@ import (
 // Store is the in-process metadata boundary for task scheduling, worker
 // discovery, workflow state, actor state, and model registration. Implementations
 // should return defensive copies for mutable fields so callers cannot corrupt
-// store-owned state.
+// store-owned state. Methods expose a synchronous state contract even when a
+// durable implementation later mirrors the accepted snapshot asynchronously.
 type Store interface {
 	// CreateTask inserts a scheduler task and returns duplicate=true when the
 	// idempotency key already points at an existing task.
@@ -52,7 +57,8 @@ type Store interface {
 	GetWorkflowByIdempotencyKey(idempotencyKey string) (workflow.State, bool)
 	// ListWorkflows returns all workflow state snapshots.
 	ListWorkflows() []workflow.State
-	// UpdateWorkflow mutates one workflow through a callback and commits on success.
+	// UpdateWorkflow mutates one workflow through a callback and commits only when
+	// the callback returns nil.
 	UpdateWorkflow(workflowID string, fn func(*workflow.State) error) (workflow.State, error)
 	// UpsertWorkflow installs a replayed or externally materialized workflow state.
 	UpsertWorkflow(state workflow.State)
@@ -80,7 +86,8 @@ type Store interface {
 	GetActorByIdempotencyKey(idempotencyKey string) (actor.State, bool)
 	// ListActors returns all actor state snapshots.
 	ListActors() []actor.State
-	// UpdateActor mutates one actor through a callback and commits on success.
+	// UpdateActor mutates one actor through a callback and commits only when the
+	// callback returns nil.
 	UpdateActor(actorID string, fn func(*actor.State) error) (actor.State, error)
 	// UpsertActor installs a replayed or externally materialized actor state.
 	UpsertActor(state actor.State)

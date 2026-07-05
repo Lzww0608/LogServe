@@ -1,3 +1,4 @@
+# Tests checkpoint acceptance summary generation from command status and replay fixtures.
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts" / "summarize_checkpoint_acceptance.py"
 
 
+# load_module imports the checkpoint summarizer directly from scripts/.
 def load_module():
     spec = importlib.util.spec_from_file_location("summarize_checkpoint_acceptance", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -18,11 +20,13 @@ def load_module():
     return module
 
 
+# write_status appends one command_status.jsonl row for summarizer command failure logic.
 def write_status(root, name, exit_code):
     with (root / "command_status.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"name": name, "exit_code": exit_code, "duration_sec": 1, "log": f"{name}.log"}) + "\n")
 
 
+# write_acceptance creates a compact checkpoint_acceptance.json fixture with replay ratio fields.
 def write_acceptance(root, verdict="PASS", checks=None):
     if checks is None:
         checks = {
@@ -46,7 +50,9 @@ def write_acceptance(root, verdict="PASS", checks=None):
     (root / "checkpoint_acceptance.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+# CheckpointAcceptanceSummaryTest verifies checkpoint summary verdicts, Markdown, and failed command propagation.
 class CheckpointAcceptanceSummaryTest(unittest.TestCase):
+    # test_writes_pass_summary covers the happy path and emitted Markdown fields.
     def test_writes_pass_summary(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -63,6 +69,7 @@ class CheckpointAcceptanceSummaryTest(unittest.TestCase):
             self.assertIn("Verdict: **PASS**", markdown)
             self.assertIn("checkpoint_read_records_reduced", markdown)
 
+    # test_main_returns_failure_when_a_check_fails ensures failed acceptance checks drive a non-zero CLI result.
     def test_main_returns_failure_when_a_check_fails(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -78,6 +85,7 @@ class CheckpointAcceptanceSummaryTest(unittest.TestCase):
             self.assertEqual("FAIL", summary["verdict"])
             self.assertIn("checkpoint_replay_consistent", summary["failed_checks"])
 
+    # test_failed_command_marks_summary_failed confirms command_status failures are not hidden by PASS fixture data.
     def test_failed_command_marks_summary_failed(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:

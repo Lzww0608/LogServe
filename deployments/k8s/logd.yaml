@@ -1,9 +1,13 @@
+# logd owns the durable shared log. The pod mounts a PVC at the same data path
+# used by the container image and Compose deployment.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: logserve-logd
   namespace: logserve
 spec:
+  # The logstore PVC uses ReadWriteOnce, so this manifest deliberately runs one
+  # logd replica instead of relying on multi-writer storage semantics.
   replicas: 1
   selector:
     matchLabels:
@@ -24,6 +28,8 @@ spec:
         - name: logd
           image: logserve:local
           imagePullPolicy: IfNotPresent
+          # Data-dir points at the PVC mount; changing it would break recovery
+          # expectations for restarts against the same logstore volume.
           args: ["logserve-logd", "--addr", "0.0.0.0:50051", "--data-dir", "/var/lib/logserve/logstore"]
           env:
             - name: LOGSERVE_API_TOKEN
@@ -56,6 +62,8 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            # logstore is the only durable mount; /tmp remains ephemeral for a
+            # read-only-rootfs compatible runtime scratch area.
             - name: logstore
               mountPath: /var/lib/logserve/logstore
             - name: tmp
@@ -67,6 +75,8 @@ spec:
         - name: tmp
           emptyDir: {}
 ---
+# ClusterIP exposes the log gRPC port to control/workers without publishing it
+# outside the cluster.
 apiVersion: v1
 kind: Service
 metadata:
@@ -80,6 +90,8 @@ spec:
     - port: 50051
       targetPort: 50051
 ---
+# The PVC is intentionally small for local kind/dev clusters; production-like
+# durability depends on the storage class backing this claim.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

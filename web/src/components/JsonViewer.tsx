@@ -5,7 +5,9 @@ import { copyToClipboard } from "../utils/clipboard";
 
 // Render a stable JSON/text preview for unknown API payloads.
 export function JsonViewer({ value, title = "JSON", collapsible = false, defaultCollapsed = false }: { value: unknown; title?: string; collapsible?: boolean; defaultCollapsed?: boolean }) {
+  // Collapse state is local because each viewer controls its own payload disclosure.
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  // Memoize stringification so large payloads are not reserialized on unrelated renders.
   const text = useMemo(() => stringifyJSON(value), [value]);
   return (
     <div className="json-viewer">
@@ -24,6 +26,7 @@ export function JsonViewer({ value, title = "JSON", collapsible = false, default
 // Serialize unknown values for display, falling back when JSON.stringify fails.
 function stringifyJSON(value: unknown): string {
   try {
+    // Pretty-print for inspection; table previews use separate compact formatters.
     return JSON.stringify(value, null, 2);
   } catch {
     return String(value);

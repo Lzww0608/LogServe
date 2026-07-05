@@ -7,6 +7,7 @@ import { StatusBadge } from "./StatusBadge";
 import { Table, type Column, type TablePagination } from "./Table";
 
 // Render registered functions with copy and submit-task shortcuts.
+// onCopy receives the stable function_hash so callers can place it on the clipboard without row coupling.
 export function FunctionTable({ rows, onCopy }: { rows: FunctionRegistryEntry[]; onCopy: (functionHash: string) => void }) {
   return <Table rows={rows} empty="No functions" columns={[
     { label: "Function hash", className: "hash-cell", render: (row) => <code className="payload-cell">{row.function_hash}</code> },
@@ -92,6 +93,7 @@ export function WorkerTable({ rows }: { rows: Worker[] }) {
 }
 
 // Render selectable log streams with sequence stats.
+// onSelect receives a stream id, leaving pagination and record fetching to the owning page.
 export function LogStreamTable({ streamIDs, stats, selected, onSelect }: { streamIDs: string[]; stats: Map<string, StreamStats>; selected: string; onSelect: (streamID: string) => void }) {
   return <Table rows={streamIDs} empty="No streams" columns={[
     { label: "Stream", render: (streamID) => <button type="button" className={streamID === selected ? "primary compact-button" : "ghost compact-button"} onClick={() => onSelect(streamID)}>{streamID}</button> },
@@ -103,7 +105,9 @@ export function LogStreamTable({ streamIDs, stats, selected, onSelect }: { strea
 }
 
 // Render log records with optional inspect/copy actions.
+// Optional callbacks let read-only pages reuse the same table without exposing action buttons.
 export function LogRecordTable({ rows, pagination, onInspect, onCopyPayload }: { rows: LogRecord[]; pagination?: TablePagination; onInspect?: (row: LogRecord) => void; onCopyPayload?: (row: LogRecord) => void }) {
+  // Build log columns locally because action buttons are optional per caller.
   const columns: Column<LogRecord>[] = [
     { label: "Seq", render: (row) => row.seq },
     { label: "Event", render: (row) => row.event_type || "-" },
@@ -112,6 +116,7 @@ export function LogRecordTable({ rows, pagination, onInspect, onCopyPayload }: {
     { label: "CRC32", render: (row) => row.crc32 ?? "-" },
     { label: "Payload", render: (row) => <code className="payload-cell">{payloadPreview(row)}</code> }
   ];
+  // Append the actions column only when at least one callback is available.
   if (onInspect || onCopyPayload) {
     columns.push({
       label: "Actions",
@@ -127,6 +132,7 @@ export function LogRecordTable({ rows, pagination, onInspect, onCopyPayload }: {
 
 // Render sequence and compaction stats for the selected log stream.
 export function StreamStatsPanel({ stats }: { stats?: StreamStats | null }) {
+  // Missing stats is valid while a stream has no records or the first poll is still loading.
   if (!stats) return <div className="empty">No stream stats</div>;
   return <DetailGrid items={[
     ["First seq", stats.first_seq],

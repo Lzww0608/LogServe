@@ -55,6 +55,8 @@ func (s *Server) handleCreateActor(w http.ResponseWriter, r *http.Request) {
 	initArgsJSON := []byte(input.InitArgsJSON)
 	var err error
 	if len(initArgsJSON) == 0 {
+		// Support both UI-friendly init_args/init_kwargs and the lower-level
+		// init_args_json envelope used by SDK or replay-oriented callers.
 		initArgsJSON, err = envelopeArgs(input.InitArgs, input.InitKwargs)
 		if err != nil {
 			writeErr(w, err)
@@ -122,6 +124,8 @@ func (s *Server) handleCallActor(w http.ResponseWriter, r *http.Request) {
 	}
 	timeout := s.cfg.RequestTimeout
 	if input.TimeoutMs > 0 {
+		// Keep the HTTP context slightly longer than the actor execution timeout so
+		// the control plane can return a terminal result instead of racing the client deadline.
 		timeout = time.Duration(input.TimeoutMs+5000) * time.Millisecond
 	}
 	ctx, cancel := requestContext(r, timeout)
@@ -152,6 +156,8 @@ func (s *Server) handleReplayActor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := actorStatusDTO(resp.GetReplayed())
+	// Replay diagnostics are attached to the normal actor DTO so callers can
+	// compare reconstructed state with metadata without another response shape.
 	dto.Consistent = resp.GetConsistentWithMetadata()
 	dto.FullReplayCommands = resp.GetFullReplayCommands()
 	dto.SnapshotReplayCommands = resp.GetSnapshotReplayCommands()

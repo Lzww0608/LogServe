@@ -6,7 +6,9 @@ import { roleLabel } from "../utils/roles";
 
 // Render control-plane connection metadata and the signed-in role badge.
 export function Header({ title, session, sessionError }: { title: string; session?: ConsoleSession | null; sessionError?: string }) {
+  // Read token presence at render time so manual refreshes reflect Settings changes.
   const hasToken = Boolean(getStoredToken());
+  // This timestamp is a lightweight render marker, not a server heartbeat time.
   const refreshedAt = new Date().toLocaleTimeString();
   return (
     <header className="topbar">

@@ -12,12 +12,17 @@ option go_package = "github.com/logserve/logserve/gen/logservepb;logservepb";
 // The log service assigns seq, timestamp_ms, and crc32 on append. Callers treat
 // payload as opaque bytes and interpret it according to event_type and stream_id.
 message LogRecord {
+  // stream_id identifies the independent append sequence for this record.
   string stream_id = 1;
+  // seq is assigned by the log service and increases monotonically per stream.
   uint64 seq = 2;
+  // event_type names the payload schema understood by higher-level replay code.
   string event_type = 3;
   string idempotency_key = 4;
+  // payload is intentionally opaque to the log service.
   bytes payload = 5;
   int64 timestamp_ms = 6;
+  // crc32 lets readers detect corrupted payload bytes during replay or maintenance.
   uint32 crc32 = 7;
 }
 
@@ -27,9 +32,11 @@ message LogRecord {
 // when present, the store can return the original append result instead of
 // creating a second record for the same logical event.
 message AppendLogRequest {
+  // stream_id chooses the stream whose sequence should receive this event.
   string stream_id = 1;
   string event_type = 2;
   string idempotency_key = 3;
+  // payload is written exactly as supplied; encoding compatibility is handled by callers.
   bytes payload = 4;
 }
 
@@ -51,6 +58,7 @@ message AppendLogResponse {
 message ReadLogRequest {
   string stream_id = 1;
   uint64 from_seq = 2;
+  // limit protects callers from accidentally materializing an unbounded stream slice.
   uint32 limit = 3;
 }
 
@@ -61,6 +69,7 @@ message ReadLogResponse {
 
 // ListStreamsRequest lists known stream ids, optionally filtered by prefix.
 message ListStreamsRequest {
+  // prefix allows discovery of related streams such as task:, wf:, actor:, or llm:.
   string prefix = 1;
 }
 
@@ -75,6 +84,7 @@ message ListStreamsResponse {
 // immediate physical deletion.
 message TrimStreamRequest {
   string stream_id = 1;
+  // before_seq is exclusive: that sequence and later records remain logically retained.
   uint64 before_seq = 2;
 }
 
@@ -83,13 +93,16 @@ message TrimStreamResponse {
   string stream_id = 1;
   uint64 trimmed_before_seq = 2;
   uint64 compactable_records = 3;
+  // compactable_bytes is advisory and may lag physical cleanup.
   uint64 compactable_bytes = 4;
 }
 
 // StreamStats summarizes sequence and compaction state for one stream.
 message StreamStats {
   string stream_id = 1;
+  // first_seq is the earliest logically readable sequence after trimming.
   uint64 first_seq = 2;
+  // next_seq is the sequence number assigned to the next fresh append.
   uint64 next_seq = 3;
   uint64 trimmed_before_seq = 4;
   uint64 compactable_records = 5;
@@ -102,6 +115,7 @@ message StreamStats {
 // is empty; callers should not rely on both filters being combined.
 message GetStreamStatsRequest {
   string stream_id = 1;
+  // prefix is ignored when stream_id selects one exact stream.
   string prefix = 2;
 }
 
@@ -113,6 +127,7 @@ message GetStreamStatsResponse {
 // LogService exposes the append-only event log used by control-plane replay,
 // worker state changes, audit streams, and maintenance tooling.
 service LogService {
+  // Mutating RPCs are append/trim only; reads never change log contents.
   // AppendLog persists one event and returns its assigned sequence metadata.
   rpc AppendLog(AppendLogRequest) returns (AppendLogResponse);
 

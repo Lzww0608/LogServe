@@ -19,9 +19,12 @@ import (
 // FunctionCache resolves Python function source by content hash for worker execution.
 // It keeps a small in-memory cache and optionally fetches missing source from the configured object store.
 type FunctionCache struct {
-	mu      sync.RWMutex
+	// mu protects entries while allowing concurrent source cache hits.
+	mu sync.RWMutex
+	// entries stores only source that has matched its declared content hash.
 	entries map[string]string
-	store   objectstore.Store
+	// store is optional; nil means tasks must carry inline source or hit entries.
+	store objectstore.Store
 }
 
 // newFunctionCache creates an empty function source cache backed by the provided object store.
@@ -40,6 +43,7 @@ func (c *FunctionCache) SourceForTask(ctx context.Context, task *logservepb.Task
 	}
 	hash := task.GetFunctionHash()
 	inline := task.GetFunctionSource()
+	// Legacy or ad hoc tasks without hashes can only use inline source; there is no cache key to validate.
 	if hash == "" {
 		return inline, nil
 	}

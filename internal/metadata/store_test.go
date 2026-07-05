@@ -80,6 +80,8 @@ func TestCompleteTaskRejectsQueuedExpiredLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Sleep through a tiny lease window instead of reaching into store internals so
+	// this compatibility test stays valid for both legacy and V2 implementations.
 	time.Sleep(time.Millisecond)
 	store.RequeueExpiredRunningTasks(time.Nanosecond)
 

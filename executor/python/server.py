@@ -30,6 +30,7 @@ _MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 # Identity decorator preserves submitted SDK annotations without local registration side effects.
 def _identity_decorator(fn=None, **_kwargs):
+    # Support both @logserve.task and @logserve.task(...) without changing the wrapped callable.
     if fn is None:
         return lambda actual: actual
     return fn
@@ -42,6 +43,8 @@ def _identity_decorator(fn=None, **_kwargs):
 # real control-plane calls, so helpers are inert and decorators are identity
 # wrappers.
 class _LogServeModule:
+    # staticmethod avoids binding a fake module instance as self when user code
+    # calls logserve.task or logserve.llm_generate from class/function bodies.
     task = staticmethod(_identity_decorator)
     workflow = staticmethod(_identity_decorator)
     actor = staticmethod(_identity_decorator)
@@ -60,6 +63,7 @@ class _LogServeModule:
 
 # Install the fake SDK module into sys.modules before executing user code.
 def _install_fake_logserve():
+    # Use a real module object so import logserve and from logserve import task follow normal import semantics.
     fake_logserve = types.ModuleType("logserve")
     fake_logserve.task = _identity_decorator
     fake_logserve.workflow = _identity_decorator
@@ -75,6 +79,8 @@ def _install_fake_logserve():
     fake_logserve.submit_llm = lambda *args, **kwargs: None
     fake_logserve.llm_generate = lambda *args, **kwargs: None
     fake_logserve.replay_llm = lambda *args, **kwargs: None
+    # Overwrite any previously imported real SDK module so submitted code always
+    # sees the inert executor-local surface for this request.
     sys.modules["logserve"] = fake_logserve
 
 
@@ -127,6 +133,7 @@ _FORBIDDEN_NAMES = {
 def _limited_import(name, globals=None, locals=None, fromlist=(), level=0):
     if level != 0 or name not in _ALLOWED_IMPORTS:
         raise ImportError(f"imports are disabled in the LogServe executor: {name}")
+    # Request handlers install the fake module before executing user source; a missing entry is a request-ordering bug.
     if name == "logserve":
         return sys.modules[name]
     return _SAFE_IMPORT_MODULES[name]
@@ -151,6 +158,7 @@ def _safe_open(path, mode="r", *args, **kwargs):
     # commonpath prevents prefix tricks such as C:\TempX matching C:\Temp.
     if not any(os.path.commonpath([root, target]) == root for root in _ALLOWED_FILE_ROOTS):
         raise PermissionError("executor open is restricted to the system temp directory")
+    # Delegate only after path normalization so user code cannot smuggle a non-temp path through relative components.
     return builtins.open(target, mode, *args, **kwargs)
 
 # Process-local compiled-code cache keyed by SDK source hashes.
@@ -193,6 +201,8 @@ _SAFE_BUILTINS = {
 
 # Parse, validate, and compile submitted Python source under a synthetic filename.
 def _compile_user_source(source, filename):
+    # Parse first so validation works on structured syntax rather than brittle
+    # string checks, then compile the already-validated tree.
     tree = ast.parse(source, filename=filename, mode="exec")
     _validate_user_ast(tree)
     return compile(tree, filename, "exec")
@@ -209,11 +219,14 @@ def _validate_user_ast(tree):
                 if alias.name not in _ALLOWED_IMPORTS:
                     raise ValueError(f"import is not allowed in executor source: {alias.name}")
         elif isinstance(node, ast.ImportFrom):
+            # from-import is allowed only for the same top-level safe modules;
+            # relative imports would reach files outside the submitted source.
             if node.level != 0 or node.module not in _ALLOWED_IMPORTS:
                 raise ValueError(f"import is not allowed in executor source: {node.module or ''}")
         elif isinstance(node, ast.Name):
             if node.id in _FORBIDDEN_NAMES:
                 raise ValueError(f"name is not allowed in executor source: {node.id}")
+        # Dunder attributes can reach Python internals even when getattr/type are unavailable.
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("__"):
                 raise ValueError(f"dunder attribute access is not allowed in executor source: {node.attr}")
@@ -229,6 +242,8 @@ def _sandbox_namespace(name):
         "task": _identity_decorator,
         "workflow": _identity_decorator,
         "actor": _identity_decorator,
+        # Provide logserve as a global as well as an importable fake module so
+        # snippets copied from SDK examples work with or without import logserve.
         "logserve": _LogServeModule,
     }
 
@@ -238,6 +253,7 @@ def handle_request(request):
         if request.get("mode") == "actor":
             return handle_actor(request)
         return handle_task(request)
+    # Send tracebacks over the executor protocol so the Go worker can complete the task as failed.
     except Exception:
         return {"ok": False, "error": traceback.format_exc()}
 
@@ -251,6 +267,8 @@ def handle_task(request):
     args = args_payload.get("args", [])
     kwargs = args_payload.get("kwargs", {})
 
+    # function_name is intentionally required: the worker decides the entrypoint,
+    # while this process only resolves it after source validation and execution.
     # Reinstall per request so tests or previous user code cannot leave a mutated
     # logserve module behind for the next execution.
     _install_fake_logserve()
@@ -272,6 +290,7 @@ def _code_for_task_source(source, function_hash):
             return cached
         if not source:
             raise ValueError(f"function source for {function_hash} is not cached")
+        # Recheck inside the subprocess so a direct executor caller cannot poison the code cache.
         computed = _source_hash(source)
         if computed != function_hash:
             raise ValueError(f"function hash mismatch: expected {function_hash}, got {computed}")
@@ -308,8 +327,11 @@ def handle_actor(request):
 
     _install_fake_logserve()
     namespace = _sandbox_namespace("logserve_actor")
+    # Actor class code is compiled on every call because actor state is the only
+    # persisted Python data; class source remains part of the task request.
     exec(_compile_user_source(class_source, "<logserve-actor>"), namespace, namespace)
     cls = namespace[class_name]
+    # Only a truthy persisted state is rehydrated; empty state follows the first-materialization path.
     if state:
         # Rehydrate from persisted __dict__ without calling __init__; init args
         # are only for first materialization when no prior actor state exists.
@@ -331,6 +353,7 @@ def _payload(raw):
         return json.loads(bytes(raw).decode("utf-8")) if raw else {}
     if isinstance(raw, str):
         return json.loads(raw) if raw else {}
+    # JSON line mode can already provide decoded dict/list values, so leave them untouched.
     return raw
 
 # Encode a value as compact UTF-8 JSON bytes for the Go worker response fields.
@@ -354,6 +377,8 @@ def _response_for_msgpack(response):
 
 # Read exactly size bytes from a binary stream or fail on a short frame.
 def _read_exact(stream, size):
+    # Pipes can close mid-frame; treat short reads as protocol errors so the Go
+    # worker can restart the subprocess instead of decoding partial msgpack.
     data = stream.read(size)
     if len(data) != size:
         raise EOFError("unexpected EOF while reading executor frame")
@@ -386,6 +411,8 @@ def _write_frame(stream, payload):
 # Serve the long-lived msgpack protocol used by the default Go worker path.
 def _loop_msgpack():
     if msgpack is None:
+        # Diagnostics must go to stderr because stdout is reserved for binary
+        # length-prefixed frames in this protocol.
         print("msgpack is required for --loop-msgpack", file=sys.stderr, flush=True)
         return 2
     stdin = sys.stdin.buffer

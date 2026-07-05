@@ -55,15 +55,26 @@ type Worker struct {
 // MemoryStore is a single-lock in-memory Store implementation. It favors simple
 // correctness and defensive cloning over concurrency throughput.
 type MemoryStore struct {
-	mu                sync.RWMutex
-	tasks             map[string]Task
-	taskByIdemKey     map[string]string
-	workers           map[string]Worker
+	// mu protects every map below; the legacy store deliberately keeps one lock so
+	// behavior is easy to compare with the sharded V2 implementation.
+	mu sync.RWMutex
+	// tasks holds cloned task values keyed by task ID; byte slices are cloned at
+	// read/write boundaries to avoid caller aliasing.
+	tasks map[string]Task
+	// taskByIdemKey maps non-empty idempotency keys to their first accepted task.
+	taskByIdemKey map[string]string
+	// workers stores cloned scheduler-visible worker snapshots.
+	workers map[string]Worker
+	// workflows and workflowByIdemKey mirror the workflow runtime state and its
+	// idempotency index.
 	workflows         map[string]workflow.State
 	workflowByIdemKey map[string]string
-	actors            map[string]actor.State
-	actorByIdemKey    map[string]string
-	models            map[string]*logservepb.ModelInfo
+	// actors and actorByIdemKey mirror actor lifecycle state and idempotent create
+	// requests.
+	actors         map[string]actor.State
+	actorByIdemKey map[string]string
+	// models stores cloned protobuf model metadata by normalized model key.
+	models map[string]*logservepb.ModelInfo
 }
 
 // NewLegacyMemoryStore constructs the original single-lock memory store used as a
@@ -89,6 +100,8 @@ func (s *MemoryStore) CreateTask(task Task, idempotencyKey string) (Task, bool) 
 
 	if idempotencyKey != "" {
 		if taskID, ok := s.taskByIdemKey[idempotencyKey]; ok {
+			// Duplicate creates return the original accepted task instead of comparing
+			// request bodies; fingerprint validation happens before this store layer.
 			return s.tasks[taskID], true
 		}
 	}
@@ -196,6 +209,8 @@ func (s *MemoryStore) RequeueExpiredRunningTasks(maxAge time.Duration) []Task {
 		return nil
 	}
 	now := time.Now().UnixMilli()
+	// UpdatedAtMs is the lease timestamp for RUNNING tasks, so maxAge is compared
+	// against that field rather than CreatedAtMs.
 	cutoffMs := maxAge.Milliseconds()
 	requeued := make([]Task, 0)
 	for id, task := range s.tasks {
@@ -231,6 +246,8 @@ func (s *MemoryStore) RequeueTaskIfLeaseExpired(taskID string, leaseEpoch uint64
 		return Task{}, false
 	}
 	if task.Status != logservepb.TaskStatus_TASK_STATUS_RUNNING || task.TaskLeaseEpoch != leaseEpoch {
+		// Epoch mismatch means another worker or recovery pass has already moved the
+		// task, so the caller receives the current snapshot but no state change.
 		return cloneTask(task), false
 	}
 	now := time.Now().UnixMilli()
@@ -271,6 +288,8 @@ func (s *MemoryStore) CompleteTask(taskID, workerID string, leaseEpoch uint64, s
 	}
 	task.Status = status
 	task.WorkerID = workerID
+	// Copy result bytes before storing them so caller buffers cannot mutate the
+	// terminal result after completion returns.
 	task.ResultJSON = append([]byte(nil), resultJSON...)
 	task.Error = taskErr
 	task.UpdatedAtMs = time.Now().UnixMilli()
@@ -406,6 +425,8 @@ func (s *MemoryStore) UpsertWorker(worker Worker) {
 		worker.Capacity = 1
 	}
 	if existing, ok := s.workers[worker.WorkerID]; ok {
+		// UpsertWorker is used by bootstrap and heartbeats; preserve scheduler-owned
+		// load so metadata refreshes do not erase in-flight task accounting.
 		worker.RunningTasks = existing.RunningTasks
 	}
 	if worker.LastHeartbeat == 0 {
@@ -463,6 +484,8 @@ func (s *MemoryStore) Heartbeat(workerID string, cachedModels map[string]bool) (
 		worker = Worker{WorkerID: workerID, Labels: map[string]string{}, CachedModels: map[string]bool{}, Capacity: 1}
 	}
 	if cachedModels != nil {
+		// nil means "leave the previous cache alone"; a non-nil empty map explicitly
+		// clears the worker's model cache.
 		worker.CachedModels = cloneModelCache(cachedModels)
 	}
 	if worker.Capacity == 0 {

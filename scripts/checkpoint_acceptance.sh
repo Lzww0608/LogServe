@@ -16,6 +16,7 @@ mkdir -p "$RESULT_DIR"
 : > "$STATUS_FILE"
 cd "$ROOT" || exit 1
 
+# Escape shell strings for JSONL status output without depending on jq.
 json_escape() {
   "$PYTHON_RUN" - "$1" <<'PY'
 import json
@@ -24,6 +25,7 @@ print(json.dumps(sys.argv[1])[1:-1])
 PY
 }
 
+# Append one command result to the JSONL status file and update the aggregate failure flag.
 record_status() {
   local name="$1"
   local code="$2"
@@ -39,6 +41,7 @@ record_status() {
   fi
 }
 
+# Run one acceptance step, capture its log, and continue so the final summary has every attempted gate.
 run_step() {
   local name="$1"
   local log="$2"

@@ -1,4 +1,5 @@
 <!doctype html>
+<!-- Static dashboard for locally viewing a LogServe snapshot.json export. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -130,24 +131,39 @@
     </section>
   </main>
   <script>
+    // statusClass maps protobuf-style status strings onto compact badge colors.
+    // Unknown or in-progress statuses intentionally use the warning style.
     const statusClass = (value) => {
       if (String(value).includes("SUCCEEDED") || String(value).includes("COMPLETED") || String(value).includes("ACTIVE")) return "ok";
       if (String(value).includes("FAILED")) return "bad";
       return "warn";
     };
 
+    // pick tolerates both camelCase protobuf JSON and snake_case snapshots so the
+    // same page can read outputs produced by different serializers.
     const pick = (obj, camel, snake) => obj?.[camel] ?? obj?.[snake];
+    // cell normalizes missing optional fields to a visible placeholder instead of
+    // leaving table cells blank or rendering JavaScript null/undefined strings.
     const cell = (value) => value === undefined || value === null || value === "" ? "-" : value;
 
+    // table renders small local snapshot tables. Values are inserted as HTML, so
+    // this page should be used with LogServe-generated snapshot files, not
+    // arbitrary untrusted JSON.
     const table = (columns, rows) => {
       const head = `<tr>${columns.map((c) => `<th>${c.label}</th>`).join("")}</tr>`;
       const body = rows.map((row) => `<tr>${columns.map((c) => `<td>${c.render ? c.render(row) : cell(row[c.key])}</td>`).join("")}</tr>`).join("");
       return `<table>${head}${body}</table>`;
     };
 
+    // status keeps badge markup centralized so workflow, task, and actor tables
+    // classify statuses consistently.
     const status = (value) => `<span class="status ${statusClass(value)}">${cell(value)}</span>`;
 
+    // render materializes the entire snapshot into static DOM sections. It does
+    // not retain client-side state; each load reflects the fetched snapshot only.
     const render = (data) => {
+      // Metadata materializer fields are optional because older snapshots do not
+      // include eventual-consistency diagnostics.
       const materializer = pick(data, "metadataMaterializer", "metadata_materializer") || {};
       const materializerMode = pick(materializer, "mode", "mode");
       const metricRows = [
@@ -168,13 +184,21 @@
           ["Metadata Flush Errors", pick(materializer, "flushErrorCount", "flush_error_count") || 0],
         );
       }
+      // Metric rows are generated from a flat list so optional metadata metrics can
+      // be appended without duplicating card markup.
       document.getElementById("metrics").innerHTML = metricRows.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
 
+      // Workflow DAG rendering is intentionally linear: integration snapshots use
+      // ordered steps, while dependency detail stays in the JSON payload.
       document.getElementById("workflows").innerHTML = (data.workflows || []).map((wf) => {
+        // Each step callback emits one node and inserts arrows only between nodes,
+        // avoiding a leading arrow for the first step.
         const nodes = (wf.steps || []).map((step, i) => `${i ? '<span class="arrow">-></span>' : ''}<span class="node">${pick(step, "stepId", "step_id")}<br>${status(step.status)}</span>`).join("");
         return `<p><code>${pick(wf, "workflowId", "workflow_id")}</code> ${status(wf.status)}</p><div class="dag">${nodes}</div>`;
       }).join("") || "No workflows";
 
+      // Table column renderers hide protobuf field-name differences behind pick so
+      // dashboard snapshots can be compared across Go and JSON conventions.
       document.getElementById("tasks").innerHTML = table([
         { label: "Task", render: (r) => pick(r, "taskId", "task_id") },
         { label: "Name", render: (r) => pick(r, "taskName", "task_name") },
@@ -185,6 +209,8 @@
         { label: "Model", render: (r) => [pick(r, "llmModelName", "llm_model_name"), pick(r, "llmModelVersion", "llm_model_version")].filter(Boolean).join(":") || "-" },
       ], data.tasks || []);
 
+      // Actor rows expose both ownership and snapshot progress because recovery
+      // tests depend on those fields moving independently.
       document.getElementById("actors").innerHTML = table([
         { label: "Actor", render: (r) => pick(r, "actorId", "actor_id") },
         { label: "Class", render: (r) => pick(r, "className", "class_name") },
@@ -195,6 +221,8 @@
         { label: "Snapshot", render: (r) => pick(r, "snapshotCommandCount", "snapshot_command_count") },
       ], data.actors || []);
 
+      // Worker rows flatten cached model entries into name:version labels for quick
+      // scheduler-locality inspection.
       document.getElementById("workers").innerHTML = table([
         { label: "Worker", render: (r) => pick(r, "workerId", "worker_id") },
         { label: "Capacity", key: "capacity" },
@@ -204,9 +232,16 @@
       ], data.workers || []);
     };
 
+    // Disable browser caching so refreshing the static page picks up a newly
+    // exported snapshot.json from disk or a simple static server.
     fetch("snapshot.json", { cache: "no-store" })
+      // The first promise callback performs only JSON decoding; rendering is kept
+      // in render so the snapshot-to-DOM mapping is testable by inspection.
       .then((response) => response.json())
+      // render is passed directly because it already accepts the decoded snapshot.
       .then(render)
+      // Replace the main content on load failure so missing snapshot.json is visible
+      // even when the rest of the static shell loaded correctly.
       .catch((error) => {
         document.querySelector("main").innerHTML = `<section>Unable to load snapshot.json: ${error.message}</section>`;
       });

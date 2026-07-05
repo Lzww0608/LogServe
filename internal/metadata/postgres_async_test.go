@@ -55,6 +55,8 @@ var recordingPostgresRecorders sync.Map
 // test or benchmark and cleans the registry on completion.
 func openRecordingPostgresDB(t testing.TB) (*sql.DB, *recordingPostgresRecorder) {
 	t.Helper()
+	// Include the test name and a timestamp so parallel tests do not share a
+	// recorder through database/sql's driver registry.
 	dsn := t.Name() + ":" + time.Now().Format("150405.000000000")
 	recorder := &recordingPostgresRecorder{}
 	recordingPostgresRecorders.Store(dsn, recorder)
@@ -152,7 +154,8 @@ func TestPostgresStoreAsyncMaterializerCoalescesHeartbeats(t *testing.T) {
 		Mode:          PostgresWriteModeAsync,
 		BatchMax:      64,
 		FlushInterval: time.Hour,
-		QueueSize:     1,
+		// QueueSize 1 forces overflow/coalescing behavior after the first heartbeat.
+		QueueSize: 1,
 	})
 	defer store.Close()
 
@@ -191,6 +194,8 @@ func TestPostgresStoreAsyncFlushErrorDoesNotBlockPrimaryPath(t *testing.T) {
 		FlushInterval: time.Hour,
 	})
 	defer store.Close()
+	// Inject the failure before mutating so the test proves async foreground calls
+	// do not wait for durable writes.
 	recorder.fail(errors.New("postgres down"))
 
 	created, duplicate := store.CreateTask(Task{
@@ -263,6 +268,8 @@ func TestMaterializerFlushAllDrainsMultipleBatches(t *testing.T) {
 		batches = append(batches, batch)
 		return nil
 	}, nil)
+	// Populate the goroutine-owned pending map directly to isolate flushAllPending
+	// from queue draining and timer behavior.
 	pending := make(map[string]metadataDelta)
 	for i := 0; i < 5; i++ {
 		mergeDelta(pending, metadataDelta{

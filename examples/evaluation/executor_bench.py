@@ -1,3 +1,5 @@
+# Direct Python executor microbenchmark used to compare repeated source payloads
+# against function-hash based compile-cache reuse.
 import hashlib
 import importlib.util
 import json
@@ -7,6 +9,8 @@ import time
 from pathlib import Path
 
 
+# load_executor imports the local executor module directly so the benchmark can
+# isolate Python execution overhead without starting LogServe daemons.
 def load_executor():
     path = Path(__file__).resolve().parents[2] / "executor" / "python" / "server.py"
     spec = importlib.util.spec_from_file_location("logserve_python_executor_bench", path)
@@ -15,12 +19,16 @@ def load_executor():
     return module
 
 
+# module_source creates deterministic padded source so payload size and function
+# hash remain stable across benchmark cases.
 def module_source(padding_lines):
     return "".join(
         f"# padding {i:04d}\n" for i in range(padding_lines)
     ) + "def bench_echo(value):\n    return value\n"
 
 
+# run_case builds executor requests either with repeated source payloads or with
+# a hash-only hot path after the first request.
 def run_case(executor, source, function_hash, count, compile_cache):
     requests = []
     for i in range(count):
@@ -33,6 +41,8 @@ def run_case(executor, source, function_hash, count, compile_cache):
             req["function_source"] = source
         requests.append(req)
     if not compile_cache:
+        # This benchmark deliberately reaches into the executor's private cache
+        # to force a cold-source baseline for comparison.
         executor._FUNCTION_CODE_CACHE.clear()
     start = time.perf_counter()
     for req in requests:
@@ -43,6 +53,8 @@ def run_case(executor, source, function_hash, count, compile_cache):
     return elapsed_ms
 
 
+# main runs cold and warm compile-cache cases for each requested count and emits
+# a JSON report consumed by benchmark summaries.
 def main():
     executor = load_executor()
     padding = int(os.getenv("LOGSERVE_EXECUTOR_PADDING_LINES", "200"))

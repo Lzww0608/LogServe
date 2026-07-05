@@ -1,6 +1,8 @@
 package actorlock
 
-// This file tests actor lock table eviction and actor-ID-level serialization.
+// This file tests actor lock table eviction, independent actor progress, and
+// actor-ID-level serialization under contention.
+
 import (
 	"fmt"
 	"runtime"
@@ -43,6 +45,8 @@ func TestTableConcurrentActorsIndependent(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			// Unique actor IDs exercise the table-level coordination path without
+			// contending on the same per-actor mutex.
 			actorID := fmt.Sprintf("actor-%d", id)
 			unlock := table.Lock(actorID)
 			unlock()
@@ -63,6 +67,8 @@ func TestTableSerializesConcurrentSameActor(t *testing.T) {
 
 	start := make(chan struct{})
 	var wg sync.WaitGroup
+	// Atomic counters detect accidental overlap without adding a test mutex that
+	// would serialize the critical section being validated.
 	var inCritical atomic.Int32
 	var violations atomic.Int32
 
@@ -86,6 +92,8 @@ func TestTableSerializesConcurrentSameActor(t *testing.T) {
 		}()
 	}
 
+	// Starting workers together increases same-actor contention and validates that
+	// refs protects waiters while the entry is still locked.
 	close(start)
 	wg.Wait()
 	if got := violations.Load(); got != 0 {

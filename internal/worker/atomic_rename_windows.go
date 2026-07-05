@@ -21,6 +21,8 @@ var moveFileExW = syscall.NewLazyDLL("kernel32.dll").NewProc("MoveFileExW")
 
 // replaceFileWithRename replaces targetPath with tmpPath using MoveFileExW because os.Rename cannot overwrite reliably on Windows.
 func replaceFileWithRename(tmpPath, targetPath string) error {
+	// Win32 file APIs expect nul-terminated UTF-16 paths; conversion errors are
+	// returned before calling MoveFileExW so invalid Go strings are not truncated.
 	from, err := syscall.UTF16PtrFromString(tmpPath)
 	if err != nil {
 		return err
@@ -29,6 +31,8 @@ func replaceFileWithRename(tmpPath, targetPath string) error {
 	if err != nil {
 		return err
 	}
+	// MOVEFILE_REPLACE_EXISTING gives os.Rename-like overwrite semantics, while
+	// MOVEFILE_WRITE_THROUGH asks Windows to flush the metadata update before returning.
 	r1, _, callErr := moveFileExW.Call(
 		uintptr(unsafe.Pointer(from)),
 		uintptr(unsafe.Pointer(to)),

@@ -8,6 +8,7 @@ import type { ConsoleSession } from "./types/logserve";
 import { navigate } from "./utils/navigation";
 import { errorMessage } from "./utils/status";
 
+// BrowserLocation separates route matching from the key that should remount query-sensitive pages.
 type BrowserLocation = {
   path: string;
   fullPath: string;
@@ -62,6 +63,7 @@ export function App() {
 
   useEffect(() => {
     void refreshSession();
+    // setStoredToken dispatches this event so settings changes refresh permissions without a reload.
     window.addEventListener("logserve:token-change", refreshSession);
     return () => window.removeEventListener("logserve:token-change", refreshSession);
   }, [refreshSession]);

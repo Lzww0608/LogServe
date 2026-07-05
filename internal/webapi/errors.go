@@ -43,6 +43,8 @@ func writeErr(w http.ResponseWriter, err error) {
 	httpStatus := http.StatusInternalServerError
 	message := err.Error()
 	if st, ok := status.FromError(err); ok {
+		// Preserve gRPC status text as the API code so frontend error handling can
+		// distinguish backend failures from local validation failures.
 		code = st.Code().String()
 		message = st.Message()
 		switch st.Code() {
@@ -60,6 +62,8 @@ func writeErr(w http.ResponseWriter, err error) {
 			httpStatus = http.StatusInternalServerError
 		}
 	} else {
+		// Local validation helpers wrap errInvalidInput, but some older paths still
+		// produce plain errors; the string checks keep those responses user-friendly.
 		lower := strings.ToLower(message)
 		switch {
 		case errors.Is(err, errInvalidInput), strings.Contains(lower, "required"), strings.Contains(lower, "invalid"):

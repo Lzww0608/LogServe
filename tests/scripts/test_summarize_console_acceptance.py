@@ -1,3 +1,4 @@
+# Tests console acceptance summary aggregation across local, Docker, and probe evidence.
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts" / "summarize_console_acceptance.py"
 
 
+# load_module imports the console summarizer from the checkout under test.
 def load_module():
     spec = importlib.util.spec_from_file_location("summarize_console_acceptance", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -18,11 +20,13 @@ def load_module():
     return module
 
 
+# write_status appends one wrapper command result to command_status.jsonl.
 def write_status(root, name, exit_code):
     with (root / "command_status.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"name": name, "exit_code": exit_code, "duration_sec": 1, "log": f"{name}.log"}) + "\n")
 
 
+# write_config creates the run_config.json switches that decide Docker and npm expectations.
 def write_config(root, run_docker=True, run_npm_ci=True):
     (root / "run_config.json").write_text(
         json.dumps({"run_docker": run_docker, "run_npm_ci": run_npm_ci, "base_url": "http://127.0.0.1:8080"}),
@@ -30,11 +34,13 @@ def write_config(root, run_docker=True, run_npm_ci=True):
     )
 
 
+# write_local_statuses records successful local Go/web/Python gates.
 def write_local_statuses(root):
     for name in ("go_test_web", "go_vet_web", "web_npm_ci", "web_build", "python_script_tests", "package_results"):
         write_status(root, name, 0)
 
 
+# write_docker_statuses records the Compose and HTTP probe gates for full acceptance.
 def write_docker_statuses(root):
     for name in (
         "docker_compose_config",
@@ -48,6 +54,7 @@ def write_docker_statuses(root):
         write_status(root, name, 0)
 
 
+# write_probe emits the console_http_probe.json fixture with the full probe-check matrix by default.
 def write_probe(root, verdict="PASS", checks=None):
     if checks is None:
         checks = {
@@ -90,7 +97,9 @@ def write_probe(root, verdict="PASS", checks=None):
     (root / "console_http_probe.json").write_text(json.dumps({"verdict": verdict, "checks": checks}), encoding="utf-8")
 
 
+# ConsoleAcceptanceSummaryTest verifies how local, Docker, and probe evidence combine into the final summary.
 class ConsoleAcceptanceSummaryTest(unittest.TestCase):
+    # test_writes_pass_summary_for_full_console_acceptance covers the complete Docker-backed happy path.
     def test_writes_pass_summary_for_full_console_acceptance(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -114,6 +123,7 @@ class ConsoleAcceptanceSummaryTest(unittest.TestCase):
             self.assertIn("feature_6_workflow_dag", markdown)
             self.assertIn("HTTP Probe", markdown)
 
+    # test_docker_disabled_skips_probe_checks preserves the rule that skipped Docker evidence is incomplete feature evidence.
     def test_docker_disabled_skips_probe_checks(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -129,6 +139,7 @@ class ConsoleAcceptanceSummaryTest(unittest.TestCase):
             self.assertNotIn("console_http_probe", summary["checks"])
             self.assertNotIn("probe_dashboard_with_auth", summary["checks"])
 
+    # test_failed_probe_check_marks_summary_failed ensures individual probe failures become failed summary checks.
     def test_failed_probe_check_marks_summary_failed(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:

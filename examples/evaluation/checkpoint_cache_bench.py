@@ -1,3 +1,5 @@
+# Lightweight checkpoint-cache benchmark for multiple model ids. It reports
+# cold/warm replay timings without enforcing pass/fail validation rules.
 import json
 import os
 import sys
@@ -6,6 +8,8 @@ import time
 from logserve import register_model, replay_llm, submit_llm
 
 
+# snapshot keeps only timing fields needed for the benchmark summary and accepts
+# both snake_case and camelCase replay shapes.
 def snapshot(replay):
     return {
         "cache_hit": bool(replay.get("cache_hit") or replay.get("cacheHit")),
@@ -15,6 +19,8 @@ def snapshot(replay):
     }
 
 
+# probe_model registers one mock checkpoint model and compares first-use versus
+# repeated-use replay metadata for that model id.
 def probe_model(model, version):
     register_model(model, version=version, size_bytes=0, path=f"checkpoint://{model}", adapter="mock")
     cold_task = submit_llm(model, "cold", version=version, adapter="mock")
@@ -25,6 +31,8 @@ def probe_model(model, version):
     }
 
 
+# main reads the model list from the environment so scripts can scale the cache
+# benchmark without editing this example file.
 def main():
     models = [x.strip() for x in os.getenv("LOGSERVE_CHECKPOINT_MODELS", "model-D,model-E").split(",") if x.strip()]
     version = os.getenv("LOGSERVE_CHECKPOINT_VERSION", "v1")

@@ -1,5 +1,8 @@
 package integration
 
+// This file covers workflow execution against real logd/control services and a
+// Python-backed worker, including replay, deduplication, retries, and recovery.
+
 import (
 	"context"
 	"encoding/json"
@@ -16,6 +19,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// workflowTestEnv owns the per-test log/control servers, gRPC clients, and repo
+// root needed by integration tests that run real workers.
 type workflowTestEnv struct {
 	root          string
 	logServer     *logd.Server
@@ -26,6 +31,9 @@ type workflowTestEnv struct {
 	logConn       *grpc.ClientConn
 }
 
+// TestWorkflowSimpleRAGReplayAndDedup verifies a three-step workflow, checks
+// replay consistency, and confirms duplicate completion cannot append a second
+// WorkflowCompleted event.
 func TestWorkflowSimpleRAGReplayAndDedup(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -57,6 +65,8 @@ func TestWorkflowSimpleRAGReplayAndDedup(t *testing.T) {
 		t.Fatal("replayed workflow state is not consistent with metadata")
 	}
 
+	// Re-submit the final completion after the workflow is already terminal; the
+	// log should remain idempotent and contain exactly one terminal event.
 	finalStep := status.GetSteps()[len(status.GetSteps())-1]
 	if _, err := env.controlClient.CompleteTask(context.Background(), &logservepb.CompleteTaskRequest{
 		TaskId:     finalStep.GetTaskId(),
@@ -79,6 +89,9 @@ func TestWorkflowSimpleRAGReplayAndDedup(t *testing.T) {
 	}
 }
 
+// TestWorkflowWorkerRecoveryContinuesAfterCompletedStep stops a worker after one
+// task and verifies a replacement worker resumes from persisted step state
+// without re-running the completed dependency.
 func TestWorkflowWorkerRecoveryContinuesAfterCompletedStep(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -86,6 +99,8 @@ func TestWorkflowWorkerRecoveryContinuesAfterCompletedStep(t *testing.T) {
 	firstCtx, firstCancel := context.WithCancel(context.Background())
 	defer firstCancel()
 	done := make(chan struct{})
+	// Limit the first worker to one task to simulate a worker exiting after the
+	// initial step has committed but before the workflow is complete.
 	go func() {
 		runWorkerForTest(firstCtx, t, env, "first-worker", 1)
 		close(done)
@@ -113,6 +128,9 @@ func TestWorkflowWorkerRecoveryContinuesAfterCompletedStep(t *testing.T) {
 	}
 }
 
+// TestWorkflowRetriesFailedStep uses a deterministic first-attempt failure to
+// prove the workflow retry path records two attempts and still produces the
+// downstream result.
 func TestWorkflowRetriesFailedStep(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -121,6 +139,8 @@ func TestWorkflowRetriesFailedStep(t *testing.T) {
 	defer cancel()
 	go runWorkerForTest(ctx, t, env, "retry-worker", 0)
 
+	// The marker file makes the embedded Python function fail exactly once while
+	// keeping the retry behavior independent of timing.
 	marker := filepath.Join(t.TempDir(), "flaky-marker")
 	submitted := submitWorkflowForTest(t, env.controlClient, retryDefinition(t, marker))
 	status := waitWorkflow(t, env.controlClient, submitted.GetWorkflowId(), logservepb.WorkflowStatus_WORKFLOW_STATUS_COMPLETED)
@@ -134,6 +154,8 @@ func TestWorkflowRetriesFailedStep(t *testing.T) {
 	}
 }
 
+// TestWorkflowRetriesTimedOutStep verifies that repeated task timeouts exhaust
+// the configured attempts and move both the step and workflow to FAILED.
 func TestWorkflowRetriesTimedOutStep(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -156,6 +178,8 @@ func TestWorkflowRetriesTimedOutStep(t *testing.T) {
 	}
 }
 
+// startWorkflowEnv starts isolated logd and control-plane servers on ephemeral
+// ports and returns clients wired to those instances.
 func startWorkflowEnv(t *testing.T) *workflowTestEnv {
 	t.Helper()
 	root := repoRoot(t)
@@ -187,6 +211,8 @@ func startWorkflowEnv(t *testing.T) *workflowTestEnv {
 	}
 }
 
+// stop tears down clients and servers best-effort so deferred cleanup does not
+// hide the original test failure.
 func (e *workflowTestEnv) stop() {
 	_ = e.controlConn.Close()
 	_ = e.logConn.Close()
@@ -194,6 +220,8 @@ func (e *workflowTestEnv) stop() {
 	_ = e.logServer.Stop()
 }
 
+// restartControl replaces only the control plane while keeping logd alive, which
+// lets tests verify metadata bootstrap from the durable log.
 func (e *workflowTestEnv) restartControl(t *testing.T) {
 	t.Helper()
 	_ = e.controlConn.Close()
@@ -213,6 +241,9 @@ func (e *workflowTestEnv) restartControl(t *testing.T) {
 	e.controlClient = logservepb.NewControlServiceClient(controlConn)
 }
 
+// runWorkerForTest starts the real worker loop against the test servers. maxTasks
+// can bound worker lifetime for recovery tests; zero leaves it running until ctx
+// is canceled.
 func runWorkerForTest(ctx context.Context, t *testing.T, env *workflowTestEnv, workerID string, maxTasks int) {
 	t.Helper()
 	ensureExecutorDeps(t)
@@ -230,12 +261,16 @@ func runWorkerForTest(ctx context.Context, t *testing.T, env *workflowTestEnv, w
 	}
 }
 
+// waitForWorkerRegistered polls the dashboard until the worker appears, reporting
+// the last observed worker list to make registration failures actionable.
 func waitForWorkerRegistered(t *testing.T, client logservepb.ControlServiceClient, workerID string) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	lastWorkers := []string{}
 	var lastErr error
 	for time.Now().Before(deadline) {
+		// Each dashboard RPC has its own short timeout so a transient control-plane
+		// stall does not consume the whole registration deadline.
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		snapshot, err := client.GetDashboardSnapshot(ctx, &logservepb.GetDashboardSnapshotRequest{})
 		cancel()
@@ -256,6 +291,8 @@ func waitForWorkerRegistered(t *testing.T, client logservepb.ControlServiceClien
 	t.Fatalf("worker %s did not register; last workers=%v last error=%v", workerID, lastWorkers, lastErr)
 }
 
+// submitWorkflowForTest marshals a map-based workflow definition and submits it
+// with a unique idempotency key so separate tests do not collide.
 func submitWorkflowForTest(t *testing.T, client logservepb.ControlServiceClient, def map[string]any) *logservepb.SubmitWorkflowResponse {
 	t.Helper()
 	data, err := json.Marshal(def)
@@ -273,6 +310,8 @@ func submitWorkflowForTest(t *testing.T, client logservepb.ControlServiceClient,
 	return resp
 }
 
+// waitWorkflow polls until the workflow reaches the requested non-failed status,
+// failing early if the workflow transitions to FAILED.
 func waitWorkflow(t *testing.T, client logservepb.ControlServiceClient, workflowID string, want logservepb.WorkflowStatus) *logservepb.GetWorkflowStatusResponse {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
@@ -295,6 +334,8 @@ func waitWorkflow(t *testing.T, client logservepb.ControlServiceClient, workflow
 	return nil
 }
 
+// waitWorkflowTerminal waits for either terminal workflow state when a test needs
+// to inspect successful or failed completion explicitly.
 func waitWorkflowTerminal(t *testing.T, client logservepb.ControlServiceClient, workflowID string) *logservepb.GetWorkflowStatusResponse {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
@@ -314,6 +355,8 @@ func waitWorkflowTerminal(t *testing.T, client logservepb.ControlServiceClient, 
 	return nil
 }
 
+// waitWorkflowStep polls workflow status until a specific step reaches the target
+// state, returning the full snapshot for follow-up assertions.
 func waitWorkflowStep(t *testing.T, client logservepb.ControlServiceClient, workflowID, stepID string, want logservepb.WorkflowStepStatus) *logservepb.GetWorkflowStatusResponse {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
@@ -334,6 +377,8 @@ func waitWorkflowStep(t *testing.T, client logservepb.ControlServiceClient, work
 	return nil
 }
 
+// stepByID returns a named step from a workflow status response and fails the test
+// if the definition or replay output is missing that step.
 func stepByID(t *testing.T, status *logservepb.GetWorkflowStatusResponse, stepID string) *logservepb.WorkflowStepState {
 	t.Helper()
 	for _, step := range status.GetSteps() {
@@ -345,6 +390,8 @@ func stepByID(t *testing.T, status *logservepb.GetWorkflowStatusResponse, stepID
 	return nil
 }
 
+// countWorkflowEvent counts matching event names in a log stream for tests that
+// assert idempotency or compaction behavior.
 func countWorkflowEvent(records []*logservepb.LogRecord, eventType string) int {
 	count := 0
 	for _, rec := range records {
@@ -355,6 +402,8 @@ func countWorkflowEvent(records []*logservepb.LogRecord, eventType string) int {
 	return count
 }
 
+// simpleRAGDefinition returns a small deterministic workflow whose later steps
+// consume earlier outputs through __step_ref__ placeholders.
 func simpleRAGDefinition(t *testing.T) map[string]any {
 	t.Helper()
 	source := `
@@ -408,6 +457,8 @@ def generate_mock(query, docs):
 	}
 }
 
+// retryDefinition returns a workflow whose first step fails once by writing a
+// marker file, then succeeds on retry and feeds a dependent step.
 func retryDefinition(t *testing.T, marker string) map[string]any {
 	t.Helper()
 	source := fmt.Sprintf(`
@@ -453,6 +504,8 @@ def finish(value):
 	}
 }
 
+// timeoutDefinition returns a workflow whose only step sleeps longer than its
+// timeout so retry exhaustion and terminal failure are deterministic.
 func timeoutDefinition(t *testing.T) map[string]any {
 	t.Helper()
 	source := `

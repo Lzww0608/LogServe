@@ -11,9 +11,13 @@ option go_package = "github.com/logserve/logserve/gen/logservepb;logservepb";
 enum TaskStatus {
   // UNSPECIFIED is the proto3 zero value and represents unknown task state.
   TASK_STATUS_UNSPECIFIED = 0;
+  // QUEUED means the task exists but has not been leased by a worker yet.
   TASK_STATUS_QUEUED = 1;
+  // RUNNING means a worker accepted the current lease and reported StartTask.
   TASK_STATUS_RUNNING = 2;
+  // SUCCEEDED is terminal and carries result_json when the task produced a value.
   TASK_STATUS_SUCCEEDED = 3;
+  // FAILED is terminal and carries an error string when available.
   TASK_STATUS_FAILED = 4;
 }
 
@@ -21,8 +25,11 @@ enum TaskStatus {
 enum WorkflowStatus {
   // UNSPECIFIED is the proto3 zero value and represents unknown workflow state.
   WORKFLOW_STATUS_UNSPECIFIED = 0;
+  // RUNNING includes workflows with queued, running, or retryable steps.
   WORKFLOW_STATUS_RUNNING = 1;
+  // COMPLETED means the result step reached a successful terminal state.
   WORKFLOW_STATUS_COMPLETED = 2;
+  // FAILED means at least one required step exhausted attempts or hit a fatal error.
   WORKFLOW_STATUS_FAILED = 3;
 }
 
@@ -31,9 +38,13 @@ enum WorkflowStatus {
 enum WorkflowStepStatus {
   // UNSPECIFIED is the proto3 zero value and represents unknown step state.
   WORKFLOW_STEP_STATUS_UNSPECIFIED = 0;
+  // SCHEDULED means the control plane created or queued work for the step.
   WORKFLOW_STEP_STATUS_SCHEDULED = 1;
+  // STARTED means a worker began the task backing this step.
   WORKFLOW_STEP_STATUS_STARTED = 2;
+  // SUCCEEDED means the step result is available inline or via result_ref.
   WORKFLOW_STEP_STATUS_SUCCEEDED = 3;
+  // FAILED means the step reached a non-retryable terminal state.
   WORKFLOW_STEP_STATUS_FAILED = 4;
 }
 
@@ -41,7 +52,9 @@ enum WorkflowStepStatus {
 enum ActorStatus {
   // UNSPECIFIED is the proto3 zero value and represents unknown actor state.
   ACTOR_STATUS_UNSPECIFIED = 0;
+  // ACTIVE means the actor has usable metadata and can accept serialized calls.
   ACTOR_STATUS_ACTIVE = 1;
+  // UNAVAILABLE means callers should not assume a current worker owner exists.
   ACTOR_STATUS_UNAVAILABLE = 2;
 }
 
@@ -49,21 +62,29 @@ enum ActorStatus {
 enum SchedulingPolicy {
   // UNSPECIFIED is the proto3 zero value before the control plane applies its default.
   SCHEDULING_POLICY_UNSPECIFIED = 0;
+  // RESOURCE_ONLY assigns based on available worker capacity without model locality.
   SCHEDULING_POLICY_RESOURCE_ONLY = 1;
+  // LOCALITY_AWARE can wait for workers that already cache the requested model.
   SCHEDULING_POLICY_LOCALITY_AWARE = 2;
+  // PREDICTED_LATENCY uses recorded execution history to prefer lower-latency workers.
   SCHEDULING_POLICY_PREDICTED_LATENCY = 3;
 }
 
 // ModelInfo describes a model or adapter known to the control plane.
 message ModelInfo {
+  // name and version together form the scheduler-visible model identity.
   string name = 1;
   string version = 2;
+  // size_bytes is advisory metadata for cache accounting and dashboard display.
   uint64 size_bytes = 3;
+  // path is adapter-specific; mock adapters and checkpoint loaders interpret it differently.
   string path = 4;
+  // adapter selects the runtime integration used to execute the model request.
   string adapter = 5;
 }
 
 // ModelCacheEntry is the compact model identity workers report in heartbeats.
+// ModelCacheEntry intentionally omits size/path because heartbeats only need identity.
 message ModelCacheEntry {
   string name = 1;
   string version = 2;
@@ -80,9 +101,11 @@ message TaskSpec {
   string function_source = 4;
   bytes args_json = 5;
   string idempotency_key = 6;
+  // Workflow fields are set only when this task backs a workflow DAG step.
   string workflow_id = 7;
   string step_id = 8;
   string target_worker_id = 9;
+  // Actor fields are set only when this task represents one serialized actor call.
   string actor_id = 10;
   string actor_call_id = 11;
   string actor_class_name = 12;
@@ -94,10 +117,12 @@ message TaskSpec {
   // actor_epoch fences actor state writes so stale completions cannot overwrite
   // a newer actor ownership epoch.
   uint64 actor_epoch = 17;
+  // LLM fields are set only for SubmitLLM tasks or LLM workflow steps.
   string llm_model_name = 18;
   string llm_model_version = 19;
   string llm_adapter = 20;
   uint32 llm_max_tokens = 21;
+  // timeout_ms is a per-task execution budget; zero leaves server defaults in effect.
   int64 timeout_ms = 22;
 
   // task_lease_epoch fences StartTask and CompleteTask against redelivery races.
@@ -116,8 +141,10 @@ message SubmitTaskRequest {
   string task_name = 1;
   string function_name = 2;
   string function_source = 3;
+  // args_json uses the executor envelope {"args": [...], "kwargs": {...}}.
   bytes args_json = 4;
   string idempotency_key = 5;
+  // function_ref/function_hash let clients reference registered code without resending source.
   string function_ref = 6;
   string function_hash = 7;
 }
@@ -147,9 +174,12 @@ message GetTaskStatusResponse {
 // RegisterWorkerRequest advertises worker capacity, labels, and cached models.
 message RegisterWorkerRequest {
   string worker_id = 1;
+  // address is optional in local tests but reserved for worker callbacks or diagnostics.
   string address = 2;
+  // labels are opaque scheduler hints; this proto does not define their key space.
   map<string, string> labels = 3;
   repeated ModelCacheEntry cached_models = 4;
+  // capacity is the worker-advertised concurrent task budget.
   uint32 capacity = 5;
 }
 
@@ -161,6 +191,7 @@ message RegisterWorkerResponse {
 // HeartbeatRequest refreshes worker liveness and cache metadata.
 message HeartbeatRequest {
   string worker_id = 1;
+  // cached_models refreshes locality state on every heartbeat.
   repeated ModelCacheEntry cached_models = 2;
 }
 
@@ -174,7 +205,9 @@ message HeartbeatResponse {
 // max_tasks enables batch polling; wait_timeout_ms allows long-poll behavior.
 message PollTaskRequest {
   string worker_id = 1;
+  // max_tasks caps the returned batch; zero is interpreted by the server.
   uint32 max_tasks = 2;
+  // wait_timeout_ms enables long polling when no eligible task exists immediately.
   int64 wait_timeout_ms = 3;
 }
 
@@ -184,6 +217,7 @@ message PollTaskRequest {
 message PollTaskResponse {
   bool has_task = 1;
   TaskSpec task = 2;
+  // tasks is authoritative for batch-aware clients; task mirrors the first item for compatibility.
   repeated TaskSpec tasks = 3;
 }
 
@@ -210,7 +244,9 @@ message CompleteTaskRequest {
   string task_id = 1;
   string worker_id = 2;
   TaskStatus status = 3;
+  // result_json carries the executor result payload when status is SUCCEEDED.
   bytes result_json = 4;
+  // error should be populated when status is FAILED, but clients must tolerate it being empty.
   string error = 5;
   bytes actor_state_json = 6;
   uint64 actor_epoch = 7;
@@ -257,6 +293,7 @@ message WorkflowStepState {
   int64 started_at_ms = 9;
   int64 completed_at_ms = 10;
   int64 latency_ms = 11;
+  // depends_on preserves declared DAG edge ids for status and dashboard consumers.
   repeated string depends_on = 12;
 }
 
@@ -266,6 +303,7 @@ message WorkflowStepState {
 // workflow request.
 message SubmitWorkflowRequest {
   string workflow_name = 1;
+  // definition_json is opaque here so workflow schema evolution stays above the RPC layer.
   bytes definition_json = 2;
   string idempotency_key = 3;
 }
@@ -374,6 +412,7 @@ message GetActorStatusResponse {
   uint64 command_count = 6;
   string snapshot_ref = 7;
   uint64 snapshot_command_count = 8;
+  // state_json is diagnostic/replay data; callers should treat it as runtime-owned JSON.
   bytes state_json = 9;
   int64 created_at_ms = 10;
   int64 updated_at_ms = 11;
@@ -444,9 +483,12 @@ message LLMEvent {
   string worker_id = 6;
   bool cache_hit = 7;
   int64 model_load_ms = 8;
+  // first_token_ms is zero for adapters that do not expose streaming-token timing.
   int64 first_token_ms = 9;
   int64 total_latency_ms = 10;
+  // checkpoint_fetch_ms distinguishes source fetch cost from local model load cost.
   int64 checkpoint_fetch_ms = 11;
+  // cache_used_bytes/cache_capacity_bytes describe worker cache state after the event.
   int64 cache_used_bytes = 12;
   int64 cache_capacity_bytes = 13;
   int64 eviction_count = 14;
@@ -485,6 +527,7 @@ message ReplayLLMResponse {
 message SetBackpressureRequest {
   uint32 queue_high_watermark = 1;
   int64 redelivery_timeout_ms = 2;
+  // log_append_slow_ms rejects new submissions when recent appends exceed this threshold.
   int64 log_append_slow_ms = 3;
 }
 
@@ -502,7 +545,9 @@ message DashboardTask {
   TaskStatus status = 3;
   string worker_id = 4;
   string workflow_id = 5;
+  // step_id is set only for workflow-backed tasks.
   string step_id = 6;
+  // actor_id is set only for actor-backed tasks.
   string actor_id = 7;
   string llm_model_name = 8;
   string llm_model_version = 9;
@@ -524,24 +569,30 @@ message DashboardWorker {
   uint32 capacity = 2;
   uint32 running_tasks = 3;
   repeated ModelCacheEntry cached_models = 4;
+  // last_heartbeat_ms is server-observed time, not a worker-supplied timestamp.
   int64 last_heartbeat_ms = 5;
 }
 
 // MetadataMaterializerStats exposes async metadata flush health and lag.
 message MetadataMaterializerStats {
   string mode = 1;
+  // pending_deltas counts metadata changes not yet flushed by the materializer.
   uint64 pending_deltas = 2;
+  // queued_deltas counts changes waiting in the async materializer channel.
   uint64 queued_deltas = 3;
   uint32 batch_max = 4;
   int64 flush_interval_ms = 5;
   uint64 flush_count = 6;
+  // flush_error_count is cumulative for the process lifetime.
   uint64 flush_error_count = 7;
   int64 last_flush_at_ms = 8;
   int64 last_success_at_ms = 9;
   int64 last_error_at_ms = 10;
   int64 last_flush_duration_ms = 11;
   uint64 last_flush_deltas = 12;
+  // last_error is diagnostic text and may be empty after successful recovery.
   string last_error = 13;
+  // eventual_lag_estimate_ms is best-effort and should be treated as approximate.
   int64 eventual_lag_estimate_ms = 14;
 }
 
@@ -555,15 +606,18 @@ message DashboardSnapshot {
   uint32 queue_high_watermark = 2;
   int64 redelivery_timeout_ms = 3;
   SchedulingPolicy scheduling_policy = 4;
+  // Repeated sections are independent views, not a transactionally consistent join.
   repeated DashboardTask tasks = 5;
   repeated DashboardWorkflow workflows = 6;
   repeated GetActorStatusResponse actors = 7;
   repeated DashboardWorker workers = 8;
   repeated ModelInfo models = 9;
+  // last_log_append_ms and log_append_slow_ms expose the submission backpressure signal.
   int64 last_log_append_ms = 10;
   int64 log_append_slow_ms = 11;
   uint64 compactable_log_records = 12;
   uint64 compactable_log_bytes = 13;
+  // metadata_materializer is empty/defaulted when async materialization is disabled.
   MetadataMaterializerStats metadata_materializer = 14;
 }
 
@@ -573,6 +627,7 @@ message GetDashboardSnapshotRequest {}
 
 // ControlService is the control-plane API for clients, workers, and the web UI.
 service ControlService {
+  // Client-facing RPCs create work, inspect state, or change runtime policy.
   // SubmitTask creates or reuses a standalone task.
   rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
 
@@ -618,6 +673,7 @@ service ControlService {
   // ReplayActor rebuilds actor state from the log and optional snapshots.
   rpc ReplayActor(ReplayActorRequest) returns (ReplayActorResponse);
 
+  // Worker-facing RPCs maintain liveness, lease work, and report execution progress.
   // RegisterWorker announces worker capacity and cached model inventory.
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
 

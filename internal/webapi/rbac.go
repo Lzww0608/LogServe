@@ -16,17 +16,23 @@ import (
 // role is the ordered permission level recognized by the web console API.
 type role string
 
+// Console roles are ordered from read-only to full administrative access.
 const (
-	roleViewer   role = "viewer"
+	// roleViewer can read dashboard, logs, templates, and session state.
+	roleViewer role = "viewer"
+	// roleOperator can submit and replay runtime work but cannot change admin-only settings.
 	roleOperator role = "operator"
-	roleAdmin    role = "admin"
+	// roleAdmin can perform privileged operations such as model registration and backpressure changes.
+	roleAdmin role = "admin"
 )
 
 // authPrincipal is the authenticated subject stored in request context and audit
 // records.
 type authPrincipal struct {
+	// Subject is a non-secret audit identifier derived from the accepted token.
 	Subject string `json:"subject"`
-	Role    role   `json:"role"`
+	// Role is the permission level granted to the request.
+	Role role `json:"role"`
 }
 
 // authContextKey avoids collisions for authPrincipal values stored in contexts.
@@ -57,6 +63,8 @@ func authenticateHTTP(header string, cfg Config) (authPrincipal, bool) {
 	if presented == "" {
 		return authPrincipal{}, false
 	}
+	// Check higher privileges first so the admin/APIToken alias cannot be
+	// shadowed by a lower-role token if a config mistake slips past validation.
 	for _, candidate := range []struct {
 		role  role
 		token string
@@ -75,6 +83,8 @@ func authenticateHTTP(header string, cfg Config) (authPrincipal, bool) {
 
 // bearerToken accepts both raw tokens and Authorization: Bearer values.
 func bearerToken(header string) string {
+	// Accepting a raw token keeps older tests and simple CLI probes working while
+	// normal browser calls still use the standard Bearer form.
 	presented := strings.TrimSpace(header)
 	if strings.HasPrefix(strings.ToLower(presented), "bearer ") {
 		presented = strings.TrimSpace(presented[len("bearer "):])
@@ -87,6 +97,8 @@ func bearerToken(header string) string {
 func tokenMatches(presented, configured string) bool {
 	configured = strings.TrimSpace(configured)
 	if configured == "" || len(presented) != len(configured) {
+		// Length mismatch is rejected before ConstantTimeCompare; this leaks only
+		// token length and avoids treating an empty configured token as valid.
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(presented), []byte(configured)) == 1

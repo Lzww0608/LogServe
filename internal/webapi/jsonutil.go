@@ -16,17 +16,24 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// errInvalidInput marks local validation failures for HTTP 400 mapping.
 var errInvalidInput = errors.New("invalid input")
 
+// Request-size limits bound source snippets and nested raw JSON payloads before
+// they are forwarded to the control plane.
 const (
+	// maxSourceBytes caps submitted function/workflow source-like payloads.
 	maxSourceBytes = 256 * 1024
-	maxJSONBytes   = 64 * 1024
+	// maxJSONBytes caps args/kwargs raw JSON fields embedded inside requests.
+	maxJSONBytes = 64 * 1024
 )
 
 // decodeJSON reads one bounded JSON value, rejects unknown fields, and rejects
 // trailing values so request bodies have a single unambiguous shape.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	defer r.Body.Close()
+	// The body limit allows one source-sized field plus surrounding JSON envelope
+	// while still failing obviously oversized requests before full decoding.
 	r.Body = http.MaxBytesReader(w, r.Body, 2*maxSourceBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -57,6 +64,8 @@ func requestContext(r *http.Request, timeout time.Duration) (context.Context, co
 	}
 	ctx := r.Context()
 	if id := requestID(r); id != "" {
+		// Append preserves any existing outgoing metadata while making the request ID
+		// visible to control/log services for audit correlation.
 		ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", id)
 	}
 	return context.WithTimeout(ctx, timeout)
@@ -99,6 +108,8 @@ func envelopeArgs(args, kwargs json.RawMessage) ([]byte, error) {
 	if err := validateRawJSON("kwargs", kwargs, maxJSONBytes); err != nil {
 		return nil, err
 	}
+	// Keep args and kwargs as RawMessage so callers' JSON values are embedded
+	// without string escaping or semantic normalization.
 	return json.Marshal(map[string]json.RawMessage{
 		"args":   args,
 		"kwargs": kwargs,
@@ -113,6 +124,8 @@ func jsonOrNil(data []byte) json.RawMessage {
 		return nil
 	}
 	if json.Valid(data) {
+		// Return an owned copy so callers can safely hold the DTO after the protobuf
+		// response buffer is reused or discarded.
 		return append(json.RawMessage(nil), data...)
 	}
 	encoded, _ := json.Marshal(string(data))

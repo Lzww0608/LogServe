@@ -9,6 +9,7 @@ export function DetailGrid({ items }: { items: Array<[string, ReactNode]> }) {
       {items.map(([label, value]) => (
         <div key={label}>
           <dt>{label}</dt>
+          {/* Empty values are normalized here so callers can pass raw API fields directly. */}
           <dd>{value === null || value === undefined || value === "" ? "-" : value}</dd>
         </div>
       ))}

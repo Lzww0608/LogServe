@@ -36,6 +36,8 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// Reuse dashboard state so the admin page reports the exact thresholds and
+	// materializer lag currently visible to the rest of the console.
 	writeJSON(w, map[string]any{
 		"scheduling_policy":       dto.SchedulingPolicy,
 		"queue_high_watermark":    dto.QueueHighWatermark,
@@ -80,6 +82,8 @@ func (s *Server) handleSetBackpressure(w http.ResponseWriter, r *http.Request) {
 // validateBackpressureRequest rejects zero or negative thresholds that would make
 // backpressure and redelivery behavior nonsensical.
 func validateBackpressureRequest(input backpressureRequest) error {
+	// Zero thresholds would effectively disable scheduling/backpressure timers in
+	// surprising ways, so the HTTP layer rejects them before reaching the control plane.
 	if input.QueueHighWatermark == 0 {
 		return fmt.Errorf("%w: queue_high_watermark must be greater than 0", errInvalidInput)
 	}

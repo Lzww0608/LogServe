@@ -5,6 +5,8 @@ import test from "node:test";
 import { taskActionState } from "../.tmp-task-action-tests/src/utils/taskActions.js";
 import { logStreamURL, taskActionURL, tasksURL, workflowsURL, templateRunURL } from "../.tmp-task-action-tests/src/api/client.js";
 
+// Imports target the test script's compiled .tmp-task-action-tests output, not the TypeScript source tree.
+// Shared fixture for actions that only apply to failed standalone tasks.
 const standaloneFailed = { task_id: "task-1", status: "FAILED", task_name: "add" };
 
 // Verifies taskActionState enables retry only for failed standalone tasks.

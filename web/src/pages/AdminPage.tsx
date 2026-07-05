@@ -10,6 +10,7 @@ import { formatTime } from "../utils/format";
 import { errorMessage } from "../utils/status";
 import { roleAtLeast } from "../utils/roles";
 
+// BackpressureForm keeps admin numeric inputs as strings so invalid edits can stay visible until submit-time validation.
 type BackpressureForm = {
   queueHighWatermark: string;
   redeliveryTimeoutMs: string;
@@ -24,6 +25,7 @@ export function AdminPage({ session }: { session?: ConsoleSession | null }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  // The disabled state mirrors the backend admin gate; the API call still enforces the role.
   const canSave = roleAtLeast(session, "admin");
 
   useEffect(() => {
@@ -68,6 +70,7 @@ export function AdminPage({ session }: { session?: ConsoleSession | null }) {
       setMessage("Backpressure values must be positive integers");
       return;
     }
+    // The backend/protobuf field is uint32-sized, so reject values JavaScript could otherwise represent.
     if (queueHighWatermark > 4294967295) {
       setMessage("Queue high watermark exceeds uint32 range");
       return;

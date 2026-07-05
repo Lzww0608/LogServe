@@ -1,3 +1,4 @@
+# Tests top-level Ubuntu project acceptance summary aggregation and sub-suite handling.
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts" / "summarize_ubuntu_project_acceptance.py"
 
 
+# load_module imports the project-level acceptance summarizer from scripts/.
 def load_module():
     spec = importlib.util.spec_from_file_location("summarize_ubuntu_project_acceptance", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -18,11 +20,13 @@ def load_module():
     return module
 
 
+# write_status appends one command result for project-level failed-command detection.
 def write_status(root, name, exit_code):
     with (root / "command_status.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"name": name, "exit_code": exit_code, "duration_sec": 1, "log": f"{name}.log"}) + "\n")
 
 
+# write_required_statuses records the baseline gates required for a PASS project summary.
 def write_required_statuses(root):
     for name in (
         "go_test_all",
@@ -35,6 +39,7 @@ def write_required_statuses(root):
         write_status(root, name, 0)
 
 
+# write_child_summary creates a nested sub-suite summary plus Markdown artifact for send-back paths.
 def write_child_summary(root, rel_dir, filename, verdict="PASS"):
     directory = root / rel_dir
     directory.mkdir(parents=True, exist_ok=True)
@@ -43,6 +48,7 @@ def write_child_summary(root, rel_dir, filename, verdict="PASS"):
     (directory / markdown_name).write_text(f"# {rel_dir}\n", encoding="utf-8")
 
 
+# write_config controls which optional sub-suites are enabled in project acceptance.
 def write_config(root, compose=True, checkpoint=True, postgres=True):
     (root / "run_config.json").write_text(
         json.dumps(
@@ -56,7 +62,9 @@ def write_config(root, compose=True, checkpoint=True, postgres=True):
     )
 
 
+# UbuntuProjectAcceptanceSummaryTest verifies strict aggregation of baseline commands and enabled sub-suites.
 class UbuntuProjectAcceptanceSummaryTest(unittest.TestCase):
+    # test_writes_pass_summary_with_all_subsuites covers the full project acceptance happy path.
     def test_writes_pass_summary_with_all_subsuites(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -76,6 +84,7 @@ class UbuntuProjectAcceptanceSummaryTest(unittest.TestCase):
             self.assertIn("Ubuntu Project Acceptance Summary", markdown)
             self.assertIn("compose_experiment_pass", markdown)
 
+    # test_disabled_subsuite_is_skipped_without_failing keeps intentionally disabled suites from failing the run.
     def test_disabled_subsuite_is_skipped_without_failing(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -89,6 +98,7 @@ class UbuntuProjectAcceptanceSummaryTest(unittest.TestCase):
             self.assertEqual("SKIPPED", summary["subsuites"]["compose_experiment"]["state"])
             self.assertNotIn("compose_experiment_pass", summary["checks"])
 
+    # test_failed_command_marks_summary_failed confirms any command_status failure fails the project summary.
     def test_failed_command_marks_summary_failed(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
@@ -102,6 +112,7 @@ class UbuntuProjectAcceptanceSummaryTest(unittest.TestCase):
             self.assertEqual("FAIL", summary["verdict"])
             self.assertIn("go_vet", summary["failed_commands"])
 
+    # test_main_returns_failure_for_failed_check verifies missing enabled sub-suite artifacts produce a non-zero CLI result.
     def test_main_returns_failure_for_failed_check(self):
         module = load_module()
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:

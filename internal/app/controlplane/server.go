@@ -22,22 +22,41 @@ import (
 // Server owns all process-level resources for a control-plane instance. Stop
 // shuts down the checkpoint loop, gRPC server, metadata store, and log client.
 type Server struct {
-	addr           string
-	listener       net.Listener
-	grpc           *grpc.Server
-	conn           *grpc.ClientConn
-	meta           io.Closer
+	// addr records the effective bind address after net.Listen resolves
+	// wildcards or port 0 into the listener's concrete address.
+	addr string
+	// listener is owned by grpc.Server.Serve and closed during GracefulStop.
+	listener net.Listener
+	// grpc exposes the control-plane RPC surface to workers, web, and CLI clients.
+	grpc *grpc.Server
+	// conn is the downstream client connection to logd; bootstrap and all log writes
+	// flow through this process-owned connection.
+	conn *grpc.ClientConn
+	// meta closes durable metadata backends. It is nil for the in-memory store.
+	meta io.Closer
+	// checkpointStop cancels and joins the optional metadata checkpoint goroutine.
 	checkpointStop func()
 }
 
 // Options contains startup-time control-plane dependencies and persistence
 // settings. Empty fields keep the same environment/default behavior as Start.
 type Options struct {
-	MetadataStore               string
-	PostgresDSN                 string
-	PostgresMode                string
-	APIToken                    string
-	MetadataCheckpointInterval  time.Duration
+	// MetadataStore selects the metadata backend: empty and "memory" use an
+	// in-process store; "postgres" and "postgresql" open the durable SQL store.
+	MetadataStore string
+	// PostgresDSN is required only when MetadataStore selects Postgres.
+	PostgresDSN string
+	// PostgresMode is forwarded to metadata.PostgresOptions and normalized there.
+	PostgresMode string
+	// APIToken overrides the shared environment token for both server auth and the
+	// downstream log-service client; empty values fall back to the environment.
+	APIToken string
+	// MetadataCheckpointInterval controls the periodic checkpoint loop. Zero
+	// disables the loop and still returns a no-op stopper.
+	MetadataCheckpointInterval time.Duration
+	// MetadataCheckpointRetention caps retained checkpoint records when positive.
+	// Zero means unspecified and is normalized to the process default; negative
+	// values pass through and therefore disable trimming in control checkpointing.
 	MetadataCheckpointRetention int
 }
 
@@ -66,8 +85,9 @@ func StartWithOptions(addr, logAddr string, opts Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The log client is configured before binding this service because the
-	// control plane is not useful without a log-service endpoint.
+	// The log client is configured before binding this service because the control
+	// plane is not useful without a log-service endpoint. grpc.NewClient is lazy;
+	// BootstrapFromLog below is the first log RPC that proves the endpoint works.
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		_ = conn.Close()
@@ -85,6 +105,8 @@ func StartWithOptions(addr, logAddr string, opts Options) (*Server, error) {
 	// intentionally selected from environment to match the control service.
 	store, err := objectstore.OpenFromEnv(context.Background())
 	if err != nil {
+		// Object-store setup happens before the listener is published; failures
+		// unwind every resource opened so far and leave no partially serving process.
 		if closer != nil {
 			_ = closer.Close()
 		}
@@ -101,6 +123,8 @@ func StartWithOptions(addr, logAddr string, opts Options) (*Server, error) {
 	// Bootstrap replays existing log history before serving new control-plane RPCs
 	// so in-memory state is aligned with durable records at startup.
 	if err := service.LogBootstrapResult(service.BootstrapFromLog(context.Background())); err != nil {
+		// A failed replay leaves the service state ambiguous, so fail startup
+		// before registering RPC handlers rather than accepting fresh mutations.
 		if closer != nil {
 			_ = closer.Close()
 		}
@@ -135,6 +159,8 @@ func (s *Server) Stop() error {
 	}
 	s.grpc.GracefulStop()
 	if s.meta != nil {
+		// Keep Stop's returned error tied to the log client close while still
+		// attempting metadata cleanup for durable stores.
 		_ = s.meta.Close()
 	}
 	return s.conn.Close()
@@ -148,6 +174,8 @@ func openMetadataStore(ctx context.Context, opts Options) (metadata.Store, io.Cl
 	case "", "memory":
 		return metadata.NewMemoryStore(), nil, nil
 	case "postgres", "postgresql":
+		// The metadata package normalizes empty or unknown modes to synchronous
+		// writes, so this layer only passes through the startup string.
 		store, err := metadata.OpenPostgresStoreWithOptions(ctx, opts.PostgresDSN, metadata.PostgresOptions{Mode: metadata.PostgresWriteMode(opts.PostgresMode)})
 		if err != nil {
 			return nil, nil, err

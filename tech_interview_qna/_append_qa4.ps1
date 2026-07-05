@@ -1,5 +1,8 @@
+# One-shot helper for appending the Q013-Q016 system-design interview batch.
+# Run only when the target markdown file does not already contain this batch; AppendAllText does not deduplicate.
 $file = "F:\Code\Go-Programming\LogServe\tech_interview_qna\52_system_design_fundamentals_high_availability_capacity_planning.md"
 
+# Keep the payload in a literal here-string so Markdown fences, quotes, and backslashes stay byte-for-byte literal.
 $q013to016 = @'
 
 ## Q013. 读多写少和写多读少系统设计有什么差异？
@@ -324,5 +327,6 @@ Base62（0-9, a-z, A-Z）是最常见选择。避免使用容易混淆的字符�
 
 '@
 
+# Use UTF-8 without BOM to match the repository markdown files and avoid Windows PowerShell legacy encodings.
 [System.IO.File]::AppendAllText($file, $q013to016, [System.Text.UTF8Encoding]::new($false))
 Write-Output "Q013-Q016 appended successfully"

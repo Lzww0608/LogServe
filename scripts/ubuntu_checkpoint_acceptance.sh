@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# Runs the Ubuntu metadata-checkpoint acceptance suite and packages all evidence.
+# The wrapper records every command in command_status.jsonl so later summaries can
+# distinguish failed commands from missing or failed checkpoint checks.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/naming_guard.sh"
 RUN_ID="${LOGSERVE_UBUNTU_CHECKPOINT_ACCEPTANCE_ID:-latest}"
@@ -18,6 +21,7 @@ mkdir -p "$RESULT_DIR"
 : > "$STATUS_FILE"
 cd "$ROOT" || exit 1
 
+# json_escape emits one shell argument as a JSON string fragment for status JSONL.
 json_escape() {
   "$PYTHON_RUN" - "$1" <<'PY'
 import json
@@ -26,6 +30,7 @@ print(json.dumps(sys.argv[1])[1:-1])
 PY
 }
 
+# record_status appends one command result and updates ANY_FAIL without stopping the script.
 record_status() {
   local name="$1"
   local code="$2"
@@ -41,6 +46,7 @@ record_status() {
   fi
 }
 
+# run_step executes a command into a log file, records duration and exit code, and always returns success so later evidence can still be collected.
 run_step() {
   local name="$1"
   local log="$2"
@@ -60,6 +66,7 @@ run_step() {
   return 0
 }
 
+# detect_compose accepts either the Docker Compose v2 plugin or the legacy docker-compose binary.
 detect_compose() {
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     return 0
@@ -70,6 +77,7 @@ detect_compose() {
   return 1
 }
 
+# check_prerequisites verifies the host tools required for this wrapper and treats Docker as optional unless LOGSERVE_REQUIRE_DOCKER=1.
 check_prerequisites() {
   local missing=0
   for cmd in bash git go tar "$PYTHON_RUN"; do
@@ -78,6 +86,8 @@ check_prerequisites() {
       missing=1
     fi
   done
+  # Docker is only a prerequisite when explicitly requested; the nested
+  # checkpoint harness can run in its in-memory single-host mode without it.
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && detect_compose; then
     echo "docker compose: available"
   else
@@ -89,6 +99,7 @@ check_prerequisites() {
   return "$missing"
 }
 
+# write_server_environment captures host, toolchain, Docker, git, and working-tree context for later review.
 write_server_environment() {
   {
     echo "run_id=$RUN_ID"
@@ -111,6 +122,7 @@ write_server_environment() {
   } > "$RESULT_DIR/server_environment.txt"
 }
 
+# write_acceptance_summary combines command_status.jsonl with the nested checkpoint summary and writes top-level handoff files.
 write_acceptance_summary() {
   "$PYTHON_RUN" - "$RESULT_DIR" "$CHECKPOINT_DIR" "$PACKAGE_PATH" <<'PY'
 import json
@@ -128,11 +140,15 @@ if status_path.exists():
             continue
         try:
             statuses.append(json.loads(line))
+        # A malformed status line means the evidence stream itself is damaged;
+        # keep it as an explicit failed command instead of hiding it.
         except json.JSONDecodeError:
             statuses.append({"name": "malformed_status_line", "exit_code": 1, "duration_sec": 0, "log": ""})
 
 checkpoint_summary = {}
 summary_path = checkpoint_dir / "summary.json"
+# The nested checkpoint summary is optional evidence; missing or malformed JSON
+# becomes a failed top-level verdict rather than a Python exception.
 if summary_path.exists():
     try:
         checkpoint_summary = json.loads(summary_path.read_text(encoding="utf-8-sig"))
@@ -141,6 +157,8 @@ if summary_path.exists():
 
 failed = [item for item in statuses if int(item.get("exit_code", 1)) != 0]
 checkpoint_pass = checkpoint_summary.get("verdict") == "PASS"
+# The wrapper is strict: shell command execution and the nested semantic
+# checkpoint checks must both pass before the handoff package is marked PASS.
 verdict = "PASS" if not failed and checkpoint_pass else "FAIL"
 summary = {
     "verdict": verdict,
@@ -150,6 +168,8 @@ summary = {
     "failed_commands": [item.get("name") for item in failed],
     "commands": statuses,
     "checkpoint_acceptance": checkpoint_summary,
+    # Include both top-level and nested artifacts in the handoff list so a
+    # reviewer can inspect command status and checkpoint-specific evidence together.
     "send_back": [
         str(result_dir / "acceptance_summary.md"),
         str(result_dir / "acceptance_summary.json"),
@@ -196,8 +216,11 @@ print(result_dir / "acceptance_summary.md")
 PY
 }
 
+# package_results archives the result directory after excluding transient virtualenvs and the package being written.
 package_results() {
   local tmp_package="$RESULT_DIR/../.$(basename "$RESULT_DIR").tmp.tar.gz"
+  # Write through a sibling temp archive so an interrupted tar run never leaves
+  # a corrupt file at PACKAGE_PATH.
   rm -f "$tmp_package" "$PACKAGE_PATH"
   tar \
     --exclude '*/venv' \
@@ -214,6 +237,7 @@ package_results() {
   return "$code"
 }
 
+# print_failure_context prints the most useful generated summary or tail log when any recorded step failed.
 print_failure_context() {
   if [ "$ANY_FAIL" -eq 0 ]; then
     return 0
@@ -231,13 +255,17 @@ print_failure_context() {
   fi
 }
 
+# Capture environment before running checks so prereq failures still leave host context.
 write_server_environment
 run_step prerequisite_check "$RESULT_DIR/prerequisite_check.log" check_prerequisites
 if [ "$ANY_FAIL" -ne 0 ]; then
   PREREQ_OK=0
 fi
 
+# Baseline tests are optional so the checkpoint acceptance workload can be rerun quickly after prior validation.
 if [ "$PREREQ_OK" -eq 1 ] && [ "${LOGSERVE_CHECKPOINT_SKIP_BASELINE:-0}" != "1" ]; then
+  # Clear runtime-only env vars so baseline tests use repository defaults rather
+  # than credentials or artifact paths from this wrapper.
   run_step go_test_all "$RESULT_DIR/go_test_all.log" env -u LOGSERVE_API_TOKEN -u LOGSERVE_CHECKPOINT_ACCEPTANCE_OUT go test -count=1 ./...
   run_step go_race_control_checkpoint "$RESULT_DIR/go_race_control_checkpoint.log" env -u LOGSERVE_API_TOKEN -u LOGSERVE_CHECKPOINT_ACCEPTANCE_OUT go test -race -count=1 ./internal/control \
     -run 'Test(Bootstrap.*Checkpoint|MetadataCheckpoint.*|CreateMetadataCheckpoint.*|ControlRestartBootstrapsTaskAfterMetadataWriteLoss)'
@@ -245,6 +273,7 @@ if [ "$PREREQ_OK" -eq 1 ] && [ "${LOGSERVE_CHECKPOINT_SKIP_BASELINE:-0}" != "1" 
   run_step python_compileall "$RESULT_DIR/python_compileall.log" "$PYTHON_RUN" -m compileall -q scripts
 fi
 
+# The nested checkpoint runner receives all workload sizing through environment variables for reproducible reruns.
 if [ "$PREREQ_OK" -eq 1 ]; then
   run_step checkpoint_acceptance "$RESULT_DIR/checkpoint_acceptance.log" env \
     PYTHON="$PYTHON_RUN" \
@@ -258,9 +287,13 @@ if [ "$PREREQ_OK" -eq 1 ]; then
     bash scripts/checkpoint_acceptance.sh
 else
   echo "Skipping checkpoint_acceptance because prerequisite_check failed" > "$RESULT_DIR/checkpoint_acceptance.log"
+  # Record the skipped nested run as a failed command so the top-level summary
+  # explains why checkpoint evidence is missing.
   record_status checkpoint_acceptance 1 0 checkpoint_acceptance.log
 fi
 
+# Write a pre-package summary, add package_results to command_status.jsonl, then
+# rewrite the summary so the final report includes packaging evidence.
 write_acceptance_summary
 package_results
 write_acceptance_summary >> "$RESULT_DIR/acceptance_summary.log" 2>&1 || true

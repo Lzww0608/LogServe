@@ -1,5 +1,8 @@
+# One-shot helper for appending the Q009-Q012 system-design interview batch.
+# Run only when the target markdown file does not already contain this batch; AppendAllText does not deduplicate.
 $file = "F:\Code\Go-Programming\LogServe\tech_interview_qna\52_system_design_fundamentals_high_availability_capacity_planning.md"
 
+# Keep the payload in a literal here-string so Markdown fences, quotes, and backslashes stay byte-for-byte literal.
 $q009to012 = @'
 
 ## Q009. 多可用区部署解决什么问题？
@@ -263,5 +266,6 @@ AWS 的官方建议："Multi-Region is most common for: regulatory requirements,
 
 '@
 
+# Use UTF-8 without BOM to match the repository markdown files and avoid Windows PowerShell legacy encodings.
 [System.IO.File]::AppendAllText($file, $q009to012, [System.Text.UTF8Encoding]::new($false))
 Write-Output "Q009-Q012 appended successfully"

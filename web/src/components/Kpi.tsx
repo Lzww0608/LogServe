@@ -2,6 +2,7 @@
 
 import type { ReactNode } from "react";
 
+// KpiTone matches the shared status tone vocabulary used by badges and health cards.
 type KpiTone = "neutral" | "good" | "bad" | "info" | "warn";
 
 // Render one labeled metric with a status tone class.

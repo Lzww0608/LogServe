@@ -12,15 +12,19 @@ import (
 // Clients groups the control and log gRPC connections used by HTTP handlers.
 // Only APIToken is passed to these clients; role tokens are not backend auth.
 type Clients struct {
+	// controlConn and logConn are kept so Close can release the concrete channels.
 	controlConn *grpc.ClientConn
 	logConn     *grpc.ClientConn
-	Control     logservepb.ControlServiceClient
-	Log         logservepb.LogServiceClient
+	// Control is the typed control-plane client used by most API handlers.
+	Control logservepb.ControlServiceClient
+	// Log is the typed log-service client used for audit, log explorer, and registry reads.
+	Log logservepb.LogServiceClient
 }
 
 // DialClients opens control-plane and log-service gRPC clients with the backend
 // API token configured for this webapi process.
 func DialClients(cfg Config) (*Clients, error) {
+	// Role tokens stop at the HTTP layer; backend RPCs use the admin-capable API token.
 	controlConn, err := grpc.NewClient(cfg.ControlAddr, rpcauth.InsecureDialOptions(cfg.APIToken)...)
 	if err != nil {
 		return nil, err

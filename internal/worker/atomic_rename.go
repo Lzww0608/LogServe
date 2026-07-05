@@ -9,5 +9,7 @@ import "os"
 
 // replaceFileWithRename atomically swaps tmpPath into targetPath on POSIX-like systems, replacing any existing target.
 func replaceFileWithRename(tmpPath, targetPath string) error {
+	// writeCheckpointManifest creates tmpPath beside targetPath, so POSIX rename
+	// stays within one filesystem and provides an atomic replacement.
 	return os.Rename(tmpPath, targetPath)
 }

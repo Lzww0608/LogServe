@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
 
+# Runs the RAG/LLM workflow example against explicit logd, control, and worker
+# processes. Separate workers advertise different model sets so routing and
+# model-aware scheduling paths are covered by the smoke run.
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $dataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("logserve-llm-smoke-" + [guid]::NewGuid().ToString("N"))
 $cliPath = Join-Path $dataDir "logservectl.exe"
@@ -16,6 +19,9 @@ go build -o $cliPath ./cmd/logservectl
 
 $procs = @()
 
+# Start-LogServeProcess launches one hidden Go process and records it for
+# teardown. Empty arguments are filtered because worker model flags are built
+# from small hashtables where some workers intentionally advertise no models.
 function Start-LogServeProcess {
   param([string[]]$Arguments)
   $filtered = $Arguments | Where-Object { $_ -ne $null -and $_ -ne "" }
@@ -29,6 +35,8 @@ function Start-LogServeProcess {
 }
 
 try {
+  # Start the shared log first because both control and workers depend on it
+  # for durable task and model state.
   Start-LogServeProcess -Arguments @(
     "run",
     "./cmd/logserve-logd",
@@ -49,6 +57,8 @@ try {
   )
   Start-Sleep -Seconds 2
 
+  # The third worker has an empty model list to keep ordinary task capacity in
+  # the same smoke while model-specific workers exercise LLM routing.
   foreach ($worker in @(
     @{ id = "worker-1"; models = "model-A:v1" },
     @{ id = "worker-2"; models = "model-B:v1" },
@@ -76,6 +86,8 @@ try {
   python (Join-Path $root "examples\rag_llm\workflow.py")
 }
 finally {
+  # Stop all processes started by this script before deleting the temporary CLI
+  # binary that SDK helpers used during the example run.
   foreach ($proc in $procs) {
     if ($proc -and -not $proc.HasExited) {
       Stop-Process -Id $proc.Id -Force

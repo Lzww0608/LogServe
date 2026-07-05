@@ -29,6 +29,7 @@ func BenchmarkMemoryStoreConcurrentGetTask(b *testing.B) {
 		b.Run(factory.name, func(b *testing.B) {
 			store := factory.newStore()
 			ids := seedBenchmarkTasks(b, store, 10000)
+			// seq distributes reads across preseeded IDs without a shared random source.
 			var seq uint64
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -52,6 +53,7 @@ func BenchmarkMemoryStoreConcurrentLeaseComplete(b *testing.B) {
 		b.Run(factory.name, func(b *testing.B) {
 			store := factory.newStore()
 			ids := seedBenchmarkTasks(b, store, b.N)
+			// seq assigns each parallel worker a unique preseeded task lifecycle.
 			var seq uint64
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -86,6 +88,7 @@ func BenchmarkMemoryStoreConcurrentHeartbeat(b *testing.B) {
 	for _, factory := range memoryStoreBenchmarkFactories() {
 		b.Run(factory.name, func(b *testing.B) {
 			store := factory.newStore()
+			// seq rotates workers and cache sets without adding a shared random source.
 			var seq uint64
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -108,6 +111,8 @@ func BenchmarkMemoryStoreHeartbeatUnderCompleteP99(b *testing.B) {
 	for _, factory := range memoryStoreBenchmarkFactories() {
 		b.Run(factory.name, func(b *testing.B) {
 			store := factory.newStore()
+			// Preseed enough tasks for lease/complete bursts so setup does not occur in
+			// the timed section.
 			ids := seedBenchmarkTasks(b, store, b.N*batchOps)
 			samples := make([]int64, b.N)
 			var opSeq uint64
@@ -119,6 +124,8 @@ func BenchmarkMemoryStoreHeartbeatUnderCompleteP99(b *testing.B) {
 				for pb.Next() {
 					opIdx := int(atomic.AddUint64(&opSeq, 1) - 1)
 					workerID := workers[opIdx%len(workers)]
+					// Every fourth operation injects write pressure while the other workers
+					// sample heartbeat latency under contention.
 					if opIdx%4 == 0 {
 						base := int(atomic.AddUint64(&taskSeq, batchOps) - batchOps)
 						for j := 0; j < batchOps && base+j < len(ids); j++ {
@@ -196,6 +203,7 @@ func BenchmarkMemoryStoreUpdateWorkflow(b *testing.B) {
 				workflowIDs[i] = fmt.Sprintf("workflow-%d", i)
 				store.UpsertWorkflow(benchmarkWorkflowState(workflowIDs[i], 16))
 			}
+			// seq spreads mutations across workflow IDs without a shared random source.
 			var seq uint64
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -260,6 +268,8 @@ func benchmarkWorkerIDs(n int) []string {
 // benchmarkWorkflowState builds a deterministic workflow state with the requested
 // number of steps.
 func benchmarkWorkflowState(workflowID string, steps int) workflow.State {
+	// Use a linear dependency-free graph so benchmarks measure store cloning and
+	// mutation costs instead of workflow validation complexity.
 	defs := make([]workflow.StepDefinition, steps)
 	for i := range defs {
 		defs[i] = workflow.StepDefinition{StepID: fmt.Sprintf("step-%d", i), TaskName: "benchmark-step"}

@@ -3,10 +3,13 @@
 import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
 
+// Keep ports configurable so browser and Lighthouse jobs can run sequentially without collisions.
 const appPort = Number(process.env.LOGSERVE_PLAYWRIGHT_PORT ?? 5173);
 const mockApiPort = Number(process.env.LOGSERVE_MOCK_API_PORT ?? 43080);
 const playwrightArgs = process.argv.slice(2);
+// Separate artifact folders because Lighthouse produces different reports from normal browser runs.
 const artifactKind = isLighthouseRun(playwrightArgs) ? "lighthouse" : "browser";
+// Track helper processes for deterministic teardown in reverse startup order.
 const children = [];
 
 try {
@@ -22,6 +25,7 @@ try {
   children.push(vite);
   await waitForHTTP(`http://127.0.0.1:${appPort}/`, "Vite dev server", vite, '<div id="root"></div>');
 
+  // Run Playwright synchronously so helper teardown happens after the test process has fully exited.
   const result = spawnSync(process.execPath, ["./node_modules/@playwright/test/cli.js", "test", "--config=playwright.config.ts", ...playwrightArgs], {
     cwd: process.cwd(),
     env: {
@@ -35,6 +39,7 @@ try {
   process.exitCode = typeof result.status === "number" ? result.status : 1;
   console.log(`[runner] playwright exited with ${process.exitCode}`);
 } finally {
+  // Stop Vite before the mock API because Vite may still proxy in-flight browser requests during shutdown.
   for (const child of children.reverse()) {
     stop(child);
   }

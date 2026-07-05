@@ -95,6 +95,8 @@ func (s *Server) handleSubmitLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	dto := LLMDTO{TaskID: resp.GetTaskId(), Status: taskStatusString(resp.GetStatus())}
 	if waitRequested(r) {
+		// Waiting uses the underlying task status endpoint; replay-only metrics such
+		// as cache hit and token latency remain available through /llm/{task}/replay.
 		task, err := s.waitTask(r, resp.GetTaskId(), waitTimeout(r, 60*time.Second))
 		if err != nil {
 			writeErr(w, err)
@@ -130,6 +132,8 @@ func (s *Server) handleSetSchedulingPolicy(w http.ResponseWriter, r *http.Reques
 		writeErr(w, err)
 		return
 	}
+	// parseSchedulingPolicy accepts aliases used by the console while keeping the
+	// control-plane RPC on the protobuf enum contract.
 	policy, err := parseSchedulingPolicy(input.Policy)
 	if err != nil {
 		writeErr(w, err)

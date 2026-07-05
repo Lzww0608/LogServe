@@ -19,6 +19,7 @@ from .client import (
 )
 from .decorators import actor, task, workflow
 
+# __all__ defines the stable convenience surface imported by examples and executor user code.
 __all__ = [
     "ActorHandle",
     "LogServeClient",

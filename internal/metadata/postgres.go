@@ -29,13 +29,22 @@ var migrationsFS embed.FS
 // PostgresStore wraps a memory Store with PostgreSQL persistence. The memory store
 // remains the read path and PostgreSQL is the durable projection of mutations.
 type PostgresStore struct {
-	memory       Store
-	db           *sql.DB
-	mode         PostgresWriteMode
+	// memory is the authoritative serving view; PostgreSQL is updated as its
+	// durable projection rather than queried on normal reads.
+	memory Store
+	// db is owned by this store when opened through OpenPostgresStore* and shared
+	// with the materializer for durable writes.
+	db *sql.DB
+	// mode decides whether mutation calls wait for SQL or only enqueue a delta.
+	mode PostgresWriteMode
+	// materializer is non-nil only in async mode and owns background batch writes.
 	materializer *Materializer
-	deltaSeq     atomic.Int64
-	mu           sync.Mutex
-	last         error
+	// deltaSeq versions async deltas so coalescing keeps the newest snapshot per key.
+	deltaSeq atomic.Int64
+	// mu protects last, which is written by both foreground sync paths and async callbacks.
+	mu sync.Mutex
+	// last records the most recent persistence/enqueue error observed by the store.
+	last error
 }
 
 // PostgresWriteMode controls whether mutation calls wait for SQL writes.
@@ -52,10 +61,14 @@ const (
 
 // PostgresOptions configures sync/async write behavior and async batch sizing.
 type PostgresOptions struct {
-	Mode          PostgresWriteMode
-	BatchMax      int
+	// Mode selects synchronous durability or asynchronous materialization.
+	Mode PostgresWriteMode
+	// BatchMax caps one async flush batch; non-positive values use defaults.
+	BatchMax int
+	// FlushInterval bounds async lag under low write volume.
 	FlushInterval time.Duration
-	QueueSize     int
+	// QueueSize bounds the fast enqueue channel before overflow coalescing is used.
+	QueueSize int
 }
 
 // OpenPostgresStore opens a Postgres-backed store with default write options.
@@ -69,6 +82,7 @@ func OpenPostgresStoreWithOptions(ctx context.Context, dsn string, opts Postgres
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("postgres dsn is required")
 	}
+	// sql.Open is lazy, so pingPostgres below is the actual connectivity gate.
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, err
@@ -78,6 +92,8 @@ func OpenPostgresStoreWithOptions(ctx context.Context, dsn string, opts Postgres
 		return nil, err
 	}
 	store := NewPostgresStoreWithOptions(db, opts)
+	// Migrations run before the store is returned so callers never publish a
+	// PostgresStore whose durable projection is missing required tables.
 	if err := store.ApplyMigrations(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -121,6 +137,8 @@ func NewPostgresStoreWithOptions(db *sql.DB, opts PostgresOptions) *PostgresStor
 	opts = normalizePostgresOptions(opts)
 	store := &PostgresStore{memory: NewMemoryStore(), db: db, mode: opts.Mode}
 	if opts.Mode == PostgresWriteModeAsync {
+		// Async mode still mutates memory synchronously; the materializer only mirrors
+		// accepted snapshots to PostgreSQL in the background.
 		store.materializer = NewMaterializer(db, opts.BatchMax, opts.FlushInterval, opts.QueueSize, store.persistDeltas, store.remember)
 		store.materializer.Start()
 	}
@@ -163,6 +181,7 @@ func (s *PostgresStore) ApplyMigrations(ctx context.Context) error {
 func (s *PostgresStore) Close() error {
 	var firstErr error
 	if s.materializer != nil {
+		// Close gives async mode a bounded final flush window before the DB handle is closed.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := s.materializer.Close(ctx); err != nil {
 			firstErr = err
@@ -224,6 +243,8 @@ func (s *PostgresStore) remember(err error) {
 // enqueue errors here and lets the materializer clear or set LastError on flush.
 func (s *PostgresStore) recordPersist(err error) {
 	if err != nil || !s.NonBlockingPersistence() {
+		// Successful async enqueues do not clear a previous async flush error; the
+		// materializer callback owns recovery/error reporting once it starts writing.
 		s.remember(err)
 	}
 }
@@ -485,6 +506,8 @@ func (s *PostgresStore) persistTaskOrEnqueue(task Task) error {
 	if !s.NonBlockingPersistence() {
 		return s.persistTask(context.Background(), task)
 	}
+	// Clone before enqueueing so later in-memory mutations cannot change the
+	// snapshot the materializer is supposed to persist.
 	return s.enqueueDelta(DeltaTask, task.TaskID, cloneTask(task))
 }
 
@@ -551,6 +574,8 @@ func (s *PostgresStore) persistDeltas(ctx context.Context, deltas []metadataDelt
 	// as a no-op after Commit, and it keeps early returns transaction-safe.
 	defer tx.Rollback()
 	for _, delta := range deltas {
+		// Each delta is already coalesced by logical key; writing them in one
+		// transaction avoids partially materialized batches.
 		if err := s.persistDeltaWith(ctx, tx, delta); err != nil {
 			return err
 		}
@@ -658,6 +683,8 @@ INSERT INTO task_instances (
 		return err
 	}
 	if task.LLMModelName != "" {
+		// llm_requests is a derived projection for LLM tasks only; regular tasks do
+		// not create rows in that table.
 		_, err = exec.ExecContext(ctx, `
 INSERT INTO llm_requests (task_id, model_name, model_version, worker_id)
 VALUES ($1, $2, $3, $4)
@@ -720,6 +747,8 @@ func (s *PostgresStore) persistWorkflow(ctx context.Context, state workflow.Stat
 // persistWorkflowWith upserts the workflow header followed by each ordered step
 // snapshot.
 func (s *PostgresStore) persistWorkflowWith(ctx context.Context, exec sqlExecutor, state workflow.State) error {
+	// Store the full workflow definition separately from input/output JSON so
+	// replay/debug tooling can inspect the submitted graph shape.
 	definitionJSON, err := json.Marshal(state.Definition)
 	if err != nil {
 		return err
@@ -845,6 +874,7 @@ ON CONFLICT (worker_id) DO UPDATE SET
 	}
 	keys := make([]string, 0, len(worker.CachedModels))
 	for key, cached := range worker.CachedModels {
+		// Only true entries are persisted; false entries represent absent cache rows.
 		if cached {
 			keys = append(keys, key)
 		}
@@ -922,6 +952,8 @@ ON CONFLICT (actor_id) DO UPDATE SET
 // jsonValue maps empty JSON payloads to SQL NULL and non-empty payloads to jsonb
 // strings.
 func jsonValue(data []byte) any {
+	// The store treats missing JSON and empty JSON as absent optional payloads;
+	// callers that need an explicit JSON empty value must pass a non-empty buffer.
 	if len(data) == 0 {
 		return nil
 	}
@@ -948,6 +980,8 @@ func nullTime(ms int64) any {
 // callers omitted a timestamp.
 func msTime(ms int64) time.Time {
 	if ms <= 0 {
+		// Required timestamp columns cannot be NULL, so omitted metadata timestamps
+		// materialize as the persistence time.
 		return time.Now()
 	}
 	return time.UnixMilli(ms)

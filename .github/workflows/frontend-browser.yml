@@ -1,5 +1,6 @@
 name: Frontend Browser Tests
 
+# Run the browser-facing console gates on main updates and every pull request.
 on:
   push:
     branches: [main]
@@ -10,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
+        # All npm scripts, generated test directories, and Playwright config live under web/.
         working-directory: web
     steps:
       - name: Checkout
@@ -18,14 +20,17 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
+          # Match the local frontend toolchain used by Vite 7 and Playwright tests.
           node-version: 22
           cache: npm
+          # Scope the cache key to the frontend lockfile so backend changes do not churn npm cache state.
           cache-dependency-path: web/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
       - name: Install Playwright Chromium
+        # Chromium plus OS dependencies are required for both Playwright specs and Lighthouse.
         run: npx playwright install --with-deps chromium
 
       - name: Build
@@ -35,12 +40,14 @@ jobs:
         run: npm run test:unit
 
       - name: Browser tests
+        # Keep browser and Lighthouse jobs as separate steps because the mock API uses a fixed local port.
         run: npm run test:browser
 
       - name: Lighthouse accessibility
         run: npm run test:lighthouse
 
       - name: Upload browser artifacts
+        # Always upload Playwright traces, screenshots, and Lighthouse reports when they exist.
         if: always()
         uses: actions/upload-artifact@v4
         with:

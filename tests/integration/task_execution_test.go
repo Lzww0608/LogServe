@@ -1,5 +1,8 @@
 package integration
 
+// This file exercises the minimal end-to-end task path through logd, the
+// control plane, a real worker, and the Python executor.
+
 import (
 	"context"
 	"encoding/json"
@@ -15,6 +18,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// TestTaskExecutionEndToEnd verifies that a submitted Python function is picked
+// up by a worker, completed successfully, and persisted as the expected task
+// event sequence in the log.
 func TestTaskExecutionEndToEnd(t *testing.T) {
 	ensureExecutorDeps(t)
 	root := repoRoot(t)
@@ -32,6 +38,8 @@ func TestTaskExecutionEndToEnd(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Run a real worker in the background so the test covers polling, Python
+	// execution, completion reporting, and log append side effects together.
 	go func() {
 		_ = worker.Run(ctx, worker.Config{
 			WorkerID:     "test-worker",
@@ -63,6 +71,8 @@ func TestTaskExecutionEndToEnd(t *testing.T) {
 	}
 
 	var status *logservepb.GetTaskStatusResponse
+	// Poll status instead of sleeping a fixed duration; this keeps the happy path
+	// fast while still giving the asynchronous worker time to complete the task.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		status, err = controlClient.GetTaskStatus(context.Background(), &logservepb.GetTaskStatusRequest{TaskId: submitted.GetTaskId()})
@@ -90,6 +100,8 @@ func TestTaskExecutionEndToEnd(t *testing.T) {
 	}
 	defer logConn.Close()
 	logClient := logservepb.NewLogServiceClient(logConn)
+	// Read the task stream directly to assert the durable lifecycle contract, not
+	// just the materialized status returned by the control plane.
 	records, err := logClient.ReadLog(context.Background(), &logservepb.ReadLogRequest{
 		StreamId: "task:" + submitted.GetTaskId(),
 		FromSeq:  1,

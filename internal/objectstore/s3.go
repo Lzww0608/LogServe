@@ -2,6 +2,7 @@ package objectstore
 
 // This file implements a minimal S3-compatible object store using raw HTTP
 // requests and AWS Signature Version 4. It is used for S3 and MinIO deployments.
+
 import (
 	"bytes"
 	"context"
@@ -27,36 +28,54 @@ import (
 // S3 multipart defaults balance memory use, object size support, and the S3
 // minimum part-size rule.
 const (
+	// defaultS3MultipartThreshold keeps small objects on the simpler single-PUT path.
 	defaultS3MultipartThreshold = 64 << 20
-	defaultS3MultipartPartSize  = 16 << 20
-	minS3MultipartPartSize      = 5 << 20
-	emptyPayloadSHA256          = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	// defaultS3MultipartPartSize is above S3's minimum and bounds per-part memory.
+	defaultS3MultipartPartSize = 16 << 20
+	// minS3MultipartPartSize is the S3 multipart minimum except for the final part.
+	minS3MultipartPartSize = 5 << 20
+	// emptyPayloadSHA256 is the canonical SigV4 hash for requests with no body.
+	emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
 
 // S3Config contains endpoint, credential, bucket, and multipart settings for the
 // S3-compatible backend.
 type S3Config struct {
-	Endpoint           string
-	Bucket             string
-	Region             string
-	AccessKey          string
-	SecretKey          string
-	CreateBucket       bool
+	// Endpoint is the scheme and host of the S3-compatible service.
+	Endpoint string
+	// Bucket is the only bucket this store accepts refs for.
+	Bucket string
+	// Region participates in SigV4 credential scope.
+	Region string
+	// AccessKey is the SigV4 access key ID.
+	AccessKey string
+	// SecretKey is the SigV4 signing secret.
+	SecretKey string
+	// CreateBucket controls the one-time best-effort bucket creation before Put.
+	CreateBucket bool
+	// MultipartThreshold chooses single PUT below the threshold and multipart at or above it.
 	MultipartThreshold int64
-	MultipartPartSize  int64
+	// MultipartPartSize is clamped to S3's minimum during OpenS3.
+	MultipartPartSize int64
 }
 
 // S3Store writes immutable content-addressed objects to one configured bucket.
 type S3Store struct {
-	cfg       S3Config
-	client    *http.Client
-	ensure    sync.Once
+	// cfg is normalized by OpenS3 and then treated as immutable.
+	cfg S3Config
+	// client owns transport pooling for all signed requests.
+	client *http.Client
+	// ensure serializes optional bucket creation across concurrent Put calls.
+	ensure sync.Once
+	// ensureErr records the memoized bucket-create outcome.
 	ensureErr error
 }
 
 // S3ConfigFromEnv builds S3Config from LOGSERVE_* variables with MINIO_* aliases
 // for local MinIO setups.
 func S3ConfigFromEnv() S3Config {
+	// Default to creating the bucket for local MinIO/dev deployments; production
+	// deployments can opt out with LOGSERVE_S3_CREATE_BUCKET=0.
 	createBucket := os.Getenv("LOGSERVE_S3_CREATE_BUCKET") != "0"
 	return S3Config{
 		Endpoint:           firstNonEmpty(os.Getenv("LOGSERVE_S3_ENDPOINT"), os.Getenv("MINIO_ENDPOINT")),
@@ -92,6 +111,8 @@ func OpenS3(ctx context.Context, cfg S3Config) (*S3Store, error) {
 		cfg.MultipartPartSize = defaultS3MultipartPartSize
 	}
 	if cfg.MultipartPartSize < minS3MultipartPartSize {
+		// S3 rejects non-final parts below 5 MiB, so silently clamp instead of
+		// accepting a config that would fail only after upload initiation.
 		cfg.MultipartPartSize = minS3MultipartPartSize
 	}
 	cfg.Endpoint = strings.TrimRight(cfg.Endpoint, "/")
@@ -129,6 +150,8 @@ func (s *S3Store) Put(ctx context.Context, namespace string, r io.Reader, size i
 		_ = os.Remove(tmpPath)
 	}()
 
+	// Keys mirror the local backend: cleaned namespace plus whole-object hash, so
+	// refs remain content-addressed even when S3 overwrites the same key.
 	key := path.Join(filepathSlash(cleanNamespace(namespace)), hashHex+".json")
 	if actualSize >= s.cfg.MultipartThreshold {
 		err = s.putMultipart(ctx, key, file, actualSize, hashHex)
@@ -197,7 +220,6 @@ func (s *S3Store) putMultipart(ctx context.Context, key string, file *os.File, s
 	completed := false
 	defer func() {
 		if !completed {
-
 			// Abort with a fresh background context because the caller context may already
 			// be canceled when cleanup is needed.
 			_ = s.abortMultipartUpload(context.Background(), key, uploadID)
@@ -376,6 +398,8 @@ func (s *S3Store) newRequest(ctx context.Context, method, rawURL string, body io
 		req.ContentLength = size
 	}
 	if payloadHash == "" {
+		// SigV4 always signs a payload hash; empty-body requests use the fixed
+		// SHA-256 value rather than omitting the header.
 		payloadHash = emptyPayloadSHA256
 	}
 	req.Header.Set("x-amz-content-sha256", payloadHash)
@@ -422,6 +446,8 @@ func (s *S3Store) keyFromRef(ref string) (string, error) {
 		return "", errors.New("invalid s3 object ref")
 	}
 	if bucket != s.cfg.Bucket {
+		// Ref buckets are pinned to the configured store to avoid accidental
+		// cross-bucket reads when metadata is copied between deployments.
 		return "", fmt.Errorf("s3 object bucket %q does not match configured bucket %q", bucket, s.cfg.Bucket)
 	}
 	return key, nil
@@ -632,6 +658,8 @@ func spoolToTemp(ctx context.Context, r io.Reader, size int64) (*os.File, string
 		return nil, "", 0, "", "", err
 	}
 	sum := h.Sum(nil)
+	// cleanup=false transfers responsibility for closing/removing the temp file
+	// to the caller, which needs the file for a later single or multipart upload.
 	cleanup = false
 	return file, file.Name(), written, hex.EncodeToString(sum), base64.StdEncoding.EncodeToString(sum), nil
 }

@@ -15,21 +15,32 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// SSE poll intervals are bounded to keep browser updates responsive without
+// allowing clients to force tight backend polling loops.
 const (
+	// defaultEventPollInterval is used when interval_ms is omitted.
 	defaultEventPollInterval = time.Second
-	minEventPollInterval     = 10 * time.Millisecond
-	maxEventPollInterval     = 10 * time.Second
+	// minEventPollInterval is the fastest accepted polling cadence.
+	minEventPollInterval = 10 * time.Millisecond
+	// maxEventPollInterval prevents accidentally stale long-poll settings.
+	maxEventPollInterval = 10 * time.Second
 )
 
 // eventSubscription describes one polling-backed SSE stream: dashboard, task,
 // workflow, or raw log records.
 type eventSubscription struct {
-	TaskID     string
-	StreamID   string
+	// TaskID selects task-status polling when non-empty.
+	TaskID string
+	// StreamID selects raw log-record polling unless it is a workflow stream shortcut.
+	StreamID string
+	// WorkflowID selects workflow-status polling derived from wf:<id> stream shortcuts.
 	WorkflowID string
-	FromSeq    uint64
-	Limit      uint32
-	Interval   time.Duration
+	// FromSeq is the next log sequence to request for raw log subscriptions.
+	FromSeq uint64
+	// Limit bounds each log read to protect the log service and response size.
+	Limit uint32
+	// Interval is the validated polling cadence for this subscription.
+	Interval time.Duration
 }
 
 // handleEvents implements SSE by polling the selected source and only emitting
@@ -79,6 +90,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bytes.Equal(data, last) {
+			// Suppress duplicate frames; the client already has this serialized state.
 			continue
 		}
 		if err := writeSSE(w, eventName, data); err != nil {
@@ -116,6 +128,8 @@ func parseEventSubscription(r *http.Request) (eventSubscription, error) {
 		}
 		return sub, nil
 	}
+	// from_seq and limit apply only to raw log-record mode; dashboard/task/workflow
+	// subscriptions are snapshots and do not expose a sequence cursor.
 	fromSeq, err := uint64Query(r, "from_seq", 1)
 	if err != nil {
 		return eventSubscription{}, err
@@ -155,6 +169,8 @@ func eventPollInterval(raw string) (time.Duration, error) {
 	}
 	interval := time.Duration(ms) * time.Millisecond
 	if interval < minEventPollInterval {
+		// Clamp instead of rejecting so an over-eager browser still receives updates
+		// at the server-approved minimum cadence.
 		return minEventPollInterval, nil
 	}
 	if interval > maxEventPollInterval {
@@ -244,6 +260,8 @@ func (s *Server) eventLogRecords(r *http.Request, sub *eventSubscription) (logRe
 	records := logRecordDTOs(resp.GetRecords())
 	nextSeq := sub.FromSeq
 	for _, record := range records {
+		// Streams can be sparse after trims, so advance by the greatest observed
+		// sequence instead of assuming a dense batch.
 		if record.Seq >= nextSeq {
 			nextSeq = record.Seq + 1
 		}

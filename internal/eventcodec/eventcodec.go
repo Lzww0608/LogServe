@@ -17,13 +17,12 @@ import (
 // path's msgpack map.
 type Kind byte
 
-// Known kind values keep payload families isolated: KindTaskSubmitted stores
-// task submissions, KindWorkflowEvent stores workflow replay records, and
-// KindActorEvent stores actor lifecycle and command replay records.
+// Known kind values keep payload families isolated; each byte selects the only
+// replay path that should decode the msgpack body.
 const (
-	KindTaskSubmitted Kind = 1
-	KindWorkflowEvent Kind = 2
-	KindActorEvent    Kind = 3
+	KindTaskSubmitted Kind = 1 // Task submission payload stored in the shared log.
+	KindWorkflowEvent Kind = 2 // Workflow replay record stored in the shared log.
+	KindActorEvent    Kind = 3 // Actor lifecycle or command replay record stored in the shared log.
 )
 
 // magic marks the versioned LogServe event envelope. Payloads without this

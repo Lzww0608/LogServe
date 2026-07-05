@@ -23,6 +23,7 @@ export function TaskDetailPage({ taskID, session }: { taskID: string; session?: 
   const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
   const [busyAction, setBusyAction] = useState<TaskOperation | "">("");
+  // Route changes must discard stale task state before the next SSE snapshot arrives.
   useEffect(() => {
     setTask(undefined);
     setError("");
@@ -60,6 +61,7 @@ export function TaskDetailPage({ taskID, session }: { taskID: string; session?: 
           ? await api.resubmitTask(task.task_id)
           : await api.cancelTask(task.task_id);
       setTask((current) => applyTaskEvent(current, next));
+      // Retry/resubmit can create a replacement task, so navigate to the returned id.
       if ((action === "retry" || action === "resubmit") && next.task_id) {
         navigate(`/tasks/${encodeURIComponent(next.task_id)}`);
       }
@@ -116,6 +118,7 @@ function TaskActionButton({ task, action, busyAction, session, onRun }: { task: 
   const busy = busyAction === action;
   const requiredRole = action === "cancel" ? "admin" : "operator";
   const roleBlocked = !roleAtLeast(session, requiredRole);
+  // Disable every action while one operation is in flight to avoid racing state transitions.
   const disabled = roleBlocked || !state.enabled || busyAction !== "";
   return (
     <span className="task-action-control" title={state.reason ?? undefined}>

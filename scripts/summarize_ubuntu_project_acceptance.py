@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+# Summarize the top-level Ubuntu project acceptance run and enabled sub-suites.
 import json
 import sys
 from pathlib import Path
 
 
+# Each sub-suite entry defines the run_config switch and the artifacts that prove
+# the suite result. Disabled suites are reported as SKIPPED rather than failing.
 SUBSUITES = {
     "compose_experiment": {
         "enabled_key": "run_compose_experiment",
@@ -26,6 +29,7 @@ SUBSUITES = {
 }
 
 
+# Load a JSON artifact, returning an empty object when optional artifacts are missing or malformed.
 def read_json(path):
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
@@ -33,6 +37,7 @@ def read_json(path):
         return {}
 
 
+# Read command_status.jsonl and convert malformed records into explicit failed statuses.
 def read_statuses(path):
     statuses = []
     if not path.exists():
@@ -42,11 +47,13 @@ def read_statuses(path):
             continue
         try:
             statuses.append(json.loads(line))
+        # Malformed status lines indicate corrupted evidence, so surface them as failures.
         except json.JSONDecodeError:
             statuses.append({"name": "malformed_status_line", "exit_code": 1, "duration_sec": 0, "log": ""})
     return statuses
 
 
+# Return whether a recorded command status represents a failed command.
 def status_failed(status):
     try:
         return int(status.get("exit_code", 1)) != 0
@@ -54,6 +61,7 @@ def status_failed(status):
         return True
 
 
+# Return whether a named command exists in the status log and exited successfully.
 def status_pass(statuses, name):
     for item in statuses:
         if item.get("name") == name:
@@ -61,6 +69,7 @@ def status_pass(statuses, name):
     return False
 
 
+# Interpret boolean run_config values from native booleans or common string forms.
 def bool_config(config, key, default=False):
     value = config.get(key, default)
     if isinstance(value, bool):
@@ -68,12 +77,14 @@ def bool_config(config, key, default=False):
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
+# Normalize a sub-suite verdict to uppercase text for pass-value comparisons.
 def normalize_verdict(value):
     if value is None:
         return ""
     return str(value).upper()
 
 
+# Collect enabled state, verdict, and artifact paths for each configured sub-suite.
 def collect_subsuites(root, config):
     result = {}
     for name, spec in SUBSUITES.items():
@@ -84,6 +95,8 @@ def collect_subsuites(root, config):
         verdict = normalize_verdict(summary.get("verdict"))
         if not enabled:
             state = "SKIPPED"
+        # Enabled sub-suites must produce their expected summary artifact with a
+        # recognized pass verdict; missing artifacts are treated as failed evidence.
         elif summary_path.exists() and verdict in spec["pass_values"]:
             state = "PASS"
         else:
@@ -98,6 +111,7 @@ def collect_subsuites(root, config):
     return result
 
 
+# Build top-level acceptance checks from command statuses and enabled sub-suite results.
 def build_checks(statuses, subsuites):
     checks = {
         "go_baseline_tests": status_pass(statuses, "go_test_all"),
@@ -106,12 +120,15 @@ def build_checks(statuses, subsuites):
         "python_script_tests": status_pass(statuses, "python_script_tests"),
         "python_compileall": status_pass(statuses, "python_compileall"),
     }
+    # Only enabled sub-suites become top-level checks so intentionally skipped
+    # optional suites do not make the whole acceptance run fail.
     for name, suite in subsuites.items():
         if suite["enabled"]:
             checks[f"{name}_pass"] = suite["state"] == "PASS"
     return checks
 
 
+# Write acceptance_summary.json and return the normalized project acceptance summary.
 def write_summary(root):
     root = Path(root)
     config = read_json(root / "run_config.json")
@@ -131,11 +148,15 @@ def write_summary(root):
     for suite in subsuites.values():
         markdown_path = Path(suite["markdown_path"])
         summary_path = Path(suite["summary_path"])
+        # Send-back paths include optional sub-suite artifacts only when they were
+        # actually materialized, keeping the final package manifest honest.
         if markdown_path.exists():
             send_back.append(str(markdown_path))
         if summary_path.exists():
             send_back.append(str(summary_path))
 
+    # The project verdict is a strict aggregate of command execution and derived
+    # checks; any missing required command or enabled sub-suite failure fails it.
     verdict = "PASS" if not failed_commands and not failed_checks else "FAIL"
     summary = {
         "verdict": verdict,
@@ -154,6 +175,7 @@ def write_summary(root):
     return summary
 
 
+# Write the Markdown project acceptance summary from the normalized summary object.
 def write_markdown(root, summary):
     lines = ["# Ubuntu Project Acceptance Summary", ""]
     lines.append(f"- Verdict: **{summary.get('verdict')}**")
@@ -196,6 +218,7 @@ def write_markdown(root, summary):
     (root / "acceptance_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# Parse the project acceptance directory, write reports, and use the verdict as the process exit code.
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 1:

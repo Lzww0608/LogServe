@@ -397,6 +397,7 @@ func runFullMetadataBootstrapForAcceptance(ctx context.Context, logClient *count
 		service.bootstrapScheduler,
 		service.bootstrapBackpressure,
 		service.bootstrapTasks,
+		// Adapt the workflow bootstrap helper into the same step signature as the other replay phases.
 		func(ctx context.Context) error { return service.bootstrapWorkflowsWithScheduling(ctx, false) },
 		service.bootstrapActors,
 		service.bootstrapLLMStats,

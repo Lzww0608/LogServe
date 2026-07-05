@@ -1,14 +1,20 @@
 # syntax=docker/dockerfile:1.7
 
+# Web console image: build static frontend assets first, then package them with
+# the Go HTTP server that serves both API proxy routes and the compiled UI.
 FROM node:22-bookworm AS web-build
 
 WORKDIR /src/web
 COPY web/package*.json ./
+# Keep npm install behavior compatible with local checkouts that may not carry a
+# lockfile, while preferring reproducible installs when package-lock.json exists.
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 COPY web/ ./
 RUN npm run build
 
+# The Go build is separate from the Node build so frontend dependency layers do
+# not invalidate the logserve-web binary cache unnecessarily.
 FROM golang:1.25-bookworm AS go-build
 
 WORKDIR /src
@@ -25,6 +31,8 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 FROM debian:bookworm-slim
 
+# The final image only needs the web binary plus static assets; it runs as the
+# same non-root uid used by the other deployment images.
 RUN adduser --system --uid 10001 --group logserve \
     && mkdir -p /app/web/dist \
     && chown -R logserve:logserve /app
@@ -34,4 +42,6 @@ COPY --from=go-build /out/logserve-web /usr/local/bin/logserve-web
 COPY --from=web-build /src/web/dist /app/web/dist
 
 USER logserve
+# Compose and k8s may override control/log addresses, but this default keeps the
+# image runnable as a standalone static console server.
 CMD ["logserve-web", "--addr", "0.0.0.0:8080", "--static-dir", "/app/web/dist"]

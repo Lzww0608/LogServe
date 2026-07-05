@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
 
+# Runs targeted recovery tests and lightweight process restart probes, then
+# writes reports/fault_injection.json. The script records probe status instead
+# of acting as a full chaos runner.
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $reportDir = Join-Path $root "reports"
 $reportPath = Join-Path $reportDir "fault_injection.json"
@@ -11,6 +14,8 @@ $env:GOCACHE = Join-Path $root ".gocache"
 New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
+# Keep the report schema stable even when an early test or process probe fails;
+# each field is updated independently as evidence is collected.
 $results = [ordered]@{
   generated_at = (Get-Date).ToString("o")
   worker_kill_recovery = "not_run"
@@ -21,6 +26,8 @@ $results = [ordered]@{
 }
 
 try {
+  # These integration tests cover the durable recovery cases; a passing run is
+  # summarized into the worker and queue recovery report fields below.
   go test ./tests/integration -run "Test(WorkflowWorkerRecoveryContinuesAfterCompletedStep|ActorCounterRecoverySnapshotAndReplay|RunningTaskIsRedeliveredAfterWorkerLeaseExpires|PolledTaskIsRedeliveredWhenWorkerDiesBeforeStart|StaleTaskCompletionRejectedAfterRedelivery|OrdinaryTaskSurvivesControlRestartFromTaskSpecLog|ControlRestartBootstrapsWorkflowAndModelStateFromLog)" -count=1 | Out-Host
   $results.worker_kill_recovery = "passed"
   $results.queue_redelivery = "passed"
@@ -33,6 +40,9 @@ catch {
 
 $logd = $null
 $control = $null
+# The restart probe below is process-level only: it verifies the daemons can be
+# killed and relaunched against the same addresses/data directory, while deeper
+# state correctness is covered by the integration tests above.
 try {
   $logd = Start-Process `
     -FilePath "go" `
@@ -50,6 +60,8 @@ try {
   Start-Sleep -Seconds 2
 
   Stop-Process -Id $control.Id -Force
+  # Restart control while logd remains up to exercise bootstrap from the shared
+  # log without wiping the logstore directory.
   Start-Sleep -Seconds 1
   $control = Start-Process `
     -FilePath "go" `
@@ -62,6 +74,8 @@ try {
   $results.notes += "Control bootstraps workflow, actor, model, ordinary task, and backpressure materialized state from shared log streams."
 
   Stop-Process -Id $logd.Id -Force
+  # Restart logd against the same data directory to prove the local process can
+  # reopen previously written logstore state for later probes.
   Start-Sleep -Seconds 1
   $logd = Start-Process `
     -FilePath "go" `
@@ -82,6 +96,7 @@ catch {
   }
 }
 finally {
+  # Best-effort cleanup is scoped to handles allocated in this script.
   foreach ($proc in @($control, $logd)) {
     if ($proc -and -not $proc.HasExited) {
       Stop-Process -Id $proc.Id -Force

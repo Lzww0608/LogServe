@@ -1,5 +1,7 @@
 // Package rpcauth centralizes the lightweight gRPC bearer-token checks used by
-// LogServe's internal control, log, worker, and web processes.
+// LogServe's internal control, log, worker, and web processes. It protects unary
+// RPC metadata only; transport encryption and stream interceptors are outside
+// this package's scope.
 package rpcauth
 
 import (
@@ -18,7 +20,11 @@ import (
 // EnvAPIToken and authorizationKey define the shared environment and metadata
 // names for LogServe's internal bearer-token RPC authentication.
 const (
-	EnvAPIToken      = "LOGSERVE_API_TOKEN"
+	// EnvAPIToken is the process-wide backend RPC token shared by logd, control,
+	// workers, webapi, and CLI clients. It is distinct from web UI role tokens.
+	EnvAPIToken = "LOGSERVE_API_TOKEN"
+	// authorizationKey is the incoming/outgoing gRPC metadata key used for the
+	// bearer token. gRPC metadata keys are case-insensitive and stored lowercase.
 	authorizationKey = "authorization"
 )
 
@@ -34,7 +40,11 @@ func ServerOptionsFromEnv() []grpc.ServerOption {
 //
 // The token is trimmed before use. An empty token deliberately returns nil so
 // local development and tests can run without configuring RPC authentication.
+// The returned option installs only a unary interceptor; streaming RPCs would
+// need an explicit stream interceptor if this package starts serving them.
 func ServerOptions(token string) []grpc.ServerOption {
+	// Normalize once at option construction so callers can pass raw env values
+	// without changing the runtime check performed by the interceptor.
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return nil
@@ -50,6 +60,8 @@ func UnaryServerInterceptor(token string) grpc.UnaryServerInterceptor {
 	token = strings.TrimSpace(token)
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if token == "" {
+			// Empty token is the explicit auth-disabled mode used by local tests and
+			// developer processes; do not require clients to send placeholder metadata.
 			return handler(ctx, req)
 		}
 		if !authorized(ctx, token) {
@@ -73,6 +85,8 @@ func InsecureDialOptionsFromEnv() []grpc.DialOption {
 // application-level bearer metadata when token is non-empty. Callers that need
 // transport security must use a different dial option set.
 func InsecureDialOptions(token string) []grpc.DialOption {
+	// This project uses local/plaintext gRPC channels; bearer metadata is an
+	// application-level guard, not transport encryption.
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 	token = strings.TrimSpace(token)
 	if token != "" {
@@ -89,6 +103,8 @@ func UnaryClientInterceptor(token string) grpc.UnaryClientInterceptor {
 	token = strings.TrimSpace(token)
 	return func(ctx context.Context, method string, req any, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		if token != "" {
+			// Append instead of replacing so caller-provided metadata such as request IDs
+			// survives while the auth header is added for this unary RPC.
 			ctx = metadata.AppendToOutgoingContext(ctx, authorizationKey, "Bearer "+token)
 		}
 		return invoker(ctx, method, req, reply, cc, opts...)
@@ -103,9 +119,13 @@ func UnaryClientInterceptor(token string) grpc.UnaryClientInterceptor {
 func authorized(ctx context.Context, token string) bool {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
+		// Missing metadata is treated the same as a bad token so callers do not get
+		// different error details for probing authentication state.
 		return false
 	}
 	for _, value := range md.Get(authorizationKey) {
+		// Check every value because gRPC metadata can carry repeated authorization
+		// entries after interceptors or proxies append their own metadata.
 		presented := strings.TrimSpace(value)
 		if strings.HasPrefix(strings.ToLower(presented), "bearer ") {
 			// Strip using the original string so token case is preserved even
@@ -124,6 +144,8 @@ func authorized(ctx context.Context, token string) bool {
 // Length mismatches are rejected before the byte comparison; equal-length inputs
 // use subtle.ConstantTimeCompare to avoid data-dependent match timing.
 func constantTimeEqual(a, b string) bool {
+	// Rejecting length mismatches leaks only token length and avoids allocating or
+	// padding before the constant-time byte comparison.
 	if len(a) != len(b) {
 		return false
 	}

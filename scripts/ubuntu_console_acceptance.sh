@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# Runs the Ubuntu Console acceptance flow and packages all evidence for review.
+# The wrapper keeps command_status.jsonl as the authoritative step log while
+# allowing later diagnostics, summaries, and packaging to run after failures.
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/naming_guard.sh"
 RUN_ID="${LOGSERVE_CONSOLE_ACCEPTANCE_ID:-latest}"
@@ -32,6 +36,8 @@ mkdir -p "$RESULT_DIR"
 : > "$STATUS_FILE"
 cd "$ROOT" || exit 1
 
+# Allocate all loopback ports up front while sockets are still held, reducing
+# the chance that concurrent local processes collide with the compose stack.
 PORTS="$("$PYTHON_BOOTSTRAP" - <<'PY'
 import socket
 
@@ -50,6 +56,7 @@ PY
 read -r LOG_PORT CONTROL_PORT WEB_PORT POSTGRES_PORT NATS_PORT MINIO_API_PORT MINIO_CONSOLE_PORT <<< "$PORTS"
 BASE_URL="http://127.0.0.1:$WEB_PORT"
 
+# json_escape emits one shell argument as a JSON string fragment for status JSONL.
 json_escape() {
   "$PYTHON_BOOTSTRAP" - "$1" <<'PY'
 import json
@@ -58,6 +65,7 @@ print(json.dumps(sys.argv[1])[1:-1])
 PY
 }
 
+# record_status appends one command result and updates ANY_FAIL without aborting later diagnostics.
 record_status() {
   local name="$1"
   local code="$2"
@@ -73,6 +81,7 @@ record_status() {
   fi
 }
 
+# run_step executes a command into a log file, records duration and exit code, and leaves control flow to the caller.
 run_step() {
   local name="$1"
   local log="$2"
@@ -93,6 +102,7 @@ run_step() {
   return 0
 }
 
+# bool_enabled centralizes string flag parsing for LOGSERVE_CONSOLE_* toggles.
 bool_enabled() {
   case "${1:-0}" in
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
@@ -100,6 +110,7 @@ bool_enabled() {
   esac
 }
 
+# detect_compose accepts either Docker Compose v2 or the legacy docker-compose binary and records the selected command.
 detect_compose() {
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     COMPOSE_CMD=(docker compose)
@@ -115,6 +126,7 @@ detect_compose() {
   return 1
 }
 
+# compose invokes the selected Compose command with this run's env file, project name, and repository compose file.
 compose() {
   "${COMPOSE_CMD[@]}" \
     --env-file "$COMPOSE_ENV" \
@@ -123,10 +135,12 @@ compose() {
     "$@"
 }
 
+# compose_config_quiet supports both Compose flag spellings used by plugin and legacy variants.
 compose_config_quiet() {
   compose config --quiet || compose config -q
 }
 
+# write_server_environment captures host, toolchain, Docker, git, and working-tree context for later review.
 write_server_environment() {
   {
     echo "run_id=$RUN_ID"
@@ -152,12 +166,14 @@ write_server_environment() {
   } > "$RESULT_DIR/server_environment.txt"
 }
 
+# write_run_config persists runtime toggles so summarizers can distinguish skipped Docker/npm work from failures.
 write_run_config() {
   "$PYTHON_BOOTSTRAP" - "$RESULT_DIR/run_config.json" "$RUN_DOCKER" "$RUN_NPM_CI" "$BASE_URL" <<'PY'
 import json
 import sys
 from pathlib import Path
 
+# Store booleans as real JSON booleans so summarizers do not have to infer from raw env strings.
 def enabled(value):
     return str(value).lower() in {"1", "true", "yes", "on"}
 
@@ -171,6 +187,7 @@ path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 PY
 }
 
+# write_compose_env materializes per-run credentials and ports consumed by docker-compose.yml.
 write_compose_env() {
   cat > "$COMPOSE_ENV" <<EOF
 LOGSERVE_API_TOKEN=$API_TOKEN
@@ -193,6 +210,7 @@ LOGSERVE_DOCKER_GOSUMDB=${LOGSERVE_DOCKER_GOSUMDB:-sum.golang.org}
 EOF
 }
 
+# check_prerequisites validates required local tools and only requires Docker when RUN_DOCKER is enabled.
 check_prerequisites() {
   local missing=0
   for cmd in bash git go tar "$PYTHON_BOOTSTRAP" "$NPM_CMD"; do
@@ -217,14 +235,17 @@ check_prerequisites() {
   return "$missing"
 }
 
+# web_npm_ci installs frontend dependencies in the web workspace when npm install validation is enabled.
 web_npm_ci() {
   (cd "$ROOT/web" && "$NPM_CMD" ci)
 }
 
+# web_build verifies the frontend production build before any browser-facing compose probe runs.
 web_build() {
   (cd "$ROOT/web" && "$NPM_CMD" run build)
 }
 
+# wait_web_health polls the public health endpoint until the web container is serving API traffic.
 wait_web_health() {
   "$PYTHON_BOOTSTRAP" - "$BASE_URL" <<'PY'
 import json
@@ -250,6 +271,7 @@ sys.exit(1)
 PY
 }
 
+# wait_console_api polls the authenticated dashboard endpoint until control-plane data is reachable.
 wait_console_api() {
   "$PYTHON_BOOTSTRAP" - "$BASE_URL" "$API_TOKEN" <<'PY'
 import json
@@ -277,6 +299,7 @@ sys.exit(1)
 PY
 }
 
+# wait_console_worker waits for at least one worker row before the HTTP probe submits tasks and workflows.
 wait_console_worker() {
   "$PYTHON_BOOTSTRAP" - "$BASE_URL" "$API_TOKEN" <<'PY'
 import json
@@ -305,6 +328,7 @@ sys.exit(1)
 PY
 }
 
+# collect_compose_state snapshots ps and logs for failure analysis without failing cleanup if Docker is gone.
 collect_compose_state() {
   if [ "$COMPOSE_AVAILABLE" -eq 1 ]; then
     compose ps > "$RESULT_DIR/compose_ps.txt" 2>&1 || true
@@ -312,6 +336,7 @@ collect_compose_state() {
   fi
 }
 
+# cleanup collects final compose state and tears down the stack unless KEEP_STACK asks to preserve it.
 cleanup() {
   if [ "$COMPOSE_STARTED" -eq 1 ] && [ "$COMPOSE_AVAILABLE" -eq 1 ]; then
     collect_compose_state
@@ -320,10 +345,13 @@ cleanup() {
     fi
   fi
 }
+# Always run cleanup so failed validation still captures compose diagnostics and releases resources.
 trap cleanup EXIT
 
+# package_results archives the result directory while excluding secrets in console.env and the package being written.
 package_results() {
   local tmp_package="$RESULT_DIR/../.$(basename "$RESULT_DIR").tmp.tar.gz"
+  # Package through a sibling temp file so interrupted tar writes do not corrupt the final artifact.
   rm -f "$tmp_package" "$PACKAGE_PATH"
   tar \
     --exclude './console.env' \
@@ -340,6 +368,7 @@ package_results() {
   return "$code"
 }
 
+# write_acceptance_summary delegates final verdict construction to the Python console summarizer.
 write_acceptance_summary() {
   "$PYTHON_BOOTSTRAP" scripts/summarize_console_acceptance.py "$RESULT_DIR" > "$RESULT_DIR/acceptance_summary.log" 2>&1
   local code=$?
@@ -349,6 +378,7 @@ write_acceptance_summary() {
   return 0
 }
 
+# print_failure_context prints the generated summary when any command or summary generation failed.
 print_failure_context() {
   if [ "$ANY_FAIL" -eq 0 ] && [ "$SUMMARY_FAIL" -eq 0 ]; then
     return 0
@@ -360,6 +390,7 @@ print_failure_context() {
   fi
 }
 
+# Capture environment and run_config before checks so prereq failures still produce reviewable metadata.
 write_server_environment
 write_run_config
 run_step prerequisite_check "$RESULT_DIR/prerequisite_check.log" check_prerequisites
@@ -367,6 +398,7 @@ if [ "$ANY_FAIL" -ne 0 ]; then
   PREREQ_OK=0
 fi
 
+# Local web/backend checks run before Compose so fast failures do not require starting containers.
 if [ "$PREREQ_OK" -eq 1 ]; then
   run_step go_test_web "$RESULT_DIR/go_test_web.log" env -u LOGSERVE_API_TOKEN go test -count=1 ./cmd/logserve-web ./internal/webapi
   run_step go_vet_web "$RESULT_DIR/go_vet_web.log" go vet ./cmd/logserve-web ./internal/webapi
@@ -376,6 +408,8 @@ if [ "$PREREQ_OK" -eq 1 ]; then
   run_step web_build "$RESULT_DIR/web_build.log" web_build
   run_step python_script_tests "$RESULT_DIR/python_script_tests.log" "$PYTHON_BOOTSTRAP" -m unittest discover tests/scripts
 
+  # Docker probing is optional. Config/build are gated by LAST_STEP_CODE; after
+  # compose up is attempted, readiness probes and compose logs provide failure evidence.
   if bool_enabled "$RUN_DOCKER"; then
     write_compose_env
     run_step docker_compose_config "$RESULT_DIR/docker_compose_config.log" compose_config_quiet
@@ -396,6 +430,7 @@ if [ "$PREREQ_OK" -eq 1 ]; then
   fi
 fi
 
+# Write a pre-package summary, add package status, then rewrite so the final summary includes packaging evidence.
 write_acceptance_summary
 package_results
 write_acceptance_summary

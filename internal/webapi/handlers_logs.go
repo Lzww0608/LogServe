@@ -14,20 +14,23 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// maxLogReadLimit caps HTTP log reads and SSE batches before forwarding to logd.
 const maxLogReadLimit uint32 = 1000
 
 // logRecordDTO is the log explorer representation of one log record. Payload is
 // exposed as JSON, text, or base64 depending on its bytes.
 type logRecordDTO struct {
-	StreamID       string          `json:"stream_id"`
-	Seq            uint64          `json:"seq"`
-	EventType      string          `json:"event_type,omitempty"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
-	PayloadJSON    json.RawMessage `json:"payload_json,omitempty"`
-	PayloadText    string          `json:"payload_text,omitempty"`
-	PayloadBase64  string          `json:"payload_base64,omitempty"`
-	TimestampMs    int64           `json:"timestamp_ms,omitempty"`
-	CRC32          uint32          `json:"crc32,omitempty"`
+	StreamID       string `json:"stream_id"`
+	Seq            uint64 `json:"seq"`
+	EventType      string `json:"event_type,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	// Exactly one payload representation is populated: JSON for valid JSON bytes,
+	// text for UTF-8 non-JSON bytes, or base64 for binary payloads.
+	PayloadJSON   json.RawMessage `json:"payload_json,omitempty"`
+	PayloadText   string          `json:"payload_text,omitempty"`
+	PayloadBase64 string          `json:"payload_base64,omitempty"`
+	TimestampMs   int64           `json:"timestamp_ms,omitempty"`
+	CRC32         uint32          `json:"crc32,omitempty"`
 }
 
 // streamStatsDTO mirrors log-service stream stats for the log explorer UI.
@@ -65,6 +68,8 @@ func (s *Server) handleListLogStreams(w http.ResponseWriter, r *http.Request) {
 // handleReadLogStream reads a bounded page from one log stream and computes the
 // next sequence cursor used by the explorer.
 func (s *Server) handleReadLogStream(w http.ResponseWriter, r *http.Request) {
+	// net/http already unescapes PathValue once; avoid a second unescape so stream
+	// IDs that intentionally contain percent escapes are preserved.
 	streamID := r.PathValue("stream_id")
 	if streamID == "" {
 		writeErr(w, fmt.Errorf("%w: stream_id is required", errInvalidInput))
@@ -91,6 +96,8 @@ func (s *Server) handleReadLogStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// Stats are fetched after records so the response can expose both the returned
+	// page and a cursor relative to the log service's latest retained range.
 	stats, err := s.clients.Log.GetStreamStats(ctx, &logservepb.GetStreamStatsRequest{StreamId: streamID})
 	if err != nil {
 		writeErr(w, err)
@@ -170,6 +177,8 @@ func logRecordDTOFromProto(record *logservepb.LogRecord) logRecordDTO {
 	if len(payload) == 0 {
 		return out
 	}
+	// Prefer JSON when possible because many LogServe payloads are structured event
+	// bodies; fall through to text/base64 without dropping undecodable bytes.
 	if json.Valid(payload) {
 		out.PayloadJSON = append(json.RawMessage(nil), payload...)
 		return out

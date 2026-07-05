@@ -60,6 +60,8 @@ func (s *Server) handleSubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// definition_json takes precedence for callers that already serialized the
+	// workflow; definition remains for older console payloads.
 	definition := defaultRaw(input.DefinitionJSON, input.Definition)
 	if err := validateRawJSON("definition", definition, maxSourceBytes); err != nil {
 		writeErr(w, err)
@@ -126,6 +128,8 @@ func (s *Server) handleValidateWorkflow(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, err)
 		return
 	}
+	// definition_json takes precedence for callers that already serialized the
+	// workflow; definition remains for older console payloads.
 	definition := defaultRaw(input.DefinitionJSON, input.Definition)
 	if err := validateRawJSON("definition", definition, maxSourceBytes); err != nil {
 		writeErr(w, err)
@@ -133,6 +137,8 @@ func (s *Server) handleValidateWorkflow(w http.ResponseWriter, r *http.Request) 
 	}
 	def, err := workflow.ParseDefinition(definition)
 	if err != nil {
+		// Validation is a form-style endpoint: malformed workflow definitions are
+		// returned as a valid HTTP response with valid=false instead of writeErr.
 		writeJSON(w, map[string]any{
 			"valid":   false,
 			"message": err.Error(),
@@ -146,8 +152,8 @@ func (s *Server) handleValidateWorkflow(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// waitWorkflow polls workflow status until completion/failure or timeout,
-// returning the latest observed workflow on timeout.
+// waitWorkflow polls workflow status until completion/failure or timeout. On
+// timeout it returns the latest observed workflow together with the context error.
 func (s *Server) waitWorkflow(r *http.Request, workflowID string, timeout time.Duration) (WorkflowDTO, error) {
 	ctx, cancel := requestContext(r, timeout)
 	defer cancel()

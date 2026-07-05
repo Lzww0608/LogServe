@@ -25,10 +25,12 @@ import (
 // fakeClientConn is an in-memory grpc.ClientConnInterface used to exercise webapi
 // handlers without starting real control or log services.
 type fakeClientConn struct {
-	dashboard          *logservepb.DashboardSnapshot
-	taskStatus         *logservepb.GetTaskStatusResponse
-	workflowStatus     *logservepb.GetWorkflowStatusResponse
-	submitTask         *logservepb.SubmitTaskResponse
+	// Canned control-plane responses returned by Invoke.
+	dashboard      *logservepb.DashboardSnapshot
+	taskStatus     *logservepb.GetTaskStatusResponse
+	workflowStatus *logservepb.GetWorkflowStatusResponse
+	submitTask     *logservepb.SubmitTaskResponse
+	// Captured requests let tests assert what would have been sent to backends.
 	submitTaskReqs     []*logservepb.SubmitTaskRequest
 	streams            *logservepb.ListStreamsResponse
 	readLog            *logservepb.ReadLogResponse
@@ -39,13 +41,17 @@ type fakeClientConn struct {
 	statsReqs          []*logservepb.GetStreamStatsRequest
 	setBackpressureReq *logservepb.SetBackpressureRequest
 	appendLogReqs      []*logservepb.AppendLogRequest
-	calls              []string
+	// Product RPC tracking excludes audit append calls so tests can distinguish
+	// protected actions from best-effort audit side effects.
+	calls []string
 }
 
 // Invoke records the method/request and fills canned protobuf responses for the
 // subset of RPCs covered by webapi tests.
 func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply any, _ ...grpc.CallOption) error {
 	if method == logservepb.LogService_AppendLog_FullMethodName {
+		// Audit appends are captured separately and are not counted as product RPCs
+		// in f.calls, keeping authorization tests focused on the protected action.
 		if in, ok := req.(*logservepb.AppendLogRequest); ok {
 			f.appendLogReqs = append(f.appendLogReqs, proto.Clone(in).(*logservepb.AppendLogRequest))
 		}
@@ -139,6 +145,8 @@ func (f *fakeClientConn) Invoke(_ context.Context, method string, req any, reply
 			return errors.New("unexpected read log reply type")
 		}
 		if f.readLog != nil {
+			// Simulate logd's from_seq/limit behavior closely enough for pagination,
+			// registry tailing, and SSE cursor tests.
 			limit := int(in.GetLimit())
 			if limit <= 0 {
 				limit = len(f.readLog.GetRecords())
@@ -1518,6 +1526,8 @@ func newRoleTestServer(conn *fakeClientConn, tokens map[role]string) *Server {
 	}
 	s := &Server{
 		cfg: Config{
+			// Tests pass explicit role tokens and fake backend clients, so they bypass
+			// NewServer's APIToken normalization while still exercising route RBAC.
 			RoleTokens:           tokens,
 			AllowUnauthenticated: false,
 			RequestTimeout:       time.Second,

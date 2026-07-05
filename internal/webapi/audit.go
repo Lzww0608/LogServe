@@ -16,8 +16,10 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// auditStreamID is the shared log stream used for web-console audit records.
 const auditStreamID = "system:audit"
 
+// fallbackRequestIDCounter makes fallback request IDs unique if crypto/rand fails.
 var fallbackRequestIDCounter uint64
 
 // requestIDContextKey stores the normalized request ID on API request contexts.
@@ -26,13 +28,16 @@ type requestIDContextKey struct{}
 // statusRecorder captures the first HTTP status written by a handler for audit
 // reporting.
 type statusRecorder struct {
+	// ResponseWriter receives the real writes; the wrapper only observes status.
 	http.ResponseWriter
+	// status records the first status code observed. Zero means no write yet.
 	status int
 }
 
 // flushingStatusRecorder restores http.Flusher on top of statusRecorder for SSE
 // and other streaming responses.
 type flushingStatusRecorder struct {
+	// statusRecorder keeps status capture while this type re-advertises Flush.
 	*statusRecorder
 }
 
@@ -101,6 +106,8 @@ func (s *Server) auditFrontendOperation(r *http.Request, principal authPrincipal
 	if err != nil {
 		return
 	}
+	// Audit uses a short background context so a client disconnect after handler
+	// completion does not cancel the best-effort append.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, _ = s.clients.Log.AppendLog(ctx, &logservepb.AppendLogRequest{
@@ -143,6 +150,8 @@ func newRequestID() string {
 // auditIdempotencyKey makes repeated audit writes for the same frontend request
 // collapse in the log store idempotency layer.
 func auditIdempotencyKey(requestID, action string, r *http.Request) string {
+	// Include method and escaped path so two actions in the same request, such as a
+	// template run plus model registration, do not collapse into the same audit row.
 	return fmt.Sprintf("%s:%s:%s:%s", requestID, r.Method, action, r.URL.EscapedPath())
 }
 

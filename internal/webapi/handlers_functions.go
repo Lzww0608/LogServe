@@ -13,6 +13,7 @@ import (
 	"github.com/logserve/logserve/gen/logservepb"
 )
 
+// functionRegistryStreamID is the append-only log stream for function metadata.
 const functionRegistryStreamID = "system:functions"
 
 // FunctionDTO describes a registered function source as discovered from the
@@ -35,9 +36,13 @@ type functionRegistrySnapshot struct {
 // functionRegistryCache tails the function registry stream incrementally and
 // stores the latest record for each function hash.
 type functionRegistryCache struct {
-	mu             sync.Mutex
-	byHash         map[string]FunctionDTO
-	nextSeq        uint64
+	// mu protects all cache fields while a request tails the registry stream.
+	mu sync.Mutex
+	// byHash stores the latest valid registry event for each function hash.
+	byHash map[string]FunctionDTO
+	// nextSeq is the next unread system:functions sequence for incremental tailing.
+	nextSeq uint64
+	// invalidRecords counts malformed registry records skipped since process start.
 	invalidRecords uint64
 }
 
@@ -102,6 +107,8 @@ func (s *Server) functionRegistry(r *http.Request) (functionRegistrySnapshot, er
 		cache.nextSeq = 1
 	}
 
+	// Hold the cache lock across tail reads so concurrent requests cannot race the
+	// nextSeq cursor and duplicate work or skip records.
 	fromSeq := cache.nextSeq
 	for {
 		records, err := s.clients.Log.ReadLog(ctx, &logservepb.ReadLogRequest{
@@ -117,6 +124,8 @@ func (s *Server) functionRegistry(r *http.Request) (functionRegistrySnapshot, er
 			break
 		}
 		for _, record := range batch {
+			// system:functions may grow additional event types; only registration events
+			// update the cache, while malformed registrations are counted below.
 			if record.GetEventType() != "FunctionRegistered" {
 				continue
 			}

@@ -98,6 +98,8 @@ func (s *Server) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 	argsJSON := []byte(input.ArgsJSON)
 	var err error
 	if len(argsJSON) == 0 {
+		// Prefer structured args/kwargs for normal UI requests, but preserve args_json
+		// when callers already built the executor envelope themselves.
 		argsJSON, err = envelopeArgs(input.Args, input.Kwargs)
 		if err != nil {
 			writeErr(w, err)
@@ -201,6 +203,8 @@ func (s *Server) handleTaskSubmitOperation(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Use a fresh console-scoped idempotency key so retry/resubmit does not collide
+	// with the original submission or with another manual operation on the same task.
 	resp, err := s.clients.Control.SubmitTask(ctx, &logservepb.SubmitTaskRequest{
 		TaskName:       spec.GetTaskName(),
 		FunctionName:   spec.GetFunctionName(),
@@ -233,6 +237,8 @@ func (s *Server) readTaskSubmittedSpec(ctx context.Context, taskID string) (*log
 		return nil, err
 	}
 	for _, record := range resp.GetRecords() {
+		// The task stream can contain lifecycle events before/after submission; only
+		// TaskSubmitted carries the original TaskSpec needed for reconstruction.
 		if record.GetEventType() != "TaskSubmitted" {
 			continue
 		}
@@ -263,6 +269,8 @@ func unmarshalTaskSubmittedSpec(data []byte) (*logservepb.TaskSpec, error) {
 	}
 	decoded := &logservepb.TaskSpec{}
 	if encoded {
+		// Newer logs store the protobuf TaskSpec bytes inside the eventcodec envelope;
+		// an absent field falls through as an empty spec to preserve historical behavior.
 		specData := eventcodec.BytesValue(fields["task_spec"])
 		if len(specData) == 0 {
 			return decoded, nil
@@ -351,8 +359,8 @@ func mergeTaskDTO(primary, metadata TaskDTO) TaskDTO {
 	return primary
 }
 
-// waitTask polls task status until a terminal state or timeout, returning the
-// latest observed state on timeout.
+// waitTask polls task status until a terminal state or timeout. On timeout it
+// returns the latest observed state together with the context error.
 func (s *Server) waitTask(r *http.Request, taskID string, timeout time.Duration) (TaskDTO, error) {
 	ctx, cancel := requestContext(r, timeout)
 	defer cancel()
@@ -389,6 +397,8 @@ func waitTimeout(r *http.Request, fallback time.Duration) time.Duration {
 	}
 	var parsed int64
 	if _, err := fmt.Sscan(value, &parsed); err != nil || parsed <= 0 {
+		// Bad timeout values are treated as omitted so callers cannot accidentally
+		// force a zero-timeout wait loop.
 		return fallback
 	}
 	return time.Duration(parsed) * time.Millisecond

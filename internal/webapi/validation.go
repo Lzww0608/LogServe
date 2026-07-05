@@ -87,6 +87,7 @@ func schedulingPolicyString(policy logservepb.SchedulingPolicy) string {
 // control-plane enum value.
 func parseSchedulingPolicy(value string) (logservepb.SchedulingPolicy, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
+	// Empty input preserves the console default: locality-aware scheduling.
 	case "", "locality-aware", "locality_aware", "locality aware":
 		return logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE, nil
 	case "resource-only", "resource_only", "resource only":

@@ -243,7 +243,7 @@ len(resultJSON) > resultInlineThreshold
 
 metadata view 是 current state。它可以从 shared log 重新 materialize。比如 PostgreSQL 表没了，control 重启后可以通过 `TaskSubmitted`、`WorkflowStarted`、`StepSucceeded`、`ActorCommandApplied` 等事件重建 view。
 
-object store 不一样。shared log 只保存 `result_ref` 或 `snapshot_ref`，不会保存完整大对象。如果 object store 里的对象被删了，日志仍然能说明“这里曾经有一个大结果”，但拿不到结果内容。workflow replay 可能能恢复 step 已成功的事实，却无法解析上游大结果；actor replay 如果依赖 snapshot，也可能因为 snapshot 对象缺失而失败。
+object store 不一样。shared log 只保存 `result_ref` 或 `snapshot_ref`，不会保存完整大对象。如果 object store 里的对象被删了，日志仍然能说明“这里曾经有一个大结果”，但拿不到结果内容。workflow replay 可能恢复 step 已成功的事实，却无法解析上游大结果；actor replay 如果依赖 snapshot，也可能因为 snapshot 对象缺失而失败。
 
 所以持久化边界可以这样分：
 

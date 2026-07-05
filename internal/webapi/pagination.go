@@ -10,9 +10,12 @@ import (
 	"strings"
 )
 
+// Shared list limits keep dashboard-derived list endpoints small and predictable.
 const (
+	// defaultListLimit is used when callers omit limit.
 	defaultListLimit = 50
-	maxListLimit     = 100
+	// maxListLimit bounds in-memory slices returned by list endpoints.
+	maxListLimit = 100
 )
 
 // paginationParams stores the bounded list limit and integer offset token parsed
@@ -51,6 +54,8 @@ func parsePaginationParams(r *http.Request, totalCount int) (paginationParams, e
 		limit = parsed
 	}
 	offset := 0
+	// Page tokens are plain integer offsets because every list endpoint first
+	// materializes an in-memory dashboard-derived slice before pagination.
 	rawToken := strings.TrimSpace(r.URL.Query().Get("page_token"))
 	if rawToken != "" {
 		parsed, err := strconv.Atoi(rawToken)

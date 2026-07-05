@@ -1,24 +1,30 @@
+# Keep local VCS state and Go caches out of the Docker build context.
 .git
 .gocache
 .gomodcache
 .gopath
+
+# Python smoke tests and SDK runs create local environments and bytecode caches.
 .venv
 venv
 __pycache__
 *.pyc
 .pytest_cache
 
+# Runtime data, generated reports, and dashboard snapshots are reproduced by local runs.
 bin
 data
 reports
 benchmarks
 dashboard/snapshot.json
 
+# Go test binaries, coverage, and profiles should not be copied into images.
 *.test
 *.test.exe
 *.out
 *.pprof
 
+# Frontend dependencies and build outputs are restored during web builds.
 web/node_modules
 web/dist
 *.tsbuildinfo

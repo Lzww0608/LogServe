@@ -1,4 +1,7 @@
 # High-level Python SDK client surface for submitting tasks, workflows, actors, and LLM requests.
+#
+# This module keeps the public Python API transport-agnostic: the same payload
+# dictionaries can be sent through direct gRPC or the logservectl JSON bridge.
 import hashlib
 import inspect
 import json
@@ -43,18 +46,24 @@ class ActorHandle:
 
 
 # LogServeClient wraps the selected control transport with Python-friendly APIs.
+# Empty idempotency keys are intentional: the SDK leaves deduplication opt-in for callers.
 class LogServeClient:
     # Resolve the control-plane address and transport once per client instance.
     def __init__(self, address=None, transport=None):
         self.address = address or os.environ.get("LOGSERVE_CONTROL_ADDR", "127.0.0.1:50052")
+        # Tests and embedders can inject a transport; normal callers use the auto-selected backend.
         self.transport = transport or _default_transport(self.address)
 
     # Submit a decorated or plain Python function and wait for its task result.
     def submit(self, fn, *args, idempotency_key=None, **kwargs):
+        # Keep submit() as the single user entrypoint: workflow-decorated callables
+        # are traced into DAG definitions, while regular functions become task specs.
         if getattr(fn, "_logserve_workflow", False):
             return self.submit_workflow(fn, *args, idempotency_key=idempotency_key, **kwargs)
         # Capture only the original function source so wrappers/decorators do not leak into worker code.
         source = textwrap.dedent(inspect.getsource(inspect.unwrap(fn)))
+        # The content hash lets workers avoid re-sending already-known source and
+        # validates object-store-backed source before execution.
         payload = {
             "task_name": getattr(fn, "__name__", "task"),
             "function_name": getattr(fn, "__name__", "task"),
@@ -73,6 +82,7 @@ class LogServeClient:
     def create_actor(self, cls, *args, snapshot_every=None, idempotency_key=None, **kwargs):
         source = textwrap.dedent(inspect.getsource(cls))
         if snapshot_every is None:
+            # Actor classes can declare a default snapshot cadence through @actor(snapshot_every=...).
             snapshot_every = getattr(cls, "_logserve_snapshot_every", 25)
         payload = {
             "class_name": getattr(cls, "__name__", "Actor"),
@@ -210,6 +220,7 @@ class CLIControlTransport:
             return _run_payload_command(command, payload)
         if command in self._FLAG_COMMANDS:
             flag, field = self._FLAG_COMMANDS[command]
+            # Status/replay commands use flags so the CLI shape matches interactive logservectl usage.
             return _run_json_command(_ctl_command() + [command, flag, payload[field]])
         if command == "dashboard-snapshot":
             return _run_json_command(_ctl_command() + [command])
@@ -268,6 +279,8 @@ def llm_generate(
 ):
     ctx = current_trace_context()
     if ctx is not None:
+        # During workflow tracing, LLM calls become synthetic DAG steps instead of
+        # immediate RPCs, preserving data dependencies on prior StepRef outputs.
         return ctx.add_llm_step(
             model_name,
             prompt,
@@ -343,6 +356,7 @@ def _build_workflow_definition(fn, args, kwargs):
 
     steps = []
     for step in ctx.steps:
+        # Copy traced step dictionaries before normalizing source/hash so the trace context stays reusable for debugging.
         step = dict(step)
         step["function_source"] = textwrap.dedent(step["function_source"])
         if step["function_source"]:
@@ -371,6 +385,7 @@ def _source_hash(source):
 
 # Construct a fresh default client for module-level convenience functions.
 def _default_client():
+    # Avoid a hidden singleton so tests can patch this helper without shared transport state leaking across cases.
     return LogServeClient()
 
 
@@ -392,6 +407,7 @@ def _default_transport(address):
 
 # Run a stdin-JSON logservectl command and decode its JSON stdout.
 def _run_payload_command(command, payload):
+    # logservectl payload commands speak stdin JSON and stdout JSON, matching the Go CLI integration contract.
     completed = subprocess.run(
         _ctl_command() + [command],
         cwd=_repo_root(),
@@ -425,6 +441,8 @@ def _run_json_command(command):
 def _ctl_command():
     cli = os.environ.get("LOGSERVE_CLI")
     if cli:
+        # Treat LOGSERVE_CLI as a single executable path; callers that need extra
+        # wrapper arguments should provide their own transport object.
         return [cli]
     return ["go", "run", str(_repo_root() / "cmd" / "logservectl")]
 

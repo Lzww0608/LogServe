@@ -1,5 +1,8 @@
 package integration
 
+// This file exercises actor execution through the integration stack, including
+// snapshot recovery, log compaction, mailbox serialization, and replay checks.
+
 import (
 	"context"
 	"encoding/json"
@@ -12,6 +15,9 @@ import (
 	actorpkg "github.com/logserve/logserve/internal/actor"
 )
 
+// TestActorCounterRecoverySnapshotAndReplay drives a counter actor through enough
+// commands to create a snapshot, restarts execution on another worker, and checks
+// replay plus compacted log ordering.
 func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -25,6 +31,8 @@ func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 	}()
 	waitForWorkerRegistered(t, env.controlClient, "actor-worker-1")
 
+	// snapshotEvery is lower than the command count so the test can assert both
+	// snapshot creation and reduced replay work.
 	created := createCounterActor(t, env.controlClient, 20)
 	for i := 1; i <= 100; i++ {
 		resp := callActor(t, env.controlClient, created.GetActorId(), "inc", nil)
@@ -49,6 +57,8 @@ func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 	defer secondCancel()
 	go runWorkerForTest(secondCtx, t, env, "actor-worker-2", 0)
 	waitForWorkerRegistered(t, env.controlClient, "actor-worker-2")
+	// Allow the replacement worker to observe and recover the idle actor before the
+	// next call checks epoch advancement.
 	time.Sleep(900 * time.Millisecond)
 
 	getResp := callActor(t, env.controlClient, created.GetActorId(), "get", nil)
@@ -78,6 +88,8 @@ func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// After trimming, only the compacted tail and snapshot event should remain in
+	// the actor stream; creation is represented by the snapshot state.
 	if got := countWorkflowEvent(records.GetRecords(), "ActorCreated"); got != 0 {
 		t.Fatalf("ActorCreated events after trim = %d, want 0", got)
 	}
@@ -105,6 +117,9 @@ func TestActorCounterRecoverySnapshotAndReplay(t *testing.T) {
 	}
 }
 
+// TestActorConcurrentMailboxSerializes1000Increments submits many concurrent
+// calls to one actor and verifies the mailbox serializes all increments exactly
+// once.
 func TestActorConcurrentMailboxSerializes1000Increments(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -117,6 +132,8 @@ func TestActorConcurrentMailboxSerializes1000Increments(t *testing.T) {
 	created := createCounterActor(t, env.controlClient, 200)
 	var wg sync.WaitGroup
 	errs := make(chan error, 1000)
+	// The goroutines intentionally share one actor ID; correctness depends on the
+	// actor mailbox, not client-side ordering.
 	for i := 0; i < 1000; i++ {
 		wg.Add(1)
 		go func() {
@@ -146,6 +163,8 @@ func TestActorConcurrentMailboxSerializes1000Increments(t *testing.T) {
 	}
 }
 
+// createCounterActor registers the embedded Python Counter class and returns the
+// actor id used by recovery and concurrency tests.
 func createCounterActor(t *testing.T, client logservepb.ControlServiceClient, snapshotEvery uint32) *logservepb.CreateActorResponse {
 	t.Helper()
 	resp, err := client.CreateActor(context.Background(), &logservepb.CreateActorRequest{
@@ -161,6 +180,8 @@ func createCounterActor(t *testing.T, client logservepb.ControlServiceClient, sn
 	return resp
 }
 
+// callActor invokes one actor method and fails the test if the control plane or
+// actor runtime reports an unsuccessful task status.
 func callActor(t *testing.T, client logservepb.ControlServiceClient, actorID, method string, args []any) *logservepb.CallActorResponse {
 	t.Helper()
 	resp, err := client.CallActor(context.Background(), &logservepb.CallActorRequest{
@@ -178,6 +199,8 @@ func callActor(t *testing.T, client logservepb.ControlServiceClient, actorID, me
 	return resp
 }
 
+// actorArgs encodes the args/kwargs envelope expected by the Python actor runtime.
+// A nil variadic slice is normalized to an empty args array for stable JSON shape.
 func actorArgs(t *testing.T, args ...any) []byte {
 	t.Helper()
 	if args == nil {
@@ -190,6 +213,8 @@ func actorArgs(t *testing.T, args ...any) []byte {
 	return data
 }
 
+// counterSource returns the minimal Python actor class used by the actor runtime
+// tests.
 func counterSource() string {
 	return `
 from logserve import actor
@@ -208,8 +233,12 @@ class Counter:
 `
 }
 
+// assertActorCommandSubmittedBeforeApplied verifies each applied actor command has
+// a prior submitted event with the same command sequence.
 func assertActorCommandSubmittedBeforeApplied(t *testing.T, records []*logservepb.LogRecord) {
 	t.Helper()
+	// Store the first submitted index per command sequence so ordering can be
+	// checked even after log compaction leaves only a tail of command events.
 	submittedAt := map[uint64]int{}
 	for i, rec := range records {
 		if rec.GetEventType() != "ActorCommandSubmitted" && rec.GetEventType() != "ActorCommandApplied" {

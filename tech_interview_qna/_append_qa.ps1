@@ -1,5 +1,8 @@
+# One-shot helper for appending the Q001-Q004 system-design interview batch.
+# Run only when the target markdown file does not already contain this batch; AppendAllText does not deduplicate.
 $file = "F:\Code\Go-Programming\LogServe\tech_interview_qna\52_system_design_fundamentals_high_availability_capacity_planning.md"
 
+# Keep the payload in a literal here-string so Markdown fences, quotes, and backslashes stay byte-for-byte literal.
 $q001to004 = @'
 
 ## Q001. 系统设计面试中如何澄清需求？
@@ -244,5 +247,6 @@ PostgreSQL 默认 max_connections = 100 -> 需要调大或用连接池
 
 '@
 
+# Use UTF-8 without BOM to match the repository markdown files and avoid Windows PowerShell legacy encodings.
 [System.IO.File]::AppendAllText($file, $q001to004, [System.Text.UTF8Encoding]::new($false))
 Write-Output "Q001-Q004 appended successfully"

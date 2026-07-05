@@ -1,5 +1,6 @@
 // Error and loading primitives shared by route pages.
 
+// Render a full-width route error panel.
 export function ErrorPanel({ message }: { message: string }) {
   return <section className="panel error-panel">{message}</section>;
 }

@@ -1,5 +1,9 @@
 package integration
 
+// This file covers LLM task scheduling and replay behavior, including locality,
+// predicted latency, model registry validation, checkpoint caching, and workflow
+// steps that delegate to the mock LLM adapter.
+
 import (
 	"context"
 	"encoding/json"
@@ -13,7 +17,12 @@ import (
 	"github.com/logserve/logserve/internal/worker"
 )
 
+// TestLLMLocalityAwareSchedulerPrefersCachedWorker contrasts resource-only and
+// locality-aware policies to prove cached-model workers are preferred when the
+// policy allows waiting for them.
 func TestLLMLocalityAwareSchedulerPrefersCachedWorker(t *testing.T) {
+	// The resource-only environment establishes the baseline: the first idle poller
+	// can receive the LLM task even if it lacks the requested cached model.
 	resourceEnv := startWorkflowEnv(t)
 	defer resourceEnv.stop()
 	registerLLMWorkers(t, resourceEnv.controlClient)
@@ -29,6 +38,8 @@ func TestLLMLocalityAwareSchedulerPrefersCachedWorker(t *testing.T) {
 		t.Fatalf("resource-only should assign first idle poller; poll=%v task=%s", resourcePoll, resourceTask.GetTaskId())
 	}
 
+	// Use a fresh environment for locality-aware scheduling so the baseline poll
+	// does not leave task or worker state behind.
 	localityEnv := startWorkflowEnv(t)
 	defer localityEnv.stop()
 	registerLLMWorkers(t, localityEnv.controlClient)
@@ -55,6 +66,9 @@ func TestLLMLocalityAwareSchedulerPrefersCachedWorker(t *testing.T) {
 	}
 }
 
+// TestLLMPredictedLatencySchedulerUsesObservedHistory seeds prior LLM completion
+// metrics and verifies the predicted-latency policy waits for the historically
+// faster worker.
 func TestLLMPredictedLatencySchedulerUsesObservedHistory(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -82,6 +96,8 @@ func TestLLMPredictedLatencySchedulerUsesObservedHistory(t *testing.T) {
 	}
 }
 
+// TestLLMSubmitRequiresRegisteredModel checks SubmitLLM rejects requests for
+// models that are not present in the control-plane model registry.
 func TestLLMSubmitRequiresRegisteredModel(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -97,6 +113,8 @@ func TestLLMSubmitRequiresRegisteredModel(t *testing.T) {
 	}
 }
 
+// recordLLMObservation creates a completed LLM task and appends a synthetic
+// LLMCompleted event so scheduler tests can control historical latency inputs.
 func recordLLMObservation(t *testing.T, env *workflowTestEnv, workerID, modelName, modelVersion string, cacheHit bool, totalLatencyMs, modelLoadMs, checkpointFetchMs int64) {
 	t.Helper()
 	submitted := submitLLMForTest(t, env.controlClient, modelName, "history")
@@ -108,6 +126,8 @@ func recordLLMObservation(t *testing.T, env *workflowTestEnv, workerID, modelNam
 		t.Fatalf("history observation poll by %s = %v, want task %s", workerID, poll, submitted.GetTaskId())
 	}
 	taskID := poll.GetTask().GetTaskId()
+	// The synthetic payload mirrors the production LLMCompleted fields consumed by
+	// scheduler history and ReplayLLM, without starting a worker.
 	payload, err := json.Marshal(map[string]any{
 		"task_id":             taskID,
 		"model_name":          modelName,
@@ -141,6 +161,8 @@ func recordLLMObservation(t *testing.T, env *workflowTestEnv, workerID, modelNam
 	}
 }
 
+// TestLLMReplayRecordsModelLoadAndCompletion runs the mock LLM adapter through a
+// worker and verifies ReplayLLM reconstructs load, completion, and latency fields.
 func TestLLMReplayRecordsModelLoadAndCompletion(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -181,6 +203,9 @@ func TestLLMReplayRecordsModelLoadAndCompletion(t *testing.T) {
 	}
 }
 
+// TestLLMCheckpointCacheFetchThenHit verifies the first checkpoint-backed model
+// request fetches from the source directory and the second request hits the local
+// worker cache.
 func TestLLMCheckpointCacheFetchThenHit(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -189,6 +214,8 @@ func TestLLMCheckpointCacheFetchThenHit(t *testing.T) {
 
 	sourceDir := t.TempDir()
 	cacheDir := t.TempDir()
+	// Write enough bytes to exercise cache accounting while keeping the fixture
+	// small enough for fast integration tests.
 	writeLLMCheckpoint(t, sourceDir, "model-A", "v1", []byte(strings.Repeat("checkpoint", 256)))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -247,6 +274,9 @@ func TestLLMCheckpointCacheFetchThenHit(t *testing.T) {
 	}
 }
 
+// TestLocalityAwareImprovesSchedulingExperimentMetrics uses a manual experiment
+// harness to assert locality-aware scheduling improves cache, cold-start, and
+// tail-latency metrics over resource-only assignment.
 func TestLocalityAwareImprovesSchedulingExperimentMetrics(t *testing.T) {
 	resource := runManualSchedulingExperiment(t, logservepb.SchedulingPolicy_SCHEDULING_POLICY_RESOURCE_ONLY)
 	locality := runManualSchedulingExperiment(t, logservepb.SchedulingPolicy_SCHEDULING_POLICY_LOCALITY_AWARE)
@@ -263,6 +293,8 @@ func TestLocalityAwareImprovesSchedulingExperimentMetrics(t *testing.T) {
 	}
 }
 
+// TestRAGWorkflowCanUseMockLLM runs a workflow whose final step is an LLM task and
+// verifies the mock adapter result flows back into workflow status.
 func TestRAGWorkflowCanUseMockLLM(t *testing.T) {
 	env := startWorkflowEnv(t)
 	defer env.stop()
@@ -284,6 +316,8 @@ func TestRAGWorkflowCanUseMockLLM(t *testing.T) {
 	}
 }
 
+// experimentMetrics is the compact result set produced by the manual scheduling
+// experiment; AssignedTasks is retained for debugging even when not asserted.
 type experimentMetrics struct {
 	CacheHitRate  float64
 	ColdStartMs   int64
@@ -292,6 +326,9 @@ type experimentMetrics struct {
 	AssignedTasks []string
 }
 
+// runManualSchedulingExperiment submits a fixed sequence of LLM tasks and manually
+// polls workers in a cold-to-hot order so policy choices translate into measurable
+// cache-hit and latency differences.
 func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPolicy) experimentMetrics {
 	t.Helper()
 	env := startWorkflowEnv(t)
@@ -305,6 +342,8 @@ func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPol
 	var coldStartMs int64
 	latencies := make([]int64, 0, requests)
 	assigned := make([]string, 0, requests)
+	// Poll cold workers before the cached worker; locality-aware policy should hold
+	// the task until worker-1 asks, while resource-only can assign earlier.
 	pollOrder := []string{"worker-2", "worker-3", "worker-1"}
 	for i := 0; i < requests; i++ {
 		submitLLMForTest(t, env.controlClient, "model-A", "hello")
@@ -336,6 +375,8 @@ func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPol
 			t.Fatal(err)
 		}
 		assigned = append(assigned, worker)
+		// The experiment uses deterministic synthetic latencies: cached assignments
+		// are fast, while cold assignments pay a fixed 100ms model-load cost.
 		cacheHit := worker == "worker-1"
 		if cacheHit {
 			hits++
@@ -354,6 +395,8 @@ func runManualSchedulingExperiment(t *testing.T, policy logservepb.SchedulingPol
 	}
 }
 
+// registerLLMWorkers registers three workers with different cached-model states
+// used by locality and predicted-latency scheduler tests.
 func registerLLMWorkers(t *testing.T, client logservepb.ControlServiceClient) {
 	t.Helper()
 	for _, worker := range []struct {
@@ -374,6 +417,8 @@ func registerLLMWorkers(t *testing.T, client logservepb.ControlServiceClient) {
 	}
 }
 
+// registerTestModels adds the mock model registry entries required before SubmitLLM
+// requests are accepted.
 func registerTestModels(t *testing.T, client logservepb.ControlServiceClient) {
 	t.Helper()
 	for _, model := range []*logservepb.ModelInfo{
@@ -386,6 +431,8 @@ func registerTestModels(t *testing.T, client logservepb.ControlServiceClient) {
 	}
 }
 
+// setPolicy switches the scheduler policy through the control-plane API and fails
+// the test if the setting is rejected.
 func setPolicy(t *testing.T, client logservepb.ControlServiceClient, policy logservepb.SchedulingPolicy) {
 	t.Helper()
 	if _, err := client.SetSchedulingPolicy(context.Background(), &logservepb.SetSchedulingPolicyRequest{Policy: policy}); err != nil {
@@ -393,6 +440,8 @@ func setPolicy(t *testing.T, client logservepb.ControlServiceClient, policy logs
 	}
 }
 
+// submitLLMForTest submits a mock-adapter LLM request with stable defaults used by
+// scheduling and replay tests.
 func submitLLMForTest(t *testing.T, client logservepb.ControlServiceClient, model, prompt string) *logservepb.SubmitLLMResponse {
 	t.Helper()
 	resp, err := client.SubmitLLM(context.Background(), &logservepb.SubmitLLMRequest{
@@ -408,6 +457,8 @@ func submitLLMForTest(t *testing.T, client logservepb.ControlServiceClient, mode
 	return resp
 }
 
+// waitTask polls a task until it reaches the expected status, failing early on an
+// unexpected FAILED state to surface the worker error.
 func waitTask(t *testing.T, client logservepb.ControlServiceClient, taskID string, want logservepb.TaskStatus) *logservepb.GetTaskStatusResponse {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -430,6 +481,8 @@ func waitTask(t *testing.T, client logservepb.ControlServiceClient, taskID strin
 	return nil
 }
 
+// runWorkerForTestWithModels starts a worker with an explicit cached-model list so
+// LLM scheduler tests can exercise locality decisions.
 func runWorkerForTestWithModels(ctx context.Context, t *testing.T, env *workflowTestEnv, workerID string, cachedModels []string, maxTasks int) {
 	t.Helper()
 	ensureExecutorDeps(t)
@@ -448,9 +501,13 @@ func runWorkerForTestWithModels(ctx context.Context, t *testing.T, env *workflow
 	}
 }
 
+// runWorkerForTestWithConfig fills test-server defaults into a worker config while
+// preserving caller-provided LLM cache and pool settings.
 func runWorkerForTestWithConfig(ctx context.Context, t *testing.T, env *workflowTestEnv, cfg worker.Config) {
 	t.Helper()
 	ensureExecutorDeps(t)
+	// Defaults are applied only when the caller leaves fields unset, so tests can
+	// override cache directories, capacities, and max task counts independently.
 	if cfg.WorkerID == "" {
 		cfg.WorkerID = "worker"
 	}
@@ -467,6 +524,8 @@ func runWorkerForTestWithConfig(ctx context.Context, t *testing.T, env *workflow
 	}
 }
 
+// writeLLMCheckpoint creates the directory layout expected by the worker's model
+// checkpoint loader.
 func writeLLMCheckpoint(t *testing.T, root, name, version string, data []byte) {
 	t.Helper()
 	dir := filepath.Join(root, name+"-"+version)
@@ -478,6 +537,8 @@ func writeLLMCheckpoint(t *testing.T, root, name, version string, data []byte) {
 	}
 }
 
+// llmEventPayloadForTest reads one LLM event payload from the durable task stream
+// and decodes the cache metrics asserted by checkpoint tests.
 func llmEventPayloadForTest(t *testing.T, client logservepb.LogServiceClient, taskID, eventType string) struct {
 	CacheHit          bool  `json:"cache_hit"`
 	ModelLoadMs       int64 `json:"model_load_ms"`
@@ -517,6 +578,8 @@ func llmEventPayloadForTest(t *testing.T, client logservepb.LogServiceClient, ta
 	}{}
 }
 
+// llmEventTypes extracts event names from ReplayLLM output for order-sensitive
+// assertions.
 func llmEventTypes(events []*logservepb.LLMEvent) []string {
 	out := make([]string, 0, len(events))
 	for _, event := range events {
@@ -525,6 +588,8 @@ func llmEventTypes(events []*logservepb.LLMEvent) []string {
 	return out
 }
 
+// ragWithLLMDefinition returns a workflow whose final step is represented as the
+// internal __logserve_llm__ task and consumes a prompt from earlier steps.
 func ragWithLLMDefinition(t *testing.T) map[string]any {
 	t.Helper()
 	source := `
@@ -583,16 +648,22 @@ def build_prompt(query, docs):
 	}
 }
 
+// percentile returns a nearest-rank percentile for the small deterministic sample
+// sets used by scheduling experiments.
 func percentile(values []int64, p int) int64 {
 	if len(values) == 0 {
 		return 0
 	}
+	// Copy before sorting so callers can reuse their latency samples after the
+	// percentile calculation.
 	sorted := append([]int64(nil), values...)
 	for i := 1; i < len(sorted); i++ {
 		for j := i; j > 0 && sorted[j-1] > sorted[j]; j-- {
 			sorted[j-1], sorted[j] = sorted[j], sorted[j-1]
 		}
 	}
+	// Round up to the nearest rank: p95 of a small sample should select the first
+	// observation at or above the requested percentile.
 	idx := (len(sorted)*p + 99) / 100
 	if idx <= 0 {
 		idx = 1
@@ -603,4 +674,6 @@ func percentile(values []int64, p int) int64 {
 	return sorted[idx-1]
 }
 
+// The blank assignment is intentionally inert; it preserves the file's existing
+// compile-time reference to json.RawMessage without runtime work.
 var _ = json.RawMessage{}
